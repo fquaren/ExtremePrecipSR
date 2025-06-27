@@ -19,4 +19,4 @@ source /users/fquareng/.bashrc
 
 micromamba activate mamba_dl
 
-micromamba run -n mamba_dl python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/data/extract_patches.py
+micromamba run -n dl python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/data/extract_patches.py
