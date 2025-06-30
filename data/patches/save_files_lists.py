@@ -11,39 +11,52 @@ train_dates_list, val_dates_list, test_dates_list = get_train_val_test_dates(
     raw_data_path
 )
 
+print(train_dates_list)
+
 patches_path = (
     "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/OPERA/patches_v2"
 )
 precip_path = "precip"
 dem_path = "dem"
 
+train_files = []
 for date in tqdm(train_dates_list):
-    train_files = glob.glob(
-        os.path.join(
-            patches_path,
-            precip_path,
-            date,
-            "*/patch_y[0-9][0-9][0-9][0-9]_x[0-9][0-9][0-9][0-9].npy",
+    train_files.extend(
+        glob.glob(
+            os.path.join(
+                patches_path,
+                precip_path,
+                date,
+                "*/patch_y[0-9][0-9][0-9][0-9]_x[0-9][0-9][0-9][0-9].npy",
+            )
         )
     )
 
+print(train_files)
+
+val_files = []
 for date in tqdm(val_dates_list):
-    val_files = glob.glob(
-        os.path.join(
-            patches_path,
-            precip_path,
-            date,
-            "*/patch_y[0-9][0-9][0-9][0-9]_x[0-9][0-9][0-9][0-9].npy",
+    val_files.extend(
+        glob.glob(
+            os.path.join(
+                patches_path,
+                precip_path,
+                date,
+                "*/patch_y[0-9][0-9][0-9][0-9]_x[0-9][0-9][0-9][0-9].npy",
+            )
         )
     )
 
+test_files = []
 for date in tqdm(test_dates_list):
-    test_files = glob.glob(
-        os.path.join(
-            patches_path,
-            precip_path,
-            date,
-            "*/patch_y[0-9][0-9][0-9][0-9]_x[0-9][0-9][0-9][0-9].npy",
+    test_files.extend(
+        glob.glob(
+            os.path.join(
+                patches_path,
+                precip_path,
+                date,
+                "*/patch_y[0-9][0-9][0-9][0-9]_x[0-9][0-9][0-9][0-9].npy",
+            )
         )
     )
 
