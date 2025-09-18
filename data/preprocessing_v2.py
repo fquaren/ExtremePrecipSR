@@ -1,53 +1,79 @@
 import os
 import numpy as np
-import xarray as xr
-from tqdm import tqdm
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from scipy.ndimage import zoom
-import random  # For splitting data
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm
+import glob
+from datetime import datetime, timedelta
+import xarray as xr
 
-# --- Parameters (Consolidated from both scripts) ---
+
+# --- Global Parameters ---
 # Patch Extraction Parameters
-patch_size = 128
-stride = 128
-min_valid_fraction_precip = 1.0
-min_valid_fraction_dem = 1.0
-n_workers_patch_extraction = 8  # Number of parallel processes for Zarr folders
+PATCH_SIZE = 128
+STRIDE = 128
+MIN_VALID_FRACTION_PRECIP = 1.0
+MIN_VALID_FRACTION_DEM = 1.0
+N_WORKERS_PATCH_EXTRACTION = 8
 
-# Paths for Patch Extraction
-base_path = "/work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data/OPERA"
-output_base_dir = (
-    "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/OPERA/patches"
+# Paths
+BASE_DATA_DIR = "/work/FAC/FGSE/IDYST/tbeucler/downscaling/"
+RAW_OPERA_DATA_PATH = os.path.join(BASE_DATA_DIR, "raw_data", "OPERA")
+PROCESSED_DATA_OUTPUT_DIR = os.path.join(BASE_DATA_DIR, "fquareng", "data", "OPERA")
+
+PATCHES_BASE_OUTPUT_DIR = os.path.join(PROCESSED_DATA_OUTPUT_DIR, "patches")
+DEM_DATA_DIR = os.path.join(PROCESSED_DATA_OUTPUT_DIR, "dem")
+REPROJECTED_DEM_FILENAME = "reproj_OPERA_1km_europe_dem.nc"
+REPROJECTED_DEM_PATH = os.path.join(DEM_DATA_DIR, REPROJECTED_DEM_FILENAME)
+
+# Output directories for the *final* .npz files and for DEM patches
+PRECIP_FINAL_BASE_OUTPUT_DIR = os.path.join(PATCHES_BASE_OUTPUT_DIR, "precip")
+DEM_PATCH_OUTPUT_DIR = os.path.join(PATCHES_BASE_OUTPUT_DIR, "dem")
+
+# Preprocessing Parameters
+DOWNSCALING_FACTOR = 6
+# Directory to save train_files.txt, val_files.txt, test_files.txt, and train_stat.npy
+FINAL_FILE_LISTS_AND_STATS_DIR = os.path.join(
+    BASE_DATA_DIR, "fquareng", "data", "OPERA"
 )
-dem_data_dir = "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/OPERA/DEM"
-reprojected_dem_filename = "reproj_OPERA_1km_europe_dem.nc"
-reprojected_dem_path = os.path.join(dem_data_dir, reprojected_dem_filename)
 
-# Only DEM patches are saved here directly from Phase 1
-DEM_PATCH_OUTPUT_DIR = os.path.join(output_base_dir, "dem")
+# Decluttering Threshold
+DECLUTTER_THRESHOLD = (
+    150.0  # Define your decluttering threshold here (e.g., 150 mm/m^2)
+)
 
-# Data Preprocessing Parameters
-downscaling_factor = 6
-
-# Directory where the preprocessed data (NPZ files) will be stored.
-PREPROCESSED_DATA_DIR = os.path.join(output_base_dir, "preprocessed_precip")
+# Quantiles to compute (still relevant for raw data analysis)
+QUANTILE_LEVELS = [
+    0.01,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    0.75,
+    0.9,
+    0.95,
+    0.99,
+]
 
 # Create necessary directories
-os.makedirs(DEM_PATCH_OUTPUT_DIR, exist_ok=True)
-os.makedirs(PREPROCESSED_DATA_DIR, exist_ok=True)
+os.makedirs(
+    PRECIP_FINAL_BASE_OUTPUT_DIR, exist_ok=True
+)  # Only the base dir, YYYYMMDD will be added
+os.makedirs(DEM_PATCH_OUTPUT_DIR, exist_ok=True)  # For the DEM .npy outputs
+os.makedirs(FINAL_FILE_LISTS_AND_STATS_DIR, exist_ok=True)
 
-# --- (Patch Extraction) ---
 
-
-def extract_valid_patches_with_coords(
-    array_2d, patch_size, stride, min_valid_pixels_count
+# --- Functions from File 4: Patch Extraction ---
+def extract_valid_patches_with_coords_and_data(
+    array_2d, patch_size, stride, min_valid_pixels_count, original_coords=None
 ):
     """
     Extracts valid patches (as numpy arrays) and their top-left (y, x) coordinates from a 2D array.
     A patch is considered valid if it contains at least 'min_valid_pixels_count' non-NaN pixels.
+    Returns patch data along with their global coordinates.
     """
     y_dim, x_dim = array_2d.shape
-    valid_patches_info = []
+    valid_patches_info = []  # (patch_data, (start_y, start_x))
 
     for i in range(0, y_dim - patch_size + 1, stride):
         for j in range(0, x_dim - patch_size + 1, stride):
@@ -55,23 +81,34 @@ def extract_valid_patches_with_coords(
             valid_pixels = np.count_nonzero(~np.isnan(patch))
 
             if valid_pixels >= min_valid_pixels_count:
-                valid_patches_info.append((patch, (i, j)))
+                # If original_coords are provided (for mapping back to source filename info),
+                # use them to derive the global Y/X, otherwise use local patch coords
+                global_y = i + (original_coords[0] if original_coords else 0)
+                global_x = j + (original_coords[1] if original_coords else 0)
+                valid_patches_info.append((patch, (global_y, global_x)))
     return valid_patches_info
 
 
-def process_single_zarr_folder(zarr_folder_name):
+def process_single_zarr_folder_in_memory(zarr_folder_name):
     """
     Processes a single Zarr folder containing precipitation data.
-    It extracts valid patches and their metadata, but does NOT save them as .npy files.
-    Instead, it returns the patch data directly in memory.
+    It extracts valid patches for each time step and returns their data along with
+    their derived file paths, but DOES NOT save them to disk at this stage.
+    It also collects the unique (y, x) coordinates of all extracted patches for DEM processing.
+
+    Args:
+        zarr_folder_name (str): The name of the Zarr folder (e.g., "20170101T000000").
 
     Returns:
-        tuple: (list of unique (y, x) coordinates,
-                list of (patch_data_array, y_start, x_start, time_str) tuples)
+        tuple: A tuple containing:
+            - list: A list of tuples, where each inner tuple is (file_path_suggestion_base, patch_data)
+            - list: A list of unique (y, x) coordinates found in this Zarr folder.
     """
-    folder_path = os.path.join(base_path, zarr_folder_name)
+    folder_path = os.path.join(RAW_OPERA_DATA_PATH, zarr_folder_name)
     all_valid_coords_in_folder = set()
-    all_raw_precip_patch_info_in_folder = []  # Store (patch_data, y, x, time_str)
+    all_precip_patch_data_for_later = (
+        []
+    )  # List of (suggested_path_base_without_ext, patch_data)
     precip_var_name = "TOT_PREC"
 
     try:
@@ -82,7 +119,15 @@ def process_single_zarr_folder(zarr_folder_name):
             f"Processing precipitation folder: {zarr_folder_name}, shape: {precip_data_array.shape}"
         )
 
-        min_valid_pixels = int(min_valid_fraction_precip * patch_size * patch_size)
+        # The base output path for the *final* .npz files for this specific Zarr folder's data
+        folder_output_path = os.path.join(
+            PRECIP_FINAL_BASE_OUTPUT_DIR, zarr_folder_name
+        )
+
+        # Create both the YYYYMMDD directory and the YYYYMMDDTHHMMSS directory
+        os.makedirs(folder_output_path, exist_ok=True)
+
+        min_valid_pixels = int(MIN_VALID_FRACTION_PRECIP * PATCH_SIZE * PATCH_SIZE)
 
         for t in tqdm(
             range(precip_data_array.sizes["time"]),
@@ -90,31 +135,24 @@ def process_single_zarr_folder(zarr_folder_name):
         ):
             slice_2d = precip_data_array.isel(time=t).values.astype(np.float32)
 
-            try:
-                time_str = (
-                    precip_data_array.time.isel(time=t)
-                    .dt.strftime("%Y%m%d%H%M%S")
-                    .item()
-                )
-            except AttributeError:
-                time_str = f"time{t:04d}"
-
-            patches_info = extract_valid_patches_with_coords(
-                slice_2d, patch_size, stride, min_valid_pixels
+            patches_info = extract_valid_patches_with_coords_and_data(
+                slice_2d, PATCH_SIZE, STRIDE, min_valid_pixels
             )
 
-            for patch_data, (y_start, x_start) in patches_info:
-                # Add the (y, x) coordinates to our set of unique locations for DEM
-                all_valid_coords_in_folder.add((y_start, x_start))
-                # Store the raw patch data and its metadata for later preprocessing
-                all_raw_precip_patch_info_in_folder.append(
-                    (patch_data, y_start, x_start, time_str, zarr_folder_name)
-                )
+            if patches_info:
+                for patch_data, (y_start, x_start) in patches_info:
+                    suggested_patch_filename_base = os.path.join(
+                        folder_output_path, f"patch_y{y_start:04d}_x{x_start:04d}"
+                    )
+                    all_precip_patch_data_for_later.append(
+                        (suggested_patch_filename_base, patch_data)
+                    )
+                    all_valid_coords_in_folder.add((y_start, x_start))
 
     except Exception as e:
         print(f"Error processing {zarr_folder_name}: {e}")
 
-    return list(all_valid_coords_in_folder), all_raw_precip_patch_info_in_folder
+    return all_precip_patch_data_for_later, list(all_valid_coords_in_folder)
 
 
 def process_dem_data(
@@ -123,13 +161,11 @@ def process_dem_data(
     """
     Extracts and saves DEM patches only for the coordinates where valid precipitation
     patches were found. This ensures spatial alignment.
-    Returns:
-        list: Paths to saved .npy DEM patches. (These are saved as they are fixed per coordinate)
     """
     print(
         f"\nExtracting and saving DEM patches for {len(all_unique_precip_coords)} unique locations..."
     )
-    saved_dem_patch_paths = []
+
     dem_y_dim, dem_x_dim = dem_array_2d.shape
 
     for y_start, x_start in tqdm(all_unique_precip_coords, desc="Saving DEM patches"):
@@ -141,74 +177,193 @@ def process_dem_data(
             valid_pixels_dem = np.count_nonzero(~np.isnan(dem_patch))
             if valid_pixels_dem >= min_valid_pixels_dem:
                 patch_filename = f"dem_patch_y{y_start:04d}_x{x_start:04d}.npy"
-                full_patch_path = os.path.join(DEM_PATCH_OUTPUT_DIR, patch_filename)
-                np.save(full_patch_path, dem_patch)
-                saved_dem_patch_paths.append(full_patch_path)
-    return saved_dem_patch_paths
+                np.save(os.path.join(DEM_PATCH_OUTPUT_DIR, patch_filename), dem_patch)
 
 
-# --- (Preprocessing) ---
-
-
-def _compute_stats_for_single_patch_data(patch_data):
+# --- Functions from File 2: Date-Based Data Splitting Logic ---
+def get_dated_directories(base_path):
     """
-    Helper function to compute sums, sums_sq, and count for a single patch data array.
+    Reads directories with YYYYMMDDTHHMMSS structure from a given base path.
+    (Note: The actual split logic uses the YYYYMMDD part of these directory names)
+    """
+    # The glob pattern still targets YYYYMMDDTHHMMSS directories
+    pattern = os.path.join(
+        base_path,
+        "[0-9][0-9][0-9][0-9][0-1][0-9][0-3][0-9]T[0-9][0-9]_[0-9][0-9]_[0-9][0-9]",
+    )
+    all_dirs = glob.glob(pattern)
+
+    dated_dirs = []
+    for d in all_dirs:
+        if os.path.isdir(d):
+            try:
+                dir_name = os.path.basename(d)  # This will be YYYYMMDDTHHMMSS
+                # We need to parse just the date part for date comparison
+                date_str = dir_name[:8]  # Extract YYYYMMDD
+                date_obj = datetime.strptime(date_str, "%Y%m%d")
+                dated_dirs.append(
+                    (date_obj, dir_name)
+                )  # Store YYYYMMDDTHHMMSS as dirname
+            except ValueError:
+                continue
+
+    dated_dirs.sort(key=lambda x: x[0])
+    return dated_dirs
+
+
+def get_date_ranges(all_directories):
+    """
+    Splits dated directories (YYYYMMDDTHHMMSS) into train, validation, and test sets
+    based on specific date ranges and a 3-weeks-on/1-week-off pattern,
+    using only the YYYYMMDD part for the split logic.
+    """
+    list1_selected_weeks = (
+        []
+    )  # For training/validation (contains YYYYMMDDTHHMMSS folder names)
+    list2_skipped_weeks = []  # Skipped weeks (contains YYYYMMDDTHHMMSS folder names)
+    list3_aug_oct_2024 = []  # For testing (contains YYYYMMDDTHHMMSS folder names)
+
+    # Define the date ranges (these are YYYYMMDD dates)
+    start_date_aug_2023 = datetime(2023, 8, 1)
+    end_date_aug_2024_excluded = datetime(2024, 8, 1)
+    start_date_aug_2024 = datetime(2024, 8, 1)
+    end_date_oct_2024 = datetime(2024, 10, 30)
+
+    # Filter directories relevant to the first two lists (August 2023 to August 2024 excluded)
+    dirs_for_list1_2 = sorted(
+        [
+            (date_obj, dirname)  # date_obj is YYYYMMDD, dirname is YYYYMMDDTHHMMSS
+            for date_obj, dirname in all_directories
+            if start_date_aug_2023 <= date_obj < end_date_aug_2024_excluded
+        ]
+    )
+
+    # Process for List 1 and List 2 (August 2023 to August 2024 excluded)
+    if dirs_for_list1_2:
+        first_date = dirs_for_list1_2[0][0]  # This is a YYYYMMDD datetime object
+        current_week_monday = first_date - timedelta(
+            days=first_date.weekday()
+        )  # Find the Monday of the first week
+
+        week_count = 0
+        dates_in_current_week = (
+            []
+        )  # Stores YYYYMMDDTHHMMSS folder names for the current week
+
+        for date_obj, dirname_full in dirs_for_list1_2:
+            # Check if we've crossed into a new week based on the YYYYMMDD part
+            if date_obj >= current_week_monday + timedelta(weeks=1):
+                if week_count % 4 < 3:  # 0, 1, 2 (first three weeks of the cycle)
+                    list1_selected_weeks.extend(dates_in_current_week)
+                else:  # 3 (fourth week of the cycle, skipped)
+                    list2_skipped_weeks.extend(dates_in_current_week)
+
+                # Reset for the new week, using the YYYYMMDD part of the current file's date
+                current_week_monday = date_obj - timedelta(days=date_obj.weekday())
+                week_count += 1
+                dates_in_current_week = []
+
+            dates_in_current_week.append(
+                dirname_full
+            )  # Add the full YYYYMMDDTHHMMSS name
+
+        # Process any remaining dates from the last week
+        if dates_in_current_week:
+            if week_count % 4 < 3:
+                list1_selected_weeks.extend(dates_in_current_week)
+            else:
+                list2_skipped_weeks.extend(dates_in_current_week)
+
+    # Process for List 3 (August 1, 2024 to October 30, 2024)
+    for date_obj, dirname_full in all_directories:
+        if start_date_aug_2024 <= date_obj <= end_date_oct_2024:
+            list3_aug_oct_2024.append(dirname_full)  # Add the full YYYYMMDDTHHMMSS name
+
+    return list1_selected_weeks, list2_skipped_weeks, list3_aug_oct_2024
+
+
+def get_train_val_test_dates_orchestrator(base_path):
+    """Orchestrates getting dated directories and splitting them into ranges."""
+    all_directories = get_dated_directories(base_path)
+    return get_date_ranges(all_directories)
+
+
+# --- Functions from File 3: File Path Generation and Saving ---
+def save_to_txt(
+    train_files_metadata, val_files_metadata, test_files_metadata, save_path
+):
+    """
+    Saves lists of file paths (extracted from metadata) to separate .txt files.
+    Each item in metadata is (filepath_base, patch_data). We only save the filepath_base.
+    """
+    train_files_path = os.path.join(save_path, "train_files.txt")
+    with open(train_files_path, "w") as f:
+        for filepath_base, _ in train_files_metadata:
+            f.write(filepath_base + ".npz" + "\n")
+    val_files_path = os.path.join(save_path, "val_files.txt")
+    with open(val_files_path, "w") as f:
+        for filepath_base, _ in val_files_metadata:
+            f.write(filepath_base + ".npz" + "\n")
+    test_files_path = os.path.join(save_path, "test_files.txt")
+    with open(test_files_path, "w") as f:
+        for filepath_base, _ in test_files_metadata:
+            f.write(filepath_base + ".npz" + "\n")
+    print(f"File lists saved at {save_path}.")
+
+
+# --- Functions for Data Preprocessing ---
+
+
+def declutter_precip(arr, threshold):
+    """
+    Sets pixel values in the array that are above the given threshold to zero.
+    """
+    arr_copy = arr.copy()
+    arr_copy[arr_copy > threshold] = 0
+    return arr_copy
+
+
+def _get_flattened_data_for_stats(file_info):
+    """
+    Helper function to return the flattened original data for quantile computation.
     Designed for parallel execution.
+    file_info is (filepath_base, data_array)
     """
-    log_data = np.log1p(patch_data)
-    return log_data.sum(), (log_data**2).sum(), log_data.size
+    _, data = file_info
+    return data.flatten()
 
 
-def compute_global_stats_parallel(list_of_patch_data):
+def compute_global_quantiles_parallel_in_memory(files_info, quantile_levels):
     """
-    Computes global mean and standard deviation of log-transformed data in parallel
-    directly from a list of patch data arrays.
+    Computes global quantiles of raw data in parallel from in-memory data.
     """
-    sums_total = 0
-    sums_sq_total = 0
-    count_total = 0
+    all_data_flat = []
 
     num_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count()))
-    print(f"Using {num_cpus} CPU workers for computing global statistics.")
+    print(f"Using {num_cpus} CPU workers for collecting data for quantiles.")
 
-    # Use a generator expression to avoid creating an intermediate list of arguments
-    # (patch_data for _compute_stats_for_single_patch_data) if it's too large
     with ProcessPoolExecutor(max_workers=num_cpus) as executor:
         results = list(
             tqdm(
-                executor.map(_compute_stats_for_single_patch_data, list_of_patch_data),
-                total=len(list_of_patch_data),
-                desc="Computing global statistics in parallel... ",
+                executor.map(_get_flattened_data_for_stats, files_info),
+                total=len(files_info),
+                desc="Collecting data for quantiles... ",
             )
         )
 
-    for sums, sums_sq, count in results:
-        sums_total += sums
-        sums_sq_total += sums_sq
-        count_total += count
+    for data_flat in results:
+        all_data_flat.append(data_flat)
 
-    mean = sums_total / count_total
-    # Prevent division by zero if count_total is 0 or sums_sq_total / count_total - mean**2
-    # is negative due to float precision
-    variance = sums_sq_total / count_total - mean**2
-    std = np.sqrt(max(0, variance))  # Ensure non-negative argument to sqrt
-    return mean, std
+    # Concatenate all flattened data into a single array for quantile computation
+    # Filter out empty arrays that might arise from empty patches
+    all_data_flat_combined = np.concatenate(
+        [arr for arr in all_data_flat if arr.size > 0]
+    )
 
+    # Compute quantiles on the combined and flattened raw data
+    quantiles = np.nanquantile(all_data_flat_combined, quantile_levels)
 
-def normalize_precip(arr, train_mean=None, train_std=None):
-    """
-    Normalizes precipitation array using log1p transformation and provided mean/std.
-    If mean/std are not provided, computes them from the current array.
-    """
-    log_arr = np.log1p(arr)
-    if train_mean is None or train_std is None:
-        mean = np.mean(log_arr)
-        std = np.std(log_arr)
-    else:
-        mean = train_mean
-        std = train_std
-    # Handle case where std might be zero (e.g., all values are same after log1p)
-    return (log_arr - mean) / (std if std != 0 else 1.0)
+    return quantiles
 
 
 def coarsen_array(arr, factor):
@@ -218,7 +373,6 @@ def coarsen_array(arr, factor):
     m, n = arr.shape
     m_new = m // factor
     n_new = n // factor
-    # Ensure array dimensions are multiples of the factor
     arr = arr[: m_new * factor, : n_new * factor]
     return arr.reshape(m_new, factor, n_new, factor).mean(axis=(1, 3))
 
@@ -230,195 +384,220 @@ def interpolate_array(arr, factor):
     return zoom(arr, zoom=factor, order=3)
 
 
-def process_and_save_transformed_patch(args):
+def process_file_wrapper_in_memory(args):
     """
-    Wrapper function to process a single patch: normalization, coarsening, interpolation.
-    Saves all outputs in a single .npz file, constructing the path based on metadata.
+    Wrapper function to process a single file's data (in-memory): decluttering, coarsening, interpolation.
+    Saves all outputs in a single .npz file.
+    args is (filepath_base, data_array, factor, declutter_threshold)
     """
-    (
-        raw_patch_data,
-        y_start,
-        x_start,
-        time_str,
-        zarr_folder_name,
-        factor,
-        train_mean,
-        train_std,
-        output_base_dir,
-    ) = args
+    filepath_base, data, factor, declutter_threshold = args
 
-    norm = normalize_precip(raw_patch_data, train_mean, train_std)
-    coarse = coarsen_array(norm, factor)
-    interp = interpolate_array(norm, factor)
+    # Apply decluttering directly to the original data
+    decluttered_data = declutter_precip(data, declutter_threshold)
 
-    # Construct the output directory structure:
-    # PREPROCESSED_DATA_DIR / zarr_folder_name / time_str / patch_yXX_xYY.npz
-    output_folder_path = os.path.join(output_base_dir, zarr_folder_name, time_str)
-    os.makedirs(output_folder_path, exist_ok=True)
+    # Coarsening and interpolation are now applied to the decluttered data
+    coarse = coarsen_array(decluttered_data, factor)
+    interp = interpolate_array(decluttered_data, factor)
 
-    output_npz_filename = f"patch_y{y_start:04d}_x{x_start:04d}.npz"
-    output_npz_path = os.path.join(output_folder_path, output_npz_filename)
-
+    npz_output_path = filepath_base + ".npz"
     np.savez(
-        output_npz_path,
-        original=raw_patch_data,  # Save original for reference if needed
-        normalized=norm,
+        npz_output_path,
+        original=data,  # Original data before any processing
+        decluttered=decluttered_data,  # Data after decluttering
         coarsened=coarse,
         interpolated=interp,
     )
-    return output_npz_path
+    return npz_output_path
 
 
-# --- Main ---
+# --- Main Orchestration Function ---
+def main_preprocessing_pipeline():
+    """
+    Orchestrates the entire data preprocessing workflow:
+    1. Extracts precipitation and DEM patches (precipitation kept in memory).
+    2. Splits data into train/val/test sets by date.
+    3. Generates file lists for each set.
+    4. Performs decluttering, coarsening, and interpolation on in-memory precipitation data,
+       saving the final .npz files.
+    5. Computes and saves quantiles for the raw (undecluttered) training data.
+    """
+    print("--- Starting Full Data Preprocessing Pipeline ---")
 
-
-def main_merged_workflow():
-    print("--- Starting Merged Data Processing Workflow ---")
-
-    # --- Phase 1: Patch Extraction (collecting data in memory) ---
+    # --- Step 1: Extract Precipitation and DEM Patches (Precipitation in-memory) ---
+    print("\n## Step 1: Extracting Precipitation (in-memory) and DEM Patches")
     print(
-        "\nPhase 1: Starting patch extraction for precipitation data and identifying valid patch locations..."
+        "Starting patch extraction for precipitation data and identifying valid patch locations..."
     )
 
+    # The raw data Zarr folders are still YYYYMMDDTHHMMSS
     zarr_folders = sorted(
-        [f for f in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, f))]
+        [
+            f
+            for f in os.listdir(RAW_OPERA_DATA_PATH)
+            if os.path.isdir(os.path.join(RAW_OPERA_DATA_PATH, f))
+        ]
     )
 
-    all_precip_coords = (
-        set()
-    )  # Master set to collect all unique (y, x) coordinates for DEM
-    # Master list to collect all raw precip patch data and their metadata
-    all_raw_precip_patch_info = (
-        []
-    )  # (patch_data, y_start, x_start, time_str, zarr_folder_name)
+    all_precip_coords = set()  # For DEM mapping
+    all_precip_data_for_later_processing = []  # List of (filepath_base, patch_data)
 
-    with ProcessPoolExecutor(max_workers=n_workers_patch_extraction) as executor:
+    with ProcessPoolExecutor(max_workers=N_WORKERS_PATCH_EXTRACTION) as executor:
         futures = {
-            executor.submit(process_single_zarr_folder, folder): folder
+            executor.submit(process_single_zarr_folder_in_memory, folder): folder
             for folder in zarr_folders
         }
         for future in as_completed(futures):
             folder = futures[future]
             try:
-                coords_from_folder, patch_info_from_folder = future.result()
+                precip_data_from_folder, coords_from_folder = future.result()
+                if precip_data_from_folder:
+                    all_precip_data_for_later_processing.extend(precip_data_from_folder)
                 if coords_from_folder:
                     all_precip_coords.update(coords_from_folder)
-                if patch_info_from_folder:
-                    all_raw_precip_patch_info.extend(patch_info_from_folder)
             except Exception as e:
                 print(f"Exception processing folder {folder}: {e}")
 
-    # Process DEM Data (still requires saving .npy files as they are fixed per coordinate)
     print(
-        "\nAll precipitation patches extracted to memory. Now loading and processing DEM data..."
+        f"Total precipitation patches extracted (in-memory): {len(all_precip_data_for_later_processing)}"
+    )
+    print(
+        "\nAll precipitation patch metadata collected. Now loading and processing DEM data..."
     )
     try:
-        dem_da = xr.open_dataarray(reprojected_dem_path)
-        # Ensure the y-axis (latitude) is oriented consistently (e.g., north-up).
+        dem_da = xr.open_dataarray(REPROJECTED_DEM_PATH)
+        # Ensure 'y' coordinate is increasing for consistent slicing
         if dem_da.y.values[0] > dem_da.y.values[-1]:
             dem_da = dem_da.isel(y=slice(None, None, -1))
-
         dem_array_2d = dem_da.values
-        min_valid_pixels_dem = int(min_valid_fraction_dem * patch_size * patch_size)
-        saved_dem_patch_paths = process_dem_data(
-            dem_array_2d, all_precip_coords, patch_size, min_valid_pixels_dem
+        min_valid_pixels_dem = int(MIN_VALID_FRACTION_DEM * PATCH_SIZE * PATCH_SIZE)
+        process_dem_data(
+            dem_array_2d, all_precip_coords, PATCH_SIZE, min_valid_pixels_dem
         )
-        print(
-            f"Saved {len(saved_dem_patch_paths)} DEM patches to {DEM_PATCH_OUTPUT_DIR}."
-        )
-
     except FileNotFoundError:
         print(
-            f"Error: DEM file not found at {reprojected_dem_path}. Cannot process DEM patches."
+            f"Error: DEM file not found at {REPROJECTED_DEM_PATH}. Cannot process DEM patches."
         )
+        return  # Exit if DEM is critical and not found
     except Exception as e:
         print(f"Error loading or processing DEM: {e}")
+        return  # Exit if DEM processing fails
 
-    print("Phase 1 Complete: Patch extraction finished and DEMs saved.")
+    print("\nFinished patch extraction for precipitation (in-memory) and DEM data.")
 
-    # --- Phase 2: Data Preprocessing (Normalization, Coarsening, Interpolation) ---
-    print(
-        "\nPhase 2: Starting data preprocessing (normalization, coarsening, interpolation)..."
+    # --- Step 2: Split Data into Train/Val/Test Sets by Date ---
+    # And Step 3: Generate File Lists
+    print("\n## Step 2 & 3: Splitting Data and Generating File Lists")
+    # train_dates_list, val_dates_list, test_dates_list will contain YYYYMMDDTHHMMSS folder names
+    train_dates_list, val_dates_list, test_dates_list = (
+        get_train_val_test_dates_orchestrator(RAW_OPERA_DATA_PATH)
     )
 
-    # How to define train/val/test splits:
-    # Here, we randomly shuffle the collected patch info.
-    # In a real-world scenario, you might want to split based on time ranges
-    # for the `zarr_folder_name` to avoid data leakage (e.g., all of 2017 is train, 2018 is val, etc.)
-    random.seed(42)  # For reproducibility of the split
-    random.shuffle(all_raw_precip_patch_info)
+    print(f"Train dates (YYYYMMDDTHHMMSS folders): {len(train_dates_list)} entries")
+    print(f"Validation dates (YYYYMMDDTHHMMSS folders): {len(val_dates_list)} entries")
+    print(f"Test dates (YYYYMMDDTHHMMSS folders): {len(test_dates_list)} entries")
 
-    total_patches = len(all_raw_precip_patch_info)
-    train_split = int(0.7 * total_patches)
-    val_split = int(0.15 * total_patches)
+    # Filter the in-memory patch data based on the determined dates
+    train_files_metadata = []  # List of (filepath_base, patch_data)
+    val_files_metadata = []
+    test_files_metadata = []
 
-    train_patch_info = all_raw_precip_patch_info[:train_split]
-    val_patch_info = all_raw_precip_patch_info[train_split : train_split + val_split]
-    test_patch_info = all_raw_precip_patch_info[train_split + val_split :]
+    # Create sets for faster lookup
+    train_dates_set = set(train_dates_list)  # These are YYYYMMDDTHHMMSS
+    val_dates_set = set(val_dates_list)
+    test_dates_set = set(test_dates_list)
 
-    print(f"Total precip patches extracted: {total_patches}")
-    print(
-        f"Train: {len(train_patch_info)}, Val: {len(val_patch_info)}, Test: {len(test_patch_info)}"
+    # Use a single loop to categorize the collected patch data
+    for filepath_base, patch_data in tqdm(
+        all_precip_data_for_later_processing, desc="Categorizing patches by date"
+    ):
+        # Extract the YYYYMMDDTHHMMSS part from the filepath_base
+        path_parts = filepath_base.split(os.sep)
+        date_time_dir_from_path = path_parts[-2]  # e.g., '20230801T000000'
+
+        if date_time_dir_from_path in train_dates_set:
+            train_files_metadata.append((filepath_base, patch_data))
+        elif date_time_dir_from_path in val_dates_set:
+            val_files_metadata.append((filepath_base, patch_data))
+        elif date_time_dir_from_path in test_dates_set:
+            test_files_metadata.append((filepath_base, patch_data))
+        # Note: Patches whose dates don't fall into train/val/test lists are implicitly discarded here.
+
+    print(f"Total training files (in-memory): {len(train_files_metadata)}")
+    print(f"Total validation files (in-memory): {len(val_files_metadata)}")
+    print(f"Total testing files (in-memory): {len(test_files_metadata)}")
+
+    # Save only the *paths* to the .txt files. The .npy extension is added here for consistency
+    save_to_txt(
+        train_files_metadata,
+        val_files_metadata,
+        test_files_metadata,
+        FINAL_FILE_LISTS_AND_STATS_DIR,
     )
+    print("Finished splitting data and generating file lists.")
 
-    # 2.1 Compute global statistics (only from training data)
-    print("\nComputing global statistics (parallelized) from training patches...")
-    # Extract only the actual patch data for statistic computation
-    train_patch_data_for_stats = [info[0] for info in train_patch_info]
-    train_mean, train_std = compute_global_stats_parallel(train_patch_data_for_stats)
-    stats = {"train_mean": train_mean, "train_std": train_std}
-    print(f"Global Mean (log1p): {train_mean}, Global Std (log1p): {train_std}")
-    np.save(os.path.join(PREPROCESSED_DATA_DIR, "train_stat.npy"), stats)
+    # --- Step 4: Data Processing (Decluttering, Coarsening, Interpolation) ---
+    print("\n## Step 4: Applying Decluttering and Transformations")
 
-    # 2.2 Process and save transformed patches for all sets
-    num_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count()))
-    print(f"\nUsing {num_cpus} CPU workers for file transformations.")
+    data_sets_to_process = {
+        "train_files.txt": train_files_metadata,
+        "val_files.txt": val_files_metadata,
+        "test_files.txt": test_files_metadata,
+    }
 
-    for file_list_name, current_patch_info_list in [
-        ("train", train_patch_info),
-        ("val", val_patch_info),
-        ("test", test_patch_info),
-    ]:
-        print(
-            f"\nProcessing {file_list_name} set (total {len(current_patch_info_list)} patches)..."
-        )
+    for file_list_name, files_info_list in data_sets_to_process.items():
+        print(f"Processing data for {file_list_name}...")
+        print(f"Start processing {len(files_info_list)} data entries...")
 
-        # Prepare arguments for each call to process_and_save_transformed_patch
-        # (raw_patch_data, y_start, x_start, time_str, zarr_folder_name, factor, train_mean, train_std, output_base_dir)
-        tasks = [
-            (
-                info[0],
-                info[1],
-                info[2],
-                info[3],
-                info[4],
-                downscaling_factor,
-                train_mean,
-                train_std,
-                PREPROCESSED_DATA_DIR,
+        if "train" in file_list_name:
+            print("Computing quantiles for raw training data...")
+            # Compute quantiles on the *combined and flattened* raw data
+            train_quantiles = compute_global_quantiles_parallel_in_memory(
+                files_info_list, QUANTILE_LEVELS
             )
-            for info in current_patch_info_list
+
+            stats = {
+                "quantile_levels": QUANTILE_LEVELS,
+                "train_quantiles": train_quantiles,
+            }
+            print(f"Training Quantiles ({QUANTILE_LEVELS}): {train_quantiles}")
+            np.save(
+                os.path.join(FINAL_FILE_LISTS_AND_STATS_DIR, "train_stat.npy"), stats
+            )
+        else:
+            # For validation/test, we don't need to recompute quantiles or stats
+            # We're not applying any statistics from training to these sets,
+            # but loading train_stat.npy might still be useful for other contexts later.
+            print("Skipping quantile computation for non-training data.")
+
+        print("Starting parallel processing for data transformations...")
+        # Prepare arguments for each call to process_file_wrapper_in_memory
+        # Now passing DECLUTTER_THRESHOLD instead of mean/std
+        tasks = [
+            (filepath_base, data, DOWNSCALING_FACTOR, DECLUTTER_THRESHOLD)
+            for filepath_base, data in files_info_list
         ]
 
+        num_cpus = 32  # int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count()))
+        print(f"Using {num_cpus} CPU workers for data transformations.")
+
         with ProcessPoolExecutor(max_workers=num_cpus) as executor:
-            for idx, completed_path in enumerate(
+            for idx, completed_path_npz in enumerate(
                 tqdm(
-                    executor.map(process_and_save_transformed_patch, tasks),
+                    executor.map(process_file_wrapper_in_memory, tasks),
                     total=len(tasks),
-                    desc=f"Transforming and saving {file_list_name} patches",
+                    desc=f"Processing {file_list_name} data",
                 )
             ):
-                if (idx + 1) % 5000 == 0:  # Print progress periodically
-                    print(f"Processed {idx + 1} patches (last saved: {completed_path})")
+                if (idx + 1) % 1000 == 0:
+                    print(
+                        f"Processed {idx + 1} data entries (last saved: {completed_path_npz})"
+                    )
         print(
-            f"Finished processing all {len(current_patch_info_list)} files in {file_list_name} set."
+            f"Finished processing all {len(files_info_list)} data entries in {file_list_name}."
         )
 
-    print("\nPhase 2 Complete: Data preprocessing finished and NPZ files saved.")
-    print(
-        "\n--- All Done. Precipitation patches preprocessed directly, and DEM patches saved. ---"
-    )
+    print("\n--- Full Data Preprocessing Pipeline Completed Successfully ---")
 
 
 if __name__ == "__main__":
-    main_merged_workflow()
+    main_preprocessing_pipeline()

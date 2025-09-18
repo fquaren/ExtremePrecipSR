@@ -1,0 +1,43 @@
+# Paths
+RAW_OPERA_DATA_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data/OPERA"
+METADATA_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA"
+TRAIN_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/train_patches_metadata.txt"
+VAL_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/val_patches_metadata.txt"
+TEST_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/test_patches_metadata.txt"
+PREPROCESSED_DATA_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/precip"
+DEM_PATCH_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/dem"
+EXPERIEMENTS_DIR: "/scratch/fquareng/experiments_2"
+
+# Precipitation patches
+PATCH_SIZE: 128
+DOWNSCALING_FACTOR: 6
+DECLUTTER_THRESHOLD: 150.0
+
+# DataLoaders
+BATCH_SIZE: 32
+NUM_WORKERS: 0
+
+# UNet
+DROPOUT_PROB: 0.3
+
+# S_INV
+S_INV_ESTIMATION_SAMPLES: 10000
+
+# Training
+device: "cuda"
+NUM_EPOCHS: 50
+PATIENCE: 10
+EARLY_STOPPING: true
+EARLY_STOPPING_PATIENCE: 5
+LEARNING_RATE: 0.00001
+QUANTILE_LEVELS: [
+    0.01,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    0.75,
+    0.9,
+    0.95,
+    0.99,
+]

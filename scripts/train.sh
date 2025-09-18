@@ -4,21 +4,20 @@
 #SBATCH --mail-user filippo.quarenghi@unil.ch
 
 #SBATCH --chdir /scratch/fquareng/
-#SBATCH --job-name preprocess-data
+#SBATCH --job-name geom
 #SBATCH --output outputs/%j
 #SBATCH --error job_errors/%j
 
-#SBATCH --partition cpu
+#SBATCH --partition gpu
+#SBATCH --gres gpu:1
+#SBATCH --gres-flags enforce-binding
 #SBATCH --nodes 1
 #SBATCH --ntasks 1
-#SBATCH --cpus-per-task 32
 #SBATCH --mem 500G
-#SBATCH --time 48:00:00
-
-module load micromamba
+#SBATCH --time 24:00:00
 
 source /users/fquareng/.bashrc
 
 micromamba activate dl
 
-micromamba run -n dl python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/data/preprocessing_v5.py
+micromamba run -n dl python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_gamma.py

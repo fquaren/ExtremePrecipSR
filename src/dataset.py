@@ -1,246 +1,151 @@
 import os
-import torch
-from torch.utils.data import Dataset, DataLoader
 import numpy as np
-import glob  # To find all .npz files
+import torch
+from torch.utils.data import Dataset
+import yaml
+from scipy.ndimage import zoom
 
 
-class PrecipitationDataset(Dataset):
-    def __init__(self, precip_npz_dir, dem_npy_dir, transform=None):
+config_path = (
+    "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/config.yaml"
+)
+with open(config_path, "r") as file:
+    config = yaml.safe_load(file)
+
+PATCH_SIZE = config["PATCH_SIZE"]
+DOWNSCALING_FACTOR = config["DOWNSCALING_FACTOR"]
+DECLUTTER_THRESHOLD = config["DECLUTTER_THRESHOLD"]
+PREPROCESSED_DATA_DIR = config["PREPROCESSED_DATA_DIR"]
+
+
+# Preprocessing functions (from your script)
+def declutter_precip(arr, threshold):
+    """Sets pixel values in the array that are above the given threshold to zero."""
+    arr_copy = arr.copy()
+    arr_copy[arr_copy > threshold] = 0
+    return arr_copy
+
+
+def coarsen_array(arr, factor):
+    """Coarsens an array by a given factor using simple averaging."""
+    m, n = arr.shape
+    m_new = m // factor
+    n_new = n // factor
+    arr = arr[: m_new * factor, : n_new * factor]
+    return arr.reshape(m_new, factor, n_new, factor).mean(axis=(1, 3))
+
+
+def interpolate_array(arr, factor, target_shape=None):
+    """Interpolates an array by a given factor using cubic spline interpolation (order=3).
+    If target_shape is given, resizes exactly to that shape after interpolation.
+    """
+    # Interpolate with zoom
+    interpolated = zoom(arr.astype(np.float32), zoom=factor, order=3)
+
+    if target_shape is not None:
+        # Resize using slicing or padding to enforce exact dimensions
+        current_shape = interpolated.shape
+        pad_y = max(0, target_shape[0] - current_shape[0])
+        pad_x = max(0, target_shape[1] - current_shape[1])
+
+        # Pad if too small
+        if pad_y > 0 or pad_x > 0:
+            interpolated = np.pad(
+                interpolated,
+                ((0, pad_y), (0, pad_x)),
+                mode="constant",
+                constant_values=0.0,
+            )
+
+        # Crop if too large
+        interpolated = interpolated[: target_shape[0], : target_shape[1]]
+
+    return interpolated
+
+
+class ZarrPatchDataset(Dataset):
+    def __init__(
+        self,
+        metadata_file_path,
+        dem_patch_dir,
+        preprocessed_data_dir=PREPROCESSED_DATA_DIR,
+        patch_size=PATCH_SIZE,
+    ):
         """
         Args:
-            precip_npz_dir (str): Directory containing preprocessed precipitation .npz files.
-                                  Expected structure: precip_npz_dir/zarr_folder_name/time_str/patch_yYY_xXX.npz
-            dem_npy_dir (str): Directory containing DEM .npy files.
-                                  Expected structure: dem_npy_dir/dem_patch_yYY_xXX.npy
-            transform (callable, optional): Optional transform to be applied on a sample.
+            metadata_file_path (str): Path to the .txt file containing patch metadata
+                                      (e.g., 'train_patches_metadata.txt').
+                                      Each line: 'YYYYMMDDHHMMSS,Y_COORD,X_COORD'
+            dem_patch_dir (str): Directory where DEM patches are saved as .npy files.
+            preprocessed_data_dir (str): Directory where preprocessed precipitation data
+                                         (coarse, interpolated, original) are saved as .npy files.
+            patch_size (int): Size of the square patches.
         """
-        self.precip_npz_dir = precip_npz_dir
-        self.dem_npy_dir = dem_npy_dir
-        self.transform = transform
+        self.metadata = self._load_metadata(metadata_file_path)
+        self.dem_patch_dir = dem_patch_dir
+        self.preprocessed_data_dir = preprocessed_data_dir
+        self.patch_size = patch_size
 
-        # List all .npz files recursively within the precipitation directory
-        self.npz_files = glob.glob(
-            os.path.join(self.precip_npz_dir, "**", "*.npz"), recursive=True
-        )
-
-        if not self.npz_files:
-            raise RuntimeError(
-                f"No .npz files found in {self.precip_npz_dir}. Please ensure preprocessing script ran successfully."
-            )
-
-        print(f"Found {len(self.npz_files)} preprocessed precipitation patches.")
+    def _load_metadata(self, metadata_file_path):
+        metadata = []
+        with open(metadata_file_path, "r") as f:
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts) == 3:
+                    timestamp_str, y_str, x_str = parts
+                    metadata.append((timestamp_str, int(y_str), int(x_str)))
+        print(f"Loaded {len(metadata)} metadata entries from {metadata_file_path}")
+        return metadata
 
     def __len__(self):
-        return len(self.npz_files)
+        return len(self.metadata)
 
     def __getitem__(self, idx):
-        # Path to the current precipitation NPZ file
-        precip_npz_path = self.npz_files[idx]
+        timestamp_str, y_start, x_start = self.metadata[idx]
 
-        # Load the precipitation data
-        data = np.load(precip_npz_path)
-        coarsened_precip = data["coarsened"]
-        interpolated_precip = data["interpolated"]
-        # The target for training will be the high-resolution normalized precipitation
-        target_normalized_precip = data["normalized"]
-
-        # Extract y_start and x_start from the filename to find the corresponding DEM
-        # Example filename: .../patch_y0000_x0000.npz
-        filename = os.path.basename(precip_npz_path)
-        parts = filename.replace(".npz", "").split("_")
-        y_str = [p for p in parts if p.startswith("y")][0]  # e.g., 'y0000'
-        x_str = [p for p in parts if p.startswith("x")][0]  # e.g., 'x0000'
-
-        # Construct the DEM filename and path
-        dem_filename = f"dem_patch_{y_str}_{x_str}.npy"
-        dem_path = os.path.join(self.dem_npy_dir, dem_filename)
-
-        if not os.path.exists(dem_path):
-            raise FileNotFoundError(
-                f"Corresponding DEM file not found: {dem_path} for {precip_npz_path}"
-            )
-
-        elevation_data = np.load(dem_path)
-
-        # Convert numpy arrays to PyTorch tensors
-        # Ensure float32 and add a channel dimension if it's not present (e.g., 2D -> 1, 2D)
-        # UNet expects B, C, H, W. Our patches are H, W, so add C=1.
-        coarsened_precip_tensor = (
-            torch.from_numpy(coarsened_precip).float().unsqueeze(0)
+        # Construct file paths for preprocessed precipitation data
+        # The naming convention must match the preprocessing script
+        original_precip_filename = (
+            f"original_precip_{timestamp_str}_y{y_start:04d}_x{x_start:04d}.npy"
         )
-        interpolated_precip_tensor = (
-            torch.from_numpy(interpolated_precip).float().unsqueeze(0)
+        interpolated_precip_filename = (
+            f"interpolated_precip_{timestamp_str}_y{y_start:04d}_x{x_start:04d}.npy"
         )
-        elevation_tensor = torch.from_numpy(elevation_data).float().unsqueeze(0)
-        target_normalized_precip_tensor = (
-            torch.from_numpy(target_normalized_precip).float().unsqueeze(0)
+        coarse_precip_filename = (
+            f"coarse_precip_{timestamp_str}_y{y_start:04d}_x{x_start:04d}.npy"
         )
 
-        # Apply transformations if any
-        if self.transform:
-            # You might want to define transforms that take multiple inputs
-            # or apply them individually if suitable
-            coarsened_precip_tensor = self.transform(coarsened_precip_tensor)
-            interpolated_precip_tensor = self.transform(interpolated_precip_tensor)
-            elevation_tensor = self.transform(elevation_tensor)
-            target_normalized_precip_tensor = self.transform(
-                target_normalized_precip_tensor
-            )
-
-        # Return the inputs for the UNet and the target
-        return {
-            "coarse_precip": coarsened_precip_tensor,
-            "interpolated_precip": interpolated_precip_tensor,
-            "elevation": elevation_tensor,
-            "target_normalized_precip": target_normalized_precip_tensor,
-        }
-
-
-def create_dataloader(dataset, batch_size, shuffle=True, num_workers=None):
-    """
-    Creates a PyTorch DataLoader from a Dataset.
-    """
-    if num_workers is None:
-        num_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count()))
-        # A common practice is to use fewer workers than CPU cores to avoid oversubscription
-        # especially if each worker loads large files.
-        num_workers = min(
-            num_workers, 8
-        )  # Cap at 8 or adjust based on your system/data size
-
-    print(f"Using {num_workers} workers for DataLoader.")
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=True,  # Optimizes data transfer to GPU
-    )
-
-
-# --- Example Usage ---
-if __name__ == "__main__":
-    # Define the base directory for your processed data
-    output_base_dir = (
-        "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/OPERA/patches_v3"
-    )
-    precip_npz_base_dir = os.path.join(output_base_dir, "preprocessed_data")
-    dem_npy_dir = os.path.join(output_base_dir, "dem")
-
-    # The `main_merged_workflow` in the previous script generated
-    # `train_files.txt`, `val_files.txt`, `test_files.txt`
-    # within `precip_npz_base_dir`.
-    # We will use these lists to create our datasets.
-
-    # Function to read file paths from a list file
-    def get_file_paths_from_list(list_filepath):
-        with open(list_filepath, "r") as f:
-            return [line.strip() for line in f if line.strip()]
-
-    # To create a dataset, we need to pass a list of *specific* NPZ files.
-    # The current `PrecipitationDataset` constructor recursively finds all .npz files.
-    # If you want to use the train/val/test split from `main_merged_workflow`,
-    # you'd modify the dataset to take a list of explicit file paths instead of a directory.
-
-    # Let's adapt `PrecipitationDataset` to take a list of specific NPZ files directly.
-    class SplitPrecipitationDataset(PrecipitationDataset):
-        def __init__(self, npz_filepaths, dem_npy_dir, transform=None):
-
-            self.dem_npy_dir = dem_npy_dir
-            self.transform = transform
-            self.npz_files = npz_filepaths  # Use the provided list of files directly
-
-            if not self.npz_files:
-                raise RuntimeError("No NPZ file paths provided for the dataset.")
-
-            print(
-                f"Dataset initialized with {len(self.npz_files)} specific preprocessed precipitation patches."
-            )
-
-    print("\n--- Initializing Datasets and DataLoaders ---")
-
-    # Paths to the lists of train/val/test NPZ files (from the previous script's output)
-    train_npz_list_path = os.path.join(precip_npz_base_dir, "train_files.txt")
-    val_npz_list_path = os.path.join(precip_npz_base_dir, "val_files.txt")
-    test_npz_list_path = os.path.join(precip_npz_base_dir, "test_files.txt")
-
-    try:
-        train_npz_files = get_file_paths_from_list(train_npz_list_path)
-        val_npz_files = get_file_paths_from_list(val_npz_list_path)
-        test_npz_files = get_file_paths_from_list(test_npz_list_path)
-    except FileNotFoundError as e:
-        print(
-            f"Error: {e}. Make sure the preprocessing script has been run to generate file lists and NPZ files."
+        original_precip_path = os.path.join(
+            self.preprocessed_data_dir, "original_precip", original_precip_filename
         )
-        exit()
-
-    # Create datasets
-    train_dataset = SplitPrecipitationDataset(train_npz_files, dem_npy_dir)
-    val_dataset = SplitPrecipitationDataset(val_npz_files, dem_npy_dir)
-    test_dataset = SplitPrecipitationDataset(test_npz_files, dem_npy_dir)
-
-    # Create DataLoaders
-    batch_size = 16  # Adjust as per your GPU memory
-    train_loader = create_dataloader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = create_dataloader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = create_dataloader(test_dataset, batch_size=batch_size, shuffle=False)
-
-    print(f"\nTrain DataLoader has {len(train_loader)} batches of size {batch_size}")
-    print(f"Validation DataLoader has {len(val_loader)} batches of size {batch_size}")
-    print(f"Test DataLoader has {len(test_loader)} batches of size {batch_size}")
-
-    # --- Test fetching a batch ---
-    print("\n--- Testing DataLoader iteration ---")
-    try:
-        first_batch = next(iter(train_loader))
-        print(f"Keys in the first batch: {first_batch.keys()}")
-        print(f"Shape of coarse_precip in batch: {first_batch['coarse_precip'].shape}")
-        print(
-            f"Shape of interpolated_precip in batch: {first_batch['interpolated_precip'].shape}"
+        interpolated_precip_path = os.path.join(
+            self.preprocessed_data_dir,
+            "interpolated_precip",
+            interpolated_precip_filename,
         )
-        print(f"Shape of elevation in batch: {first_batch['elevation'].shape}")
-        print(
-            f"Shape of target_normalized_precip in batch: {first_batch['target_normalized_precip'].shape}"
+        coarse_precip_path = os.path.join(
+            self.preprocessed_data_dir, "coarse_precip", coarse_precip_filename
         )
 
-        # Verify data types are float32
-        assert first_batch["coarse_precip"].dtype == torch.float32
-        assert first_batch["interpolated_precip"].dtype == torch.float32
-        assert first_batch["elevation"].dtype == torch.float32
-        assert first_batch["target_normalized_precip"].dtype == torch.float32
+        # Load preprocessed precipitation data
+        output_precip = torch.from_numpy(np.load(original_precip_path)).float()
+        input_precip = torch.from_numpy(np.load(interpolated_precip_path)).float()
+        coarse_precip = torch.from_numpy(np.load(coarse_precip_path)).float()
 
-        # Verify the dimensions (B, C, H, W) where C=1 for all inputs/targets
-        assert first_batch["coarse_precip"].ndim == 4
-        assert first_batch["interpolated_precip"].ndim == 4
-        assert first_batch["elevation"].ndim == 4
-        assert first_batch["target_normalized_precip"].ndim == 4
+        # Load DEM data
+        dem_filename = f"dem_patch_y{y_start:04d}_x{x_start:04d}.npy"
+        dem_path = os.path.join(self.dem_patch_dir, dem_filename)
+        dem_patch = torch.from_numpy(np.load(dem_path)).float()
+        dem_patch[torch.isnan(dem_patch)] = 0.0
 
-        # Check expected H, W dimensions for high-res data (128x128)
-        assert first_batch["interpolated_precip"].shape[2:] == (128, 128)
-        assert first_batch["elevation"].shape[2:] == (128, 128)
-        assert first_batch["target_normalized_precip"].shape[2:] == (128, 128)
+        # Add channel dimension if not already present
+        if input_precip.ndim == 2:
+            input_precip = input_precip.unsqueeze(0)
+        if output_precip.ndim == 2:
+            output_precip = output_precip.unsqueeze(0)
+        if coarse_precip.ndim == 2:
+            coarse_precip = coarse_precip.unsqueeze(0)
+        if dem_patch.ndim == 2:
+            dem_patch = dem_patch.unsqueeze(0)
 
-        # Check expected H, W dimensions for coarse data (128/6 = 21x21 approx, due to integer division)
-        # The `coarsen_array` uses integer division, so 128 // 6 = 21.
-        assert first_batch["coarse_precip"].shape[2:] == (21, 21)
-
-        print("\nSuccessfully loaded and inspected a batch from the DataLoader!")
-
-    except Exception as e:
-        print(f"An error occurred during DataLoader test: {e}")
-
-
-class SplitPrecipitationDataset(PrecipitationDataset):
-    def __init__(self, npz_filepaths, dem_npy_dir, transform=None):
-        self.precip_npz_dir = os.path.dirname(npz_filepaths[0]) if npz_filepaths else ""
-        self.dem_npy_dir = dem_npy_dir
-        self.transform = transform
-        self.npz_files = npz_filepaths
-
-        if not self.npz_files:
-            raise RuntimeError("No NPZ file paths provided for the dataset.")
-
-        print(
-            f"Dataset initialized with {len(self.npz_files)} specific preprocessed precipitation patches."
-        )
+        return input_precip, coarse_precip, output_precip, dem_patch

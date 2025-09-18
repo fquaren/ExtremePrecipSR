@@ -1,94 +1,137 @@
+import argparse
 import os
-import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader
+import json
+import yaml
+import random
+import string
+import pandas as pd
 
-
-from src.dataset import SplitPrecipitationDataset
-from src.dataloader import create_dataloader
-from src.evaluate import evaluate_model
+from src.logger import setup_logger
+from src.dataset import ZarrPatchDataset
 from src.models.unet import UNet
 from src.train import train_model
-from src.utils import get_file_paths_from_list
+
+
+# Generate random experiment ID
+def generate_experiment_id(length=4):
+    return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
 
 def main():
-    # --- Configuration ---
-    # Define the base directory for your processed data
-    output_base_dir = (
-        "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/OPERA/patches"
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/config.yaml",
+        help="Config path",
     )
-    precip_npz_base_dir = os.path.join(output_base_dir, "preprocessed_data")
-    dem_npy_dir = os.path.join(output_base_dir, "dem")
-    checkpoint_dir = os.path.join(output_base_dir, "checkpoints")
+    args = parser.parse_args()
 
-    BATCH_SIZE = 16
-    LEARNING_RATE = 1e-4
-    NUM_EPOCHS = 20
-    DROPOUT_PROB = 0.3
-    EARLY_STOPPING = True
-    PATIENCE = 5
+    config_path = args.config
+    with open(config_path, "r") as file:
+        config = yaml.safe_load(file)
 
-    # Device setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    exp_id = generate_experiment_id()
+    exp_path = os.path.join(config["EXPERIEMENTS_DIR"], exp_id)
+    os.makedirs(exp_path, exist_ok=True)
 
-    # Paths to the lists of train/val/test NPZ files (from the previous script's output)
-    train_npz_list_path = os.path.join(precip_npz_base_dir, "train_files.txt")
-    val_npz_list_path = os.path.join(precip_npz_base_dir, "val_files.txt")
-    test_npz_list_path = os.path.join(precip_npz_base_dir, "test_files.txt")
+    logger = setup_logger(exp_path, "experiment")
+    start_time = pd.Timestamp.now()
+    logger.info(f"Starting experiment (EXPERIMENT ID: {exp_id}, TIME: {start_time})")
 
-    try:
-        train_npz_files = get_file_paths_from_list(train_npz_list_path)
-        val_npz_files = get_file_paths_from_list(val_npz_list_path)
-        test_npz_files = get_file_paths_from_list(test_npz_list_path)
-    except FileNotFoundError as e:
-        print(f"Error: {e}. Cannot proceed without train/val file lists.")
-        exit()
+    # Load the all_zarr_folder_info map
+    METADATA_DIR = config["METADATA_DIR"]
+    DEM_PATCH_DIR = config["DEM_PATCH_DIR"]
+    zarr_info_map_path = os.path.join(METADATA_DIR, "zarr_info_map.json")
+    with open(zarr_info_map_path, "r") as f:
+        loaded_zarr_info = json.load(f)
+        # Convert lists back to tuples if they were tuples originally
+        loaded_zarr_info = {k: tuple(v) for k, v in loaded_zarr_info.items()}
 
-    # --- Create Datasets and DataLoaders ---
-    print("\n--- Creating Datasets ---")
-    train_dataset = SplitPrecipitationDataset(train_npz_files, dem_npy_dir)
-    val_dataset = SplitPrecipitationDataset(val_npz_files, dem_npy_dir)
-    test_dataset = SplitPrecipitationDataset(test_npz_files, dem_npy_dir)
+    # Create datasets
+    train_dataset = ZarrPatchDataset(
+        metadata_file_path=os.path.join(METADATA_DIR, "train_patches_metadata.txt"),
+        all_zarr_folder_info=loaded_zarr_info,
+        dem_patch_dir=DEM_PATCH_DIR,
+        patch_size=config["PATCH_SIZE"],
+        downscaling_factor=config["DOWNSCALING_FACTOR"],
+        declutter_threshold=config["DECLUTTER_THRESHOLD"],
+        transform_input_precip=True,  # Set to False if your model expects raw HR input
+    )
+    val_dataset = ZarrPatchDataset(
+        metadata_file_path=os.path.join(METADATA_DIR, "val_patches_metadata.txt"),
+        all_zarr_folder_info=loaded_zarr_info,
+        dem_patch_dir=DEM_PATCH_DIR,
+        patch_size=config["PATCH_SIZE"],
+        downscaling_factor=config["DOWNSCALING_FACTOR"],
+        declutter_threshold=config["DECLUTTER_THRESHOLD"],
+        transform_input_precip=True,
+    )
+    test_dataset = ZarrPatchDataset(
+        metadata_file_path=os.path.join(METADATA_DIR, "test_patches_metadata.txt"),
+        all_zarr_folder_info=loaded_zarr_info,
+        dem_patch_dir=DEM_PATCH_DIR,
+        patch_size=config["PATCH_SIZE"],
+        downscaling_factor=config["DOWNSCALING_FACTOR"],
+        declutter_threshold=config["DECLUTTER_THRESHOLD"],
+        transform_input_precip=True,
+    )
 
-    print("\n--- Creating DataLoaders ---")
-    train_loader = create_dataloader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = create_dataloader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-    test_loader = create_dataloader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config["BATCH_SIZE"],
+        shuffle=True,
+        num_workers=config["NUM_WORKERS"],
+        pin_memory=True,
+    )
 
-    print(f"Train DataLoader has {len(train_loader)} batches of size {BATCH_SIZE}")
-    print(f"Validation DataLoader has {len(val_loader)} batches of size {BATCH_SIZE}")
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config["BATCH_SIZE"],
+        shuffle=False,
+        num_workers=config["NUM_WORKERS"],
+        pin_memory=True,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config["BATCH_SIZE"],
+        shuffle=False,
+        num_workers=config["NUM_WORKERS"],
+        pin_memory=True,
+    )
+
+    print(f"Train DataLoader has {len(train_loader)} batches.")
+    print(f"Validation DataLoader has {len(val_loader)} batches.")
+    print(f"Test DataLoader has {len(test_loader)} batches.")
 
     # --- Initialize Model, Optimizer, Loss Function ---
     print("\n--- Initializing Model, Optimizer, Loss Function ---")
-    model = UNet(dropout_prob=DROPOUT_PROB)
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    model = UNet(dropout_p=config["DROPOUT_PROB"])
+    optimizer = optim.Adam(model.parameters(), lr=config["LEARNING_RATE"])
     loss_fn = nn.MSELoss()
 
     # --- Start Training ---
     print("\n--- Starting Training Process ---")
-    best_model_path = train_model(
+    _ = train_model(
         model,
         train_loader,
         val_loader,
         optimizer,
         loss_fn,
-        device,
-        NUM_EPOCHS,
-        PATIENCE,
-        checkpoint_dir,
-        EARLY_STOPPING,
+        config["device"],
+        config["NUM_EPOCHS"],
+        config["PATIENCE"],
+        exp_path,
+        config["EARLY_STOPPING"],
     )
 
     print("\nTraining process complete.")
 
-    print("\n--- Starting Evaluation Process ---")
-    test_loss = evaluate_model(
-        model,
-        test_loader,
-        loss_fn,
-        device,
-        model_path=best_model_path,
-    )
-    print(f"Evaluation complete. Final Test Loss: {test_loss:.6f}")
+
+if __name__ == "__main__":
+    main()

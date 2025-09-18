@@ -31,7 +31,12 @@ def train_model(
     """
     os.makedirs(checkpoint_dir, exist_ok=True)
     best_val_loss = float("inf")
-    model.to(device)
+    if torch.cuda.device_count() > 1:
+        # logger.info(f"MODEL: Using {torch.cuda.device_count()} GPUs!")
+        model = torch.nn.DataParallel(model)
+    # else:
+    #     logger.info("MODEL: Using single GPU or CPU.")
+    # logger.info(f"MODEL: Moving model to device: {device} ...")
 
     print(f"Starting training on device: {device}")
 
@@ -46,17 +51,18 @@ def train_model(
         train_pbar = tqdm(
             train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]", leave=False
         )
-        for batch_idx, batch_data in enumerate(train_pbar):
-            coarse_precip = batch_data["coarse_precip"].to(device)
-            interpolated_precip = batch_data["interpolated_precip"].to(device)
-            elevation = batch_data["elevation"].to(device)
-            target_normalized_precip = batch_data["target_normalized_precip"].to(device)
+        for batch_idx, (interp, coarse, target, dem) in enumerate(train_pbar):
+
+            interpolated_precip = interp.to(device)
+            coarse_precip = coarse.to(device)
+            elevation = dem.to(device)
+            target_normalized_precip = target.to(device)
 
             # Zero the parameter gradients
             optimizer.zero_grad()
 
             # Forward pass
-            outputs = model(coarse_precip, interpolated_precip, elevation)
+            outputs = model(interpolated_precip, coarse_precip, elevation)
 
             # Calculate loss
             loss = loss_fn(outputs, target_normalized_precip)
