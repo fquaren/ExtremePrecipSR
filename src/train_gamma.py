@@ -115,34 +115,48 @@ def compute_gamma_matrix_for_image(prec_2d_data, thresholds, pixel_size_km=1.0):
     return gamma_matrix
 
 
-def estimate_S_inv_from_dataset(
+def estimate_S_inv_from_dataset_separate(
     dataset_of_target_precip_fields,
     global_quantiles_as_thresholds,
     pixel_size_km,
     regularization_epsilon=1e-6,
 ):
-    all_gamma_vectors_flat = []
+    all_gamma_A = []
+    all_gamma_P = []
+    all_gamma_CC = []
+
     for i, prec_field in enumerate(dataset_of_target_precip_fields):
         gamma_matrix = compute_gamma_matrix_for_image(
             prec_field, global_quantiles_as_thresholds, pixel_size_km
         )
-        all_gamma_vectors_flat.append(gamma_matrix.flatten())
-    if not all_gamma_vectors_flat:
+        all_gamma_A.append(gamma_matrix[0, :])
+        all_gamma_P.append(gamma_matrix[1, :])
+        all_gamma_CC.append(gamma_matrix[2, :])
+
+    if not all_gamma_A:
         raise ValueError(
             "Dataset of target precipitation fields is empty. Cannot estimate S_inv."
         )
-    all_gamma_vectors_np = np.array(all_gamma_vectors_flat)
-    S = np.cov(all_gamma_vectors_np, rowvar=False)
-    S += np.eye(S.shape[0]) * regularization_epsilon
-    S_inv = np.linalg.inv(S)
-    return S_inv
 
+    # Convert to numpy arrays
+    all_gamma_A_np = np.array(all_gamma_A)
+    all_gamma_P_np = np.array(all_gamma_P)
+    all_gamma_CC_np = np.array(all_gamma_CC)
 
-def mahalanobis_distance(vec1, vec2, S_inv):
-    diff = vec1 - vec2
-    if diff.ndim == 2:
-        diff = diff.flatten()
-    return np.sqrt(diff.T @ S_inv @ diff)
+    # Compute covariance and inverse for each component
+    S_A = np.cov(all_gamma_A_np, rowvar=False)
+    S_P = np.cov(all_gamma_P_np, rowvar=False)
+    S_CC = np.cov(all_gamma_CC_np, rowvar=False)
+
+    S_A += np.eye(S_A.shape[0]) * regularization_epsilon
+    S_P += np.eye(S_P.shape[0]) * regularization_epsilon
+    S_CC += np.eye(S_CC.shape[0]) * regularization_epsilon
+
+    S_A_inv = np.linalg.inv(S_A)
+    S_P_inv = np.linalg.inv(S_P)
+    S_CC_inv = np.linalg.inv(S_CC)
+
+    return S_A_inv, S_P_inv, S_CC_inv
 
 
 class PreprocessedNpzDataset(Dataset):
@@ -190,14 +204,103 @@ class PreprocessedNpzDataset(Dataset):
         return input_for_model, output_precip
 
 
+class GeometricLossSeparate(nn.Module):
+    def __init__(self, S_inv_tensors, quantile_levels, pixel_size_km=1.0):
+        super(GeometricLossSeparate, self).__init__()
+        self.S_A_inv, self.S_P_inv, self.S_CC_inv = S_inv_tensors
+        self.quantile_levels = quantile_levels
+        self.pixel_size_km = pixel_size_km
+
+    def forward(self, gamma_pred_3d, prec_2d_target_batch):
+        prec_2d_target_batch_np = prec_2d_target_batch.squeeze(1).cpu().numpy()
+        gamma_target_batch_list = []
+        for i in range(prec_2d_target_batch_np.shape[0]):
+            gamma_matrix = compute_gamma_matrix_for_image(
+                prec_2d_target_batch_np[i],
+                self.quantile_levels,
+                self.pixel_size_km,
+            )
+            gamma_target_batch_list.append(gamma_matrix)
+
+        gamma_target_batch_3d = (
+            torch.from_numpy(np.array(gamma_target_batch_list))
+            .float()
+            .to(self.S_A_inv.device)
+        )
+
+        # 1. Separate the predicted and target gamma vectors for each component
+        pred_A = gamma_pred_3d[:, 0, :]  # Shape: (B, N_quantiles)
+        pred_P = gamma_pred_3d[:, 1, :]
+        pred_CC = gamma_pred_3d[:, 2, :]
+
+        target_A = gamma_target_batch_3d[:, 0, :]
+        target_P = gamma_target_batch_3d[:, 1, :]
+        target_CC = gamma_target_batch_3d[:, 2, :]
+
+        # 2. Compute the Mahalanobis distance for each component
+        diff_A = pred_A - target_A
+        loss_A_sq = torch.sum((diff_A @ self.S_A_inv) * diff_A, dim=1)
+
+        diff_P = pred_P - target_P
+        loss_P_sq = torch.sum((diff_P @ self.S_P_inv) * diff_P, dim=1)
+
+        diff_CC = pred_CC - target_CC
+        loss_CC_sq = torch.sum((diff_CC @ self.S_CC_inv) * diff_CC, dim=1)
+
+        # 3. Sum the square roots and take the mean over the batch
+        total_loss = torch.mean(
+            torch.sqrt(loss_A_sq) + torch.sqrt(loss_P_sq) + torch.sqrt(loss_CC_sq)
+        )
+
+        return total_loss
+
+
+# New Combined Loss Class
+class CombinedLoss(nn.Module):
+    def __init__(self, geometric_loss, normal_loss, alpha=0.1):
+        super(CombinedLoss, self).__init__()
+        self.geometric_loss = geometric_loss
+        self.normal_loss = normal_loss
+        self.alpha = alpha
+
+    def forward(self, pred_gamma, target_gamma_precip):
+        # Geometric loss on the 3D tensors (will internally compute target gamma)
+        geo_loss = self.geometric_loss.forward(pred_gamma, target_gamma_precip)
+
+        # Calculate the normal loss (L1/MAE)
+        prec_2d_target_batch_np = target_gamma_precip.squeeze(1).cpu().numpy()
+        gamma_target_batch_list = []
+        for i in range(prec_2d_target_batch_np.shape[0]):
+            gamma_matrix = compute_gamma_matrix_for_image(
+                prec_2d_target_batch_np[i],
+                self.geometric_loss.quantile_levels,
+                self.geometric_loss.pixel_size_km,
+            )
+            gamma_target_batch_list.append(gamma_matrix)
+        gamma_target_batch_3d = (
+            torch.from_numpy(np.array(gamma_target_batch_list))
+            .float()
+            .to(pred_gamma.device)
+        )
+
+        # Flatten the predicted gamma and target gamma for L1 loss
+        pred_gamma_flat = pred_gamma.view(pred_gamma.shape[0], -1)
+        target_gamma_flat = gamma_target_batch_3d.view(
+            gamma_target_batch_3d.shape[0], -1
+        )
+
+        normal_l1_loss = self.normal_loss(pred_gamma_flat, target_gamma_flat)
+
+        # Return the weighted sum
+        return geo_loss + self.alpha * normal_l1_loss, geo_loss, normal_l1_loss
+
+
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-# --- 1. Estimate S_inv from a subset of the training data ---
-print("Estimating S_inv from training data subset...")
-# The dataset init and S_inv estimation remain the same, as they
-# correctly work on the 'target_precip' from the dataset.
+# --- 1. Estimate separate S_inv matrices from a subset of the training data ---
+print("Estimating separate S_inv matrices from training data subset...")
 temp_dataset_for_S_inv = PreprocessedNpzDataset(
     preprocessed_data_dir=os.path.join(PREPROCESSED_DATA_DIR, "train"),
     dem_patch_dir=DEM_PATCH_DIR,
@@ -210,19 +313,22 @@ indices = torch.randperm(len(temp_dataset_for_S_inv)).tolist()[:num_samples_for_
 
 target_precip_fields_for_S_inv = []
 for i in tqdm(indices, desc="Collecting S_inv estimation samples"):
-    # Correctly unpack the two-item tuple returned by __getitem__
-    # Note: Both items are the same now, so we can use either
     _, target_precip = temp_dataset_for_S_inv[i]
     target_precip_fields_for_S_inv.append(target_precip.squeeze(0).numpy())
 
-S_inv = estimate_S_inv_from_dataset(
+# The new function call returns three matrices
+S_A_inv, S_P_inv, S_CC_inv = estimate_S_inv_from_dataset_separate(
     target_precip_fields_for_S_inv,
     global_quantiles_as_thresholds=QUANTILE_LEVELS,
     pixel_size_km=1.0,
 )
-print("S_inv estimation complete.")
+print("Separate S_inv estimation complete.")
 
-S_inv_torch = torch.from_numpy(S_inv).float().to(device)
+# Convert each numpy array to a PyTorch tensor
+S_A_inv_torch = torch.from_numpy(S_A_inv).float().to(device)
+S_P_inv_torch = torch.from_numpy(S_P_inv).float().to(device)
+S_CC_inv_torch = torch.from_numpy(S_CC_inv).float().to(device)
+
 
 # --- 2. Prepare Datasets and DataLoaders ---
 train_dataset_full = PreprocessedNpzDataset(
@@ -292,82 +398,11 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, mode="min", factor=0.5, patience=5
 )
 
-
-class GeometricLoss(nn.Module):
-    def __init__(self, S_inv_tensor, quantile_levels, pixel_size_km=1.0):
-        super(GeometricLoss, self).__init__()
-        self.S_inv = S_inv_tensor
-        self.quantile_levels = quantile_levels
-        self.pixel_size_km = pixel_size_km
-
-    def forward(self, gamma_pred_3d, prec_2d_target_batch):
-        # --- MODIFIED: Flatten the predicted gamma batch ---
-        # Reshape from (B, 3, N_quantiles) to (B, 3 * N_quantiles)
-        gamma_pred_flat_batch = gamma_pred_3d.view(gamma_pred_3d.shape[0], -1)
-
-        prec_2d_target_batch_np = prec_2d_target_batch.squeeze(1).cpu().numpy()
-
-        gamma_target_batch_list = []
-        for i in range(prec_2d_target_batch_np.shape[0]):
-            gamma_matrix = compute_gamma_matrix_for_image(
-                prec_2d_target_batch_np[i],
-                self.quantile_levels,
-                self.pixel_size_km,
-            )
-            gamma_target_batch_list.append(gamma_matrix.flatten())
-
-        gamma_target_batch = (
-            torch.from_numpy(np.array(gamma_target_batch_list))
-            .float()
-            .to(self.S_inv.device)
-        )
-
-        diff = gamma_pred_flat_batch - gamma_target_batch
-        batch_mahalanobis_sq = torch.diag(diff @ self.S_inv @ diff.T)
-        return torch.mean(torch.sqrt(batch_mahalanobis_sq))
-
-
-# New Combined Loss Class
-class CombinedLoss(nn.Module):
-    def __init__(self, geometric_loss, normal_loss, alpha=0.1):
-        super(CombinedLoss, self).__init__()
-        self.geometric_loss = geometric_loss
-        self.normal_loss = normal_loss
-        self.alpha = alpha
-
-    def forward(self, pred_gamma, target_gamma_precip):
-        # --- MODIFIED: The geometric loss now handles the 3D tensor directly ---
-        geo_loss = self.geometric_loss(pred_gamma, target_gamma_precip)
-
-        # Calculate the normal loss (L1/MAE)
-        # Note: We need the target gamma vector for this.
-        prec_2d_target_batch_np = target_gamma_precip.squeeze(1).cpu().numpy()
-        gamma_target_batch_list = []
-        for i in range(prec_2d_target_batch_np.shape[0]):
-            gamma_matrix = compute_gamma_matrix_for_image(
-                prec_2d_target_batch_np[i],
-                self.geometric_loss.quantile_levels,
-                self.geometric_loss.pixel_size_km,
-            )
-            gamma_target_batch_list.append(gamma_matrix.flatten())
-
-        gamma_target_batch = (
-            torch.from_numpy(np.array(gamma_target_batch_list))
-            .float()
-            .to(pred_gamma.device)
-        )
-
-        # --- MODIFIED: Flatten the predicted gamma for L1 loss ---
-        pred_gamma_flat = pred_gamma.view(pred_gamma.shape[0], -1)
-
-        normal_l1_loss = self.normal_loss(pred_gamma_flat, gamma_target_batch)
-
-        # Return the weighted sum
-        return geo_loss + self.alpha * normal_l1_loss, geo_loss, normal_l1_loss
-
-
-# Initialize the new loss classes
-geometric_criterion = GeometricLoss(S_inv_torch, QUANTILE_LEVELS).to(device)
+# Initialize the new loss classes with the three matrices
+geometric_criterion = GeometricLossSeparate(
+    S_inv_tensors=(S_A_inv_torch, S_P_inv_torch, S_CC_inv_torch),
+    quantile_levels=QUANTILE_LEVELS,
+).to(device)
 normal_l1_criterion = nn.L1Loss().to(device)
 
 # The new main criterion
