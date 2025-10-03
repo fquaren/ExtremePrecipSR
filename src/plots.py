@@ -6,6 +6,8 @@ from torch.utils.data import DataLoader, Dataset, Subset
 import numpy as np
 import os
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # Required for 3D plotting
 
 # --- Configuration Loading ---
 config_path = (
@@ -140,6 +142,60 @@ def estimate_S_from_precomputed(gamma_targets_dataset):
     S_CC = np.cov(all_gamma_CC, rowvar=False) + np.eye(N_QUANTILES) * 1e-6
 
     return S_A, S_P, S_CC
+
+
+# --- Visualization Function ---
+def plot_3d_precipitation_surface(dataset, sample_index):
+    """
+    Plots a 3D surface of a precipitation patch from the dataset. 📈
+
+    The elevation of the surface at each point corresponds to the
+    precipitation intensity at that pixel.
+
+    Args:
+        dataset (Dataset): The dataset object containing precipitation data.
+        sample_index (int): The index of the sample to retrieve and plot.
+    """
+    # --- 1. Retrieve and process data ---
+    if not (0 <= sample_index < len(dataset)):
+        print(
+            f"Error: sample_index {sample_index} is out of bounds for the dataset (size: {len(dataset)})."
+        )
+        return
+
+    # Get the original precipitation data tensor from the dataset
+    precip_tensor, _ = dataset[sample_index]
+
+    # Convert to a 2D numpy array for plotting: (C, H, W) -> (H, W)
+    precip_data = precip_tensor.squeeze().cpu().numpy()
+
+    # --- 2. Create grid for plotting ---
+    height, width = precip_data.shape
+    x = np.arange(0, width, 1)
+    y = np.arange(0, height, 1)
+    X, Y = np.meshgrid(x, y)
+
+    # --- 3. Generate the 3D plot ---
+    fig = plt.figure(figsize=(12, 8))
+    ax = fig.add_subplot(111, projection="3d")
+
+    # Create the surface plot with a suitable colormap
+    surf = ax.plot_surface(X, Y, precip_data, cmap="viridis", edgecolor="none")
+
+    # --- 4. Customize the plot for clarity ---
+    ax.set_title(f"3D Surface Plot of Precipitation - Sample {sample_index}")
+    ax.set_xlabel("X Coordinate (pixels)")
+    ax.set_ylabel("Y Coordinate (pixels)")
+    ax.set_zlabel("Precipitation Intensity")
+
+    # Add a color bar to map values to colors
+    fig.colorbar(surf, shrink=0.6, aspect=10, label="Precipitation Intensity")
+
+    # Adjust viewing angle for better perspective
+    ax.view_init(elev=30, azim=-60)
+
+    # --- 5. Show the plot ---
+    plt.show()
 
 
 # --- Loss Functions (Refactored) ---
@@ -305,3 +361,15 @@ if __name__ == "__main__":
             print("Model checkpoint saved.")
 
     print("Training complete.")
+
+    # --- 6. Evaluation & Visualization ---
+    print("\nLoading test dataset for visualization...")
+    test_dataset = PreprocessedNpzDataset(
+        preprocessed_data_dir=os.path.join(PREPROCESSED_DATA_DIR, "test"),
+        metadata_file=TEST_METADATA_FILE,
+    )
+
+    # You can now use the plotting function on any sample from the test set
+    print("Generating 3D plot for a test sample...")
+    # Feel free to change the sample_index to view different images
+    plot_3d_precipitation_surface(dataset=test_dataset, sample_index=42)
