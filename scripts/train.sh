@@ -13,8 +13,8 @@
 #SBATCH --gres-flags enforce-binding
 #SBATCH --nodes 1
 #SBATCH --ntasks 1
-#SBATCH --mem 500G
-#SBATCH --time 20:00:00
+#SBATCH --mem 50G
+#SBATCH --time 12:00:00
 
 export SINGULARITY_BINDPATH="/work,/scratch,/users"
 

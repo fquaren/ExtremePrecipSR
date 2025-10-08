@@ -1,12 +1,12 @@
 # Paths
 RAW_OPERA_DATA_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data/OPERA"
 METADATA_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/metadata_v2"
-PREPROCESSED_DATA_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches_v2/precip"
+PREPROCESSED_DATA_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/precip"
 
 # OLD
-# TRAIN_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/train_patches_metadata.txt"
-# VAL_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/val_patches_metadata.txt"
-# TEST_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/test_patches_metadata.txt"
+TRAIN_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/train_patches_metadata.txt"
+VAL_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/val_patches_metadata.txt"
+TEST_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/test_patches_metadata.txt"
 # DEM_PATCH_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/dem"
 # EXPERIEMENTS_DIR: "/scratch/fquareng/experiments_2"
 
@@ -16,7 +16,8 @@ PATCH_SIZE: 128
 DOWNSCALING_FACTOR: 6
 DECLUTTER_THRESHOLD: 150.0
 
-ANALYSIS_DATA_PERCENTAGE: 50 # Use 100% of the data. Change to 50 for 50%, etc.
+
+ANALYSIS_DATA_PERCENTAGE: 100 # Use 100% of the data. Change to 50 for 50%, etc.
 
 # Ratios for splitting the dataset. Must sum to 1.0.
 SPLIT_RATIOS:
@@ -36,6 +37,7 @@ DROPOUT_PROB: 0.3
 S_ESTIMATION_SAMPLES: 10000
 
 # Training
+LAMBDA_ZERO_PENALTY: 2.0
 SUBSAMPLE_FRACTION: 1
 device: "cuda"
 NUM_EPOCHS: 100
