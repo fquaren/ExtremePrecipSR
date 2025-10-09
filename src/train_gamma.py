@@ -7,10 +7,11 @@ import torchvision.transforms as T
 import numpy as np
 import os
 from tqdm import tqdm
+from datetime import datetime
 
 # --- Configuration Loading ---
 config_path = (
-    "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/config.yaml"
+    "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrePrecipSR/config.yaml"
 )
 with open(config_path, "r") as file:
     config = yaml.safe_load(file)
@@ -25,7 +26,10 @@ VAL_METADATA_FILE = config["VAL_METADATA_FILE"]
 TEST_METADATA_FILE = config["TEST_METADATA_FILE"]
 BATCH_SIZE = config.get("BATCH_SIZE", 16)
 LEARNING_RATE = config.get("LEARNING_RATE", 1e-4)
+WEIGHT_DECAY = config.get("WEIGHT_DECAY", 1e-5)
 NUM_EPOCHS = config.get("NUM_EPOCHS", 10)
+EARLY_STOPPING_PATIENCE = config.get("EARLY_STOPPING_PATIENCE", 10)
+EXPERIMENT_NAME = config.get("EXPERIMENT_NAME", "Debugging")
 
 
 # --- Model Definition ---
@@ -157,9 +161,24 @@ class PreprocessedNpzDataset(Dataset):
 
 
 # --- CDF-Weighted Integral Loss Function ---
-class CDFWeightedIntegralLoss(nn.Module):
+# class CDFWeightedIntegralLoss(nn.Module):
+#     def __init__(self, quantile_levels):
+#         super(CDFWeightedIntegralLoss, self).__init__()
+#         self.register_buffer(
+#             "quantiles", torch.tensor(quantile_levels, dtype=torch.float32)
+#         )
+
+#     def forward(self, gamma_pred_3d, gamma_target_3d):
+#         abs_diff = torch.abs(gamma_pred_3d - gamma_target_3d)
+#         integrand = abs_diff * self.quantiles
+#         integral_per_component = torch.trapezoid(integrand, self.quantiles, dim=2)
+#         total_integral_per_sample = torch.sum(integral_per_component, dim=1)
+#         return torch.mean(total_integral_per_sample)
+
+
+class ComponentWiseCDFLoss(nn.Module):
     def __init__(self, quantile_levels):
-        super(CDFWeightedIntegralLoss, self).__init__()
+        super(ComponentWiseCDFLoss, self).__init__()
         self.register_buffer(
             "quantiles", torch.tensor(quantile_levels, dtype=torch.float32)
         )
@@ -167,15 +186,35 @@ class CDFWeightedIntegralLoss(nn.Module):
     def forward(self, gamma_pred_3d, gamma_target_3d):
         abs_diff = torch.abs(gamma_pred_3d - gamma_target_3d)
         integrand = abs_diff * self.quantiles
+        # Shape: (B, 3) -> each column is the integrated loss for A, P, or CC
         integral_per_component = torch.trapezoid(integrand, self.quantiles, dim=2)
-        total_integral_per_sample = torch.sum(integral_per_component, dim=1)
-        return torch.mean(total_integral_per_sample)
+
+        # Return the mean loss for each component separately
+        return (
+            torch.mean(integral_per_component[:, 0]),  # Loss for Area
+            torch.mean(integral_per_component[:, 1]),  # Loss for Perimeter
+            torch.mean(integral_per_component[:, 2]),  # Loss for CC
+        )
 
 
 # --- Main Execution ---
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+
+    # Create a unique directory for this experiment run
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_name = f"{EXPERIMENT_NAME}_{timestamp}"
+    output_dir = os.path.join("experiment_runs", run_name)
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"Saving experiment artifacts to: {output_dir}")
+
+    # Save the config file for reproducibility
+    try:
+        with open(os.path.join(output_dir, "config.yaml"), "w") as f:
+            yaml.dump(config, f)
+    except IOError as e:
+        print(f"Error saving config file: {e}")
 
     # --- 1. Prepare Datasets ---
     train_dataset_full = PreprocessedNpzDataset(
@@ -220,34 +259,45 @@ if __name__ == "__main__":
     )
 
     # --- 3. Initialize Model, Optimizer, and Loss ---
+    # We learn the log variance for numerical stability.
+    log_var_A = torch.zeros((1,), requires_grad=True, device=device)
+    log_var_P = torch.zeros((1,), requires_grad=True, device=device)
+    log_var_CC = torch.zeros((1,), requires_grad=True, device=device)
+
     model = GammaPredictor(activation_fn=F.mish).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = torch.optim.Adam(
+        model.parameters() + [log_var_A, log_var_P, log_var_CC],
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
+    )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=5
     )
 
-    criterion = CDFWeightedIntegralLoss(quantile_levels=QUANTILE_LEVELS).to(device)
+    # criterion = CDFWeightedIntegralLoss(quantile_levels=QUANTILE_LEVELS).to(device)
+    criterion = ComponentWiseCDFLoss(quantile_levels=QUANTILE_LEVELS)
     lambda_zero_penalty = config.get("LAMBDA_ZERO_PENALTY", 10.0)
     print(f"Using zero penalty with lambda = {lambda_zero_penalty}")
 
-    # Set up a log file to save epoch results
-    log_file_path = "training_log.csv"
+    # Update log file path to be inside the experiment directory
+    log_file_path = os.path.join(output_dir, "training_log.csv")
     try:
         with open(log_file_path, "w") as log_file:
-            # Write the header for the CSV file
             log_file.write(
                 "epoch,train_loss_total,train_loss_main,train_loss_penalty,"
                 "val_loss_total,val_loss_main,val_loss_penalty\n"
             )
-        print(f"Log file created at {log_file_path}")
+        print(f"Log file will be saved to {log_file_path}")
     except IOError as e:
         print(f"Error creating log file: {e}")
-        # Exit or handle the error as appropriate
         exit()
 
     # --- 4. Training & Validation Loop ---
     print("Starting training...")
     best_val_loss = float("inf")
+    patience_counter = 0
+    print(f"Early stopping patience set to {EARLY_STOPPING_PATIENCE} epochs.")
+
     for epoch in range(NUM_EPOCHS):
         # --- Training ---
         model.train()
@@ -259,15 +309,25 @@ if __name__ == "__main__":
             optimizer.zero_grad()
             predicted_gamma_3d = model(input_data)
 
-            main_loss = criterion(predicted_gamma_3d, target_gamma)
+            # 1. Get the individual loss for each component
+            loss_A, loss_P, loss_CC = criterion(predicted_gamma_3d, target_gamma)
+            # 2. Apply the homoscedastic uncertainty formula
+            # Note: A more stable form is exp(-s)*L + s, where s = log(sigma^2)
+            term_A = torch.exp(-log_var_A) * loss_A + log_var_A
+            term_P = torch.exp(-log_var_P) * loss_P + log_var_P
+            term_CC = torch.exp(-log_var_CC) * loss_CC + log_var_CC
+            # The main loss
+            main_loss = (term_A + term_P + term_CC) * 0.5
+
             is_dry_mask = input_data.sum(dim=(1, 2, 3)) <= 1e-6
             zero_penalty = torch.tensor(0.0, device=device)
             if is_dry_mask.sum() > 0:
                 predictions_for_dry_inputs = predicted_gamma_3d[is_dry_mask]
-                zero_penalty = torch.sum(predictions_for_dry_inputs**2)
+                zero_penalty = torch.sum(torch.abs(predictions_for_dry_inputs))
 
             total_loss = main_loss + lambda_zero_penalty * zero_penalty
             total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             running_loss += total_loss.item()
@@ -283,7 +343,6 @@ if __name__ == "__main__":
 
         # --- Validation ---
         model.eval()
-        # Add accumulators for validation loss components
         val_running_loss, val_running_main_loss, val_running_penalty = 0.0, 0.0, 0.0
         with torch.no_grad():
             for input_data, target_gamma in tqdm(
@@ -299,31 +358,38 @@ if __name__ == "__main__":
                 zero_penalty = torch.tensor(0.0, device=device)
                 if is_dry_mask.sum() > 0:
                     predictions_for_dry_inputs = predicted_gamma_3d[is_dry_mask]
-                    zero_penalty = torch.sum(predictions_for_dry_inputs**2)
+                    zero_penalty = torch.sum(torch.abs(predictions_for_dry_inputs))
 
                 total_loss = main_loss + lambda_zero_penalty * zero_penalty
                 val_running_loss += total_loss.item()
-                # Accumulate validation loss components
                 val_running_main_loss += main_loss.item()
                 val_running_penalty += zero_penalty.item()
 
         avg_val_loss = val_running_loss / len(val_loader)
-        # Calculate average validation loss components
         avg_val_main_loss = val_running_main_loss / len(val_loader)
         avg_val_penalty = val_running_penalty / len(val_loader)
 
         scheduler.step(avg_val_loss)
-        # Update print statement to include validation components
         print(
             f"Epoch {epoch+1} Val Loss: Total={avg_val_loss:.4f} (Main={avg_val_main_loss:.4f}, Penalty={avg_val_penalty:.4f})"
         )
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), "best_gamma_predictor_model.pth")
-            print("Model checkpoint saved.")
+            # Update model save path
+            model_save_path = os.path.join(output_dir, "best_gamma_predictor_model.pth")
+            torch.save(model.state_dict(), model_save_path)
+            print(f"Model checkpoint saved to {model_save_path}.")
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            print(f"No improvement in validation loss for {patience_counter} epoch(s).")
+            if patience_counter >= EARLY_STOPPING_PATIENCE:
+                print(
+                    f"Early stopping triggered after {EARLY_STOPPING_PATIENCE} epochs without improvement."
+                )
+                break
 
-        # Log the results for the epoch to the CSV file
         try:
             with open(log_file_path, "a") as log_file:
                 log_file.write(
@@ -332,3 +398,5 @@ if __name__ == "__main__":
                 )
         except IOError as e:
             print(f"Error writing to log file: {e}")
+
+    print("Training complete.")

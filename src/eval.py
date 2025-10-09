@@ -1,45 +1,31 @@
 import yaml
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 import numpy as np
 import os
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D  # <-- ADDED IMPORT
 import matplotlib.gridspec as gridspec
-from skimage import measure, morphology
-from scipy.ndimage import label
 import torch.nn.functional as F
 from torch.utils.data import Dataset
-
-# --- Configuration Loading ---
-config_path = (
-    "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/config.yaml"
-)
-with open(config_path, "r") as file:
-    config = yaml.safe_load(file)
-
-QUANTILE_LEVELS = config["QUANTILE_LEVELS"]
-N_QUANTILES = len(QUANTILE_LEVELS)
-N = N_QUANTILES * 3
-PATCH_SIZE = config["PATCH_SIZE"]
-PREPROCESSED_DATA_DIR = config["PREPROCESSED_DATA_DIR"]
-DEM_PATCH_DIR = config["DEM_PATCH_DIR"]
-TEST_METADATA_FILE = config["TEST_METADATA_FILE"]
-BATCH_SIZE = config.get("BATCH_SIZE", 16)
+import argparse
+import pandas as pd
 
 
 # --- Model Definition ---
 class GammaPredictor(nn.Module):
+    # This class must be identical to the one used for training.
     def __init__(
         self,
-        input_shape=(1, PATCH_SIZE, PATCH_SIZE),
-        num_output_features_flat=N,
-        n_quantiles=N_QUANTILES,
+        input_shape,
+        num_output_features_flat,
+        n_quantiles,
+        activation_fn=F.gelu,
     ):
         super(GammaPredictor, self).__init__()
         self.n_quantiles = n_quantiles
+        self.activation = activation_fn
         self.conv1 = nn.Conv2d(in_channels=1, out_channels=16, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(16)
         self.conv2 = nn.Conv2d(
@@ -60,325 +46,372 @@ class GammaPredictor(nn.Module):
 
     def _get_conv_output_size(self, shape):
         with torch.no_grad():
-            input_tensor = torch.rand(1, *shape)
-            output = self._forward_conv(input_tensor)
+            input = torch.rand(1, *shape)
+            output = self._forward_conv(input)
             return int(np.prod(output.size()[1:]))
 
     def _forward_conv(self, x):
-        x = self.pool(F.relu(self.bn1(self.conv1(x))))
-        x = self.pool(F.relu(self.bn2(self.conv2(x))))
-        x = self.pool(F.relu(self.bn3(self.conv3(x))))
+        x = self.pool(self.activation(self.bn1(self.conv1(x))))
+        x = self.pool(self.activation(self.bn2(self.conv2(x))))
+        x = self.pool(self.activation(self.bn3(self.conv3(x))))
         return x
 
     def forward(self, x):
         x = self._forward_conv(x)
         x = x.view(-1, self.fc_input_size)
-        x = F.relu(self.fc1(x))
+        x = self.activation(self.fc1(x))
         x = self.dropout1(x)
-        x = F.relu(self.fc2(x))
+        x = self.activation(self.fc2(x))
         x = self.dropout2(x)
         x = self.fc3(x)
         x = x.view(-1, 3, self.n_quantiles)
         return x
 
 
-# --- Data Handling and Gamma Computation ---
-def compute_A_P_CC_single_threshold_numpy(prec_2d_np, threshold, pixel_size_km=1.0):
-    prec_2d_np_clean = np.nan_to_num(prec_2d_np, nan=-1.0)
-    mask = prec_2d_np_clean >= threshold
-    area_km2 = mask.sum() * (pixel_size_km**2)
-    contours = measure.find_contours(mask.astype(float), 0.5)
-    perimeter_pixels = sum(
-        np.linalg.norm(np.diff(c, axis=0), axis=1).sum() for c in contours
-    )
-    perimeter_km = perimeter_pixels * pixel_size_km
-    structure = morphology.disk(1)
-    _, num_features = label(mask, structure=structure)
-    return np.array([area_km2, perimeter_km, num_features], dtype=np.float32)
-
-
-def compute_gamma_matrix_for_image(prec_2d_data, thresholds, pixel_size_km=1.0):
-    gamma_matrix = np.zeros((3, len(thresholds)), dtype=np.float32)
-    for i, threshold_value in enumerate(thresholds):
-        gamma_matrix[:, i] = compute_A_P_CC_single_threshold_numpy(
-            prec_2d_data, threshold_value, pixel_size_km
+# This class is now used as an interpretable EVALUATION METRIC.
+# It calculates the total error per sample, which is ideal for ranking predictions.
+class TotalErrorMetric(nn.Module):
+    def __init__(self, quantile_levels):
+        super(TotalErrorMetric, self).__init__()
+        self.register_buffer(
+            "quantiles", torch.tensor(quantile_levels, dtype=torch.float32)
         )
-    return gamma_matrix
+
+    def forward(self, gamma_pred_3d, gamma_target_3d):
+        """Returns the total error for each sample in the batch."""
+        abs_diff = torch.abs(gamma_pred_3d - gamma_target_3d)
+        integrand = abs_diff * self.quantiles
+        integral_per_component = torch.trapezoid(integrand, self.quantiles, dim=2)
+        # Return the sum of errors per-sample, shape: (B,)
+        total_integral_per_sample = torch.sum(integral_per_component, dim=1)
+        return total_integral_per_sample
 
 
+# --- Dataset Definition ---
 class PreprocessedNpzDataset(Dataset):
-    def __init__(self, preprocessed_data_dir, dem_patch_dir, metadata_file):
+    def __init__(self, preprocessed_data_dir, metadata_file):
         print(f"Loading data from {preprocessed_data_dir}...")
         with open(metadata_file, "r") as f:
             self.metadata = [line.strip().split(",") for line in f]
         precip_path = os.path.join(preprocessed_data_dir, "original_precip.npz")
-        self.original_patches = np.load(precip_path)["data"]
-        if len(self.metadata) != self.original_patches.shape[0]:
-            raise ValueError("Metadata and patch count mismatch.")
-        print(f"Loaded {len(self.metadata)} precipitation patches.")
+        gamma_path = os.path.join(preprocessed_data_dir, "gamma_targets.npz")
+        self.input_patches = np.load(precip_path, mmap_mode="r")["data"]
+        self.original_precip_patches = np.load(precip_path, mmap_mode="r")["data"]
+        self.gamma_targets = np.load(gamma_path, mmap_mode="r")["data"]
+        if not (
+            len(self.metadata)
+            == self.input_patches.shape[0]
+            == self.gamma_targets.shape[0]
+            == self.original_precip_patches.shape[0]
+        ):
+            raise ValueError("Data array lengths or metadata mismatch.")
+        print(f"Loaded {len(self.metadata)} samples.")
 
     def __len__(self):
         return len(self.metadata)
 
     def __getitem__(self, idx):
-        original_precip = self.original_patches[idx]
-        input_for_model = torch.from_numpy(original_precip).float().unsqueeze(0)
-        return input_for_model, input_for_model.clone()
-
-
-def subsample_dataset(dataset, fraction=1.0, seed=42):
-    if fraction >= 1.0:
-        return dataset
-    dataset_size = len(dataset)
-    subset_size = int(fraction * dataset_size)
-    g = torch.Generator().manual_seed(seed)
-    subset_indices = torch.randperm(dataset_size, generator=g)[:subset_size]
-    return Subset(dataset, subset_indices)
+        input_precip = self.input_patches[idx]
+        target_gamma = self.gamma_targets[idx]
+        original_precip = self.original_precip_patches[idx]
+        input_tensor = torch.from_numpy(input_precip).float().unsqueeze(0)
+        target_gamma_tensor = torch.from_numpy(target_gamma).float()
+        original_precip_tensor = torch.from_numpy(original_precip).float().unsqueeze(0)
+        return input_tensor, target_gamma_tensor, original_precip_tensor
 
 
 # --- Plotting Functions ---
-
-
-# --- ADDED FUNCTION ---
-def plot_3d_precipitation_surface(target_images, sample_index):
-    """
-    Plots a 3D surface of a precipitation patch from the collected data. 📈
-
-    The elevation of the surface at each point corresponds to the
-    precipitation intensity at that pixel.
-
-    Args:
-        target_images (np.ndarray): A numpy array of all target images.
-        sample_index (int): The index of the sample to retrieve and plot.
-    """
-    # --- 1. Retrieve and process data ---
-    if not (0 <= sample_index < len(target_images)):
-        print(
-            f"Error: sample_index {sample_index} is out of bounds for the target images array (size: {len(target_images)})."
-        )
-        return
-
-    # Get the 2D precipitation data directly from the numpy array
-    precip_data = target_images[sample_index]
-
-    # --- 2. Create grid for plotting ---
-    height, width = precip_data.shape
-    x = np.arange(0, width, 1)
-    y = np.arange(0, height, 1)
-    X, Y = np.meshgrid(x, y)
-
-    # --- 3. Generate the 3D plot ---
-    fig = plt.figure(figsize=(12, 8))
-    ax = fig.add_subplot(111, projection="3d")
-
-    # Create the surface plot with a suitable colormap
-    surf = ax.plot_surface(X, Y, precip_data, cmap="viridis", edgecolor="none")
-
-    # --- 4. Customize the plot for clarity ---
-    ax.set_title(f"3D Surface Plot of Precipitation - Sample {sample_index}")
-    ax.set_xlabel("X Coordinate (pixels)")
-    ax.set_ylabel("Y Coordinate (pixels)")
-    ax.set_zlabel("Precipitation Intensity (mm/hr)")
-
-    # Add a color bar to map values to colors
-    fig.colorbar(surf, shrink=0.6, aspect=10, label="Precipitation Intensity (mm/hr)")
-
-    # Adjust viewing angle for better perspective
-    ax.view_init(elev=30, azim=-60)
-
-    # --- 5. Save and close the plot ---
-    output_dir = "evaluation_plots/3d_surfaces"
-    os.makedirs(output_dir, exist_ok=True)
-    save_path = os.path.join(output_dir, f"3d_surface_sample_{sample_index}.png")
-    plt.savefig(save_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved 3D surface plot: {save_path}")
-
-
-# --- END OF ADDED FUNCTION ---
-
-
-def plot_quantile_contours(sample_index, target_images, quantiles_to_plot=(10, 50, 90)):
-    """
-    Plots the precipitation image for a given sample index and overlays contours
-    at specified percentile levels.
-    """
-    if not 0 <= sample_index < len(target_images):
-        print(f"Error: Sample index {sample_index} is out of bounds.")
-        return
-
-    image = target_images[sample_index]
-    non_zero_pixels = image[image > 0]
-
-    if non_zero_pixels.size == 0:
-        print(
-            f"Warning: Sample {sample_index} has no non-zero precipitation. Skipping contour plot."
-        )
-        return
-
-    percentile_values = np.percentile(non_zero_pixels, quantiles_to_plot)
-    colors = ["cyan", "lime", "magenta"]
-
-    fig, ax = plt.subplots(figsize=(8, 8))
-    im = ax.imshow(image, cmap="Blues", origin="lower")
-
-    legend_elements = []
-    for val, q, color in zip(percentile_values, quantiles_to_plot, colors):
-        ax.contour(image, levels=[val], colors=[color], linewidths=2)
-        legend_elements.append(
-            plt.Line2D(
-                [0], [0], color=color, lw=2, label=f"{q}th Quantile ({val:.2f} mm/hr)"
-            )
-        )
-
-    ax.legend(handles=legend_elements, loc="upper right")
-    ax.set_title(f"Precipitation Contours for Sample {sample_index}")
-    ax.set_xlabel("X-coordinate")
-    ax.set_ylabel("Y-coordinate")
-    fig.colorbar(im, ax=ax, shrink=0.8, label="Precipitation (mm/hr)")
-
-    output_dir = "evaluation_plots/contours"
-    os.makedirs(output_dir, exist_ok=True)
-    save_path = os.path.join(output_dir, f"quantile_contours_sample_{sample_index}.png")
-    plt.savefig(save_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved contour plot: {save_path}")
-
-
-def plot_gamma_for_dataset_quantiles(
-    predictions, targets_gamma, target_images, quantiles, n_examples=3
+def _plot_single_gamma_comparison(
+    sample_idx,
+    all_preds,
+    all_targets,
+    all_images,
+    all_losses,
+    quantiles,
+    title_prefix,
+    sub_folder,
+    output_dir,
 ):
-    """
-    Identifies samples representing low, medium, and high mean precipitation across
-    the dataset and generates gamma plots for them.
-    """
-    print("\nGenerating plots for samples representing dataset-wide quantiles...")
-    dataset_quantiles = [10, 50, 90]
-    gamma_types = ["Area (km²)", "Perimeter (km)", "Number of Connected Components"]
+    pred_gamma = all_preds[sample_idx]
+    target_gamma = all_targets[sample_idx]
+    target_image = all_images[sample_idx]
+    loss = all_losses[sample_idx]
+    mean_precip = np.mean(target_image)
+    gamma_types = ["Area (km²)", "Perimeter (km)", "CCs"]
 
+    fig = plt.figure(figsize=(20, 5))
+    gs = gridspec.GridSpec(1, 4, wspace=0.4)
+    ax_img = fig.add_subplot(gs[0, 0])
+    im = ax_img.imshow(target_image, cmap="Blues", origin="lower", vmin=0)
+    ax_img.set_title(f"Target Image (Mean: {mean_precip:.2f})")
+    fig.colorbar(im, ax=ax_img, shrink=0.7, label="Precipitation (mm/hr)")
+
+    for j in range(3):
+        ax = fig.add_subplot(gs[0, j + 1])
+        ax.plot(quantiles, target_gamma[j], "o-", label="Target", color="royalblue")
+        ax.plot(quantiles, pred_gamma[j], "x--", label="Prediction", color="salmon")
+        ax.set_title(gamma_types[j])
+        ax.set_xlabel("Precip. Threshold (mm/hr)")
+        ax.grid(True, linestyle="--", alpha=0.6)
+        if j == 0:
+            ax.legend()
+
+    fig.suptitle(
+        f"{title_prefix} | Sample {sample_idx} | Loss: {loss:.4f}", fontsize=16, y=1.03
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+    plot_save_dir = os.path.join(output_dir, "evaluation_plots", sub_folder)
+    os.makedirs(plot_save_dir, exist_ok=True)
+    save_path = os.path.join(
+        plot_save_dir,
+        f"{title_prefix.replace(' ', '_').lower()}_sample_{sample_idx}.png",
+    )
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved plot: {save_path}")
+
+
+def plot_gamma_performance_by_quantile(
+    predictions,
+    targets_gamma,
+    target_images,
+    losses,
+    quantiles,
+    output_dir,
+    n_samples=5,
+):
+    print("\nGenerating plots for best and worst samples based on loss...")
     all_means = np.mean(target_images, axis=(1, 2))
+    sorted_indices_by_mean = np.argsort(all_means)
+    n_total = len(target_images)
+    quantile_groups = {
+        "Low_Precip (0-33%)": sorted_indices_by_mean[: int(n_total * 0.33)],
+        "Mid_Precip (33-67%)": sorted_indices_by_mean[
+            int(n_total * 0.33) : int(n_total * 0.67)
+        ],
+        "High_Precip (67-100%)": sorted_indices_by_mean[int(n_total * 0.67) :],
+    }
 
-    for dq in dataset_quantiles:
-        target_mean = np.percentile(all_means, dq)
-        closest_indices = np.argsort(np.abs(all_means - target_mean))[:n_examples]
+    for group_name, candidate_indices in quantile_groups.items():
+        print(f"\n--- Processing Group: {group_name} ---")
+        if len(candidate_indices) == 0:
+            print("No samples in this group. Skipping.")
+            continue
 
+        candidate_losses = losses[candidate_indices]
+        sorted_loss_indices_in_group = np.argsort(candidate_losses)
+        best_in_group_indices = candidate_indices[
+            sorted_loss_indices_in_group[:n_samples]
+        ]
+        worst_in_group_indices = candidate_indices[
+            sorted_loss_indices_in_group[-n_samples:]
+        ]
+
+        print(f"Plotting {len(best_in_group_indices)} best samples...")
+        for rank, sample_idx in enumerate(best_in_group_indices):
+            _plot_single_gamma_comparison(
+                sample_idx,
+                predictions,
+                targets_gamma,
+                target_images,
+                losses,
+                quantiles,
+                f"Best Sample #{rank+1}",
+                group_name,
+                output_dir,
+            )
+
+        print(f"Plotting {len(worst_in_group_indices)} worst samples...")
+        for rank, sample_idx in enumerate(worst_in_group_indices):
+            _plot_single_gamma_comparison(
+                sample_idx,
+                predictions,
+                targets_gamma,
+                target_images,
+                losses,
+                quantiles,
+                f"Worst Sample #{rank+1}",
+                group_name,
+                output_dir,
+            )
+
+
+def plot_training_log(log_path, output_dir):
+    if not os.path.exists(log_path):
         print(
-            f"\n--- Plotting for Dataset {dq}th Quantile (Mean Precip ≈ {target_mean:.2f}) ---"
+            f"\nWarning: Log file not found at {log_path}. Skipping training history plot."
         )
+        return
 
-        for i, sample_idx in enumerate(closest_indices):
-            pred_gamma = predictions[sample_idx]
-            target_gamma = targets_gamma[sample_idx]
-            target_image = target_images[sample_idx]
+    print("\nGenerating training history plot...")
+    try:
+        df = pd.read_csv(log_path)
+    except Exception as e:
+        print(f"Error reading log file with pandas: {e}. Skipping plot.")
+        return
 
-            fig = plt.figure(figsize=(20, 5))
-            gs = gridspec.GridSpec(1, 4, wspace=0.35)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+    fig.suptitle("Training History", fontsize=16)
 
-            ax_img = fig.add_subplot(gs[0, 0])
-            im = ax_img.imshow(target_image, cmap="Blues", origin="lower", vmin=0)
-            ax_img.set_title(f"Target Image (Mean: {all_means[sample_idx]:.2f})")
-            fig.colorbar(im, ax=ax_img, shrink=0.7, label="Precipitation (mm/hr)")
+    ax1.plot(
+        df["epoch"],
+        df["train_loss_total"],
+        "o-",
+        label="Train Total Loss",
+        color="royalblue",
+    )
+    ax1.plot(
+        df["epoch"],
+        df["val_loss_total"],
+        "o-",
+        label="Validation Total Loss",
+        color="salmon",
+    )
+    ax1.set_ylabel("Loss")
+    ax1.set_title("Total Training & Validation Loss Over Epochs")
+    ax1.legend()
+    ax1.grid(True, linestyle="--", alpha=0.6)
+    ax1.set_yscale("log")
 
-            for j in range(3):
-                ax = fig.add_subplot(gs[0, j + 1])
-                ax.plot(
-                    quantiles, target_gamma[j], "o-", label="Target", color="royalblue"
-                )
-                ax.plot(
-                    quantiles, pred_gamma[j], "x--", label="Prediction", color="salmon"
-                )
-                ax.set_title(gamma_types[j])
-                ax.set_xlabel("Precipitation Threshold (mm/hr)")
-                ax.grid(True, linestyle="--", alpha=0.6)
-                if j == 0:
-                    ax.legend()
+    ax2.plot(
+        df["epoch"],
+        df["train_loss_main"],
+        "s--",
+        label="Train Main Loss",
+        color="lightblue",
+        alpha=0.8,
+    )
+    ax2.plot(
+        df["epoch"],
+        df["val_loss_main"],
+        "s--",
+        label="Val Main Loss",
+        color="lightcoral",
+        alpha=0.8,
+    )
+    ax2.plot(
+        df["epoch"],
+        df["train_loss_penalty"],
+        "x:",
+        label="Train Penalty",
+        color="dodgerblue",
+    )
+    ax2.plot(
+        df["epoch"], df["val_loss_penalty"], "x:", label="Val Penalty", color="red"
+    )
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("Loss Component")
+    ax2.set_title("Loss Components Over Epochs")
+    ax2.legend()
+    ax2.grid(True, linestyle="--", alpha=0.6)
+    ax2.set_yscale("log")
 
-            fig.suptitle(
-                f"Dataset {dq}th Quantile (Example {i+1} / Sample {sample_idx})",
-                fontsize=16,
-                y=1.03,
-            )
-            plt.tight_layout(rect=[0, 0, 1, 0.96])
-
-            output_dir = f"evaluation_plots/dataset_quantile_{dq}"
-            os.makedirs(output_dir, exist_ok=True)
-            save_path = os.path.join(
-                output_dir, f"gamma_plot_example_{i+1}_sample_{sample_idx}.png"
-            )
-            plt.savefig(save_path, dpi=300, bbox_inches="tight")
-            plt.close(fig)
-            print(f"Saved plot: {save_path}")
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    save_path = os.path.join(output_dir, "training_history.png")
+    plt.savefig(save_path, dpi=300)
+    plt.close(fig)
+    print(f"Saved training history plot to: {save_path}")
 
 
 # --- Main Execution ---
-
 if __name__ == "__main__":
-    # 1. Setup
+    parser = argparse.ArgumentParser(
+        description="Evaluate a trained GammaPredictor model."
+    )
+    parser.add_argument(
+        "--run_dir",
+        type=str,
+        required=True,
+        help="Path to the timestamped experiment run directory.",
+    )
+    args = parser.parse_args()
+
+    if not os.path.isdir(args.run_dir):
+        raise FileNotFoundError(f"Error: Run directory not found at '{args.run_dir}'")
+    print(f"Evaluating experiment from: {args.run_dir}")
+
+    config_path = os.path.join(args.run_dir, "config.yaml")
+    with open(config_path, "r") as file:
+        config = yaml.safe_load(file)
+
+    QUANTILE_LEVELS = config["QUANTILE_LEVELS"]
+    N_QUANTILES = len(QUANTILE_LEVELS)
+    N = N_QUANTILES * 3
+    PATCH_SIZE = config["PATCH_SIZE"]
+    PREPROCESSED_DATA_DIR = config["PREPROCESSED_DATA_DIR"]
+    TEST_METADATA_FILE = config["TEST_METADATA_FILE"]
+    BATCH_SIZE = config.get("BATCH_SIZE", 16)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # 2. Initialize model and load trained weights
-    model = GammaPredictor(num_output_features_flat=N, n_quantiles=N_QUANTILES).to(
-        device
-    )
-    model_save_path = "best_gamma_predictor_model.pth"
+    model = GammaPredictor(
+        input_shape=(1, PATCH_SIZE, PATCH_SIZE),
+        num_output_features_flat=N,
+        n_quantiles=N_QUANTILES,
+        activation_fn=F.mish,
+    ).to(device)
+
+    model_save_path = os.path.join(args.run_dir, "best_gamma_predictor_model.pth")
     if not os.path.exists(model_save_path):
-        raise FileNotFoundError(f"Error: Model file '{model_save_path}' not found.")
+        raise FileNotFoundError(
+            f"Error: Model file not found in run directory: '{model_save_path}'"
+        )
 
     print("Loading model weights...")
     model.load_state_dict(torch.load(model_save_path, map_location=device))
     model.eval()
     print("Model loaded successfully.")
 
-    # 3. Prepare test data
     test_dataset = PreprocessedNpzDataset(
         preprocessed_data_dir=os.path.join(PREPROCESSED_DATA_DIR, "test"),
-        dem_patch_dir=DEM_PATCH_DIR,
         metadata_file=TEST_METADATA_FILE,
     )
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
     print(f"Loaded {len(test_dataset)} samples for evaluation.")
 
-    # 4. Generate predictions and compute target gamma values
-    all_preds, all_targets_gamma, all_target_images = [], [], []
+    # Instantiate the simple total error metric for evaluation.
+    # This is more interpretable than the complex homoscedastic training loss.
+    evaluation_metric = TotalErrorMetric(quantile_levels=QUANTILE_LEVELS).to(device)
+
+    all_preds, all_targets_gamma, all_original_images, all_losses = [], [], [], []
 
     with torch.no_grad():
-        for input_data, target_precip in tqdm(
-            test_loader, desc="Generating predictions"
+        for input_data, target_gamma, original_precip in tqdm(
+            test_loader, desc="Generating predictions and calculating losses"
         ):
-            # input_data = input_data.to(device)
-            # predicted_gamma_3d = model(input_data)
+            input_data = input_data.to(device)
+            predicted_gamma_3d = model(input_data)
+            target_gamma_device = target_gamma.to(device)
 
-            target_precip_np = target_precip.squeeze(1).cpu().numpy()
-            # target_gamma_batch = [
-            #     compute_gamma_matrix_for_image(img, QUANTILE_LEVELS)
-            #     for img in target_precip_np
-            # ]
+            # Use the simplified metric to get per-sample error scores
+            per_sample_losses = evaluation_metric(
+                predicted_gamma_3d, target_gamma_device
+            )
 
-            # all_preds.append(predicted_gamma_3d.cpu().numpy())
-            # all_targets_gamma.append(np.stack(target_gamma_batch))
-            all_target_images.append(target_precip_np)
+            all_losses.append(per_sample_losses.cpu().numpy())
+            all_preds.append(predicted_gamma_3d.cpu().numpy())
+            all_targets_gamma.append(target_gamma.cpu().numpy())
+            all_original_images.append(original_precip.squeeze(1).cpu().numpy())
 
-    # all_preds = np.concatenate(all_preds, axis=0)
-    # all_targets_gamma = np.concatenate(all_targets_gamma, axis=0)
-    all_target_images = np.concatenate(all_target_images, axis=0)
-    # print(f"Generated predictions for {all_preds.shape[0]} samples.")
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_targets_gamma = np.concatenate(all_targets_gamma, axis=0)
+    all_original_images = np.concatenate(all_original_images, axis=0)
+    all_losses = np.concatenate(all_losses, axis=0)
+    print(f"Generated predictions and losses for {all_preds.shape[0]} samples.")
 
-    # 5. Execute plotting functions
-    # plot_quantile_contours(sample_index=150, target_images=all_target_images)
+    plot_gamma_performance_by_quantile(
+        predictions=all_preds,
+        targets_gamma=all_targets_gamma,
+        target_images=all_original_images,
+        losses=all_losses,
+        quantiles=QUANTILE_LEVELS,
+        output_dir=args.run_dir,
+        n_samples=5,
+    )
 
-    # plot_gamma_for_dataset_quantiles(
-    #     predictions=all_preds,
-    #     targets_gamma=all_targets_gamma,
-    #     target_images=all_target_images,
-    #     quantiles=QUANTILE_LEVELS,
-    # )
+    log_file_path = os.path.join(args.run_dir, "training_log.csv")
+    plot_training_log(log_file_path, args.run_dir)
 
-    # Generate a 3D surface plot for a specific sample
-    for i in range(100):
-        plot_3d_precipitation_surface(
-            target_images=all_target_images, sample_index=i * 100
-        )
-        plot_quantile_contours(target_images=all_target_images, sample_index=i * 100)
-
-    print("\n✅ Evaluation script finished.")
+    print("\nEvaluation script finished.")
