@@ -38,7 +38,7 @@ S_ESTIMATION_SAMPLES: 10000
 
 # Training
 EXPERIMENT_NAME: "GammaEmulatorv1"
-LAMBDA_ZERO_PENALTY: 2.0
+LOSS_LAMBDA: 0.8 # between 0 and 1 (Loss = lambda*zero_penalty + (1-lambda)*main_loss)
 SUBSAMPLE_FRACTION: 1
 device: "cuda"
 NUM_EPOCHS: 100
