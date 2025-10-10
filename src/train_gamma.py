@@ -8,6 +8,8 @@ import numpy as np
 import os
 from tqdm import tqdm
 from datetime import datetime
+import random
+from torch.utils.data.sampler import Sampler
 
 # --- Configuration Loading ---
 config_path = (
@@ -160,23 +162,57 @@ class PreprocessedNpzDataset(Dataset):
         return input_tensor, target_gamma_tensor
 
 
-# --- Loss Function ---
-# class ComponentWiseCDFLoss(nn.Module):
-#     def __init__(self, quantile_levels):
-#         super(ComponentWiseCDFLoss, self).__init__()
-#         self.register_buffer(
-#             "quantiles", torch.tensor(quantile_levels, dtype=torch.float32)
-#         )
+# --- Stratified Sampler for Balanced Batches ---
+class StratifiedBatchSampler(Sampler):
+    """
+    Creates balanced mini-batches with a fixed number of samples from each stratum.
+    """
 
-#     def forward(self, gamma_pred_3d, gamma_target_3d):
-#         abs_diff = torch.abs(gamma_pred_3d - gamma_target_3d)
-#         integrand = abs_diff * self.quantiles
-#         integral_per_component = torch.trapezoid(integrand, self.quantiles, dim=2)
-#         return (
-#             torch.mean(integral_per_component[:, 0]),
-#             torch.mean(integral_per_component[:, 1]),
-#             torch.mean(integral_per_component[:, 2]),
-#         )
+    def __init__(self, indices_dry, indices_normal, indices_extreme, batch_composition):
+        """
+        Args:
+            indices_dry, indices_normal, indices_extreme (list): Lists of indices for each class.
+            batch_composition (dict): How many samples from each class per batch.
+                                      Example: {'dry': 8, 'normal': 16, 'extreme': 8}
+        """
+        self.indices_dry = indices_dry
+        self.indices_normal = indices_normal
+        self.indices_extreme = indices_extreme
+        self.batch_composition = batch_composition
+
+        self.batch_size = sum(batch_composition.values())
+
+        # The number of batches will be limited by the smallest class we are sampling from
+        # to ensure we don't run out of unique extreme samples too quickly in an epoch.
+        self.num_batches = len(indices_extreme) // batch_composition["extreme"]
+
+    def __iter__(self):
+        # Create copies to shuffle without modifying the original lists
+        shuffled_dry = random.sample(self.indices_dry, len(self.indices_dry))
+        shuffled_normal = random.sample(self.indices_normal, len(self.indices_normal))
+        shuffled_extreme = random.sample(
+            self.indices_extreme, len(self.indices_extreme)
+        )
+
+        for i in range(self.num_batches):
+            batch = []
+
+            # Get indices for extreme samples for this batch
+            start = i * self.batch_composition["extreme"]
+            end = start + self.batch_composition["extreme"]
+            batch.extend(shuffled_extreme[start:end])
+
+            # Get random indices for normal and dry samples
+            batch.extend(
+                random.sample(shuffled_normal, self.batch_composition["normal"])
+            )
+            batch.extend(random.sample(shuffled_dry, self.batch_composition["dry"]))
+
+            random.shuffle(batch)
+            yield batch
+
+    def __len__(self):
+        return self.num_batches
 
 
 # --- CDF-Weighted Integral Loss Function ---
@@ -238,30 +274,84 @@ if __name__ == "__main__":
         val_dataset_full, config["SUBSAMPLE_FRACTION"], seed=0
     )
 
-    # --- 2. Prepare DataLoaders ---
+    # --- Oversampling Strategy ---
+    print("Stratifying dataset...")
+    # --- Collect mean precipitation of all wet events ---
+    print("First pass: Collecting means of wet events to determine threshold...")
+    wet_event_means = []
+    # Assuming train_dataset_full is your full training dataset object
+    for i in range(len(train_dataset_full)):
+        # We access the numpy array directly for speed, not the tensor
+        precip_patch = train_dataset_full.original_patches[i]
+        mean_precip = np.mean(precip_patch)
+
+        # Only consider non-dry events for the percentile calculation
+        if mean_precip > 1e-6:
+            wet_event_means.append(mean_precip)
+
+    # --- Calculate the 95th percentile threshold ---
+    if wet_event_means:  # Ensure there is at least one wet event
+        extreme_threshold = np.percentile(wet_event_means, 95)
+        print(
+            f"Data-driven threshold (95th percentile of wet events): {extreme_threshold:.4f} mm/hr"
+        )
+    else:
+        extreme_threshold = float("inf")  # If no wet events, this will not be used
+        print("Warning: No wet events found in dataset to calculate threshold.")
+
+    # --- Stratify the dataset using the calculated threshold ---
+    print("Second pass: Assigning samples to strata...")
+    indices_dry = []
+    indices_normal = []
+    indices_extreme = []
+
+    for i in range(len(train_dataset_full)):
+        precip_patch = train_dataset_full.original_patches[i]
+        mean_precip = np.mean(precip_patch)
+
+        if mean_precip <= 1e-6:
+            indices_dry.append(i)
+        elif mean_precip < extreme_threshold:
+            indices_normal.append(i)
+        else:
+            indices_extreme.append(i)
+
+    print(
+        f"Stratification complete: {len(indices_dry)} Dry, {len(indices_normal)} Normal, {len(indices_extreme)} Extreme."
+    )
+
+    # Define how you want each batch to be composed
+
+    batch_composition = {
+        "dry": BATCH_SIZE / 4,
+        "normal": BATCH_SIZE / 2,
+        "extreme": BATCH_SIZE / 4,
+    }
+    print(f"Each batch will contain: {batch_composition}")
+
+    # Create an instance of your custom sampler
+    stratified_sampler = StratifiedBatchSampler(
+        indices_dry, indices_normal, indices_extreme, batch_composition
+    )
+
+    # --- Prepare DataLoaders ---
     train_loader = DataLoader(
         train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=4,
+        batch_sampler=stratified_sampler,
+        num_workers=config.get("NUM_WORKERS", 0),
         pin_memory=True,
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=4,
+        batch_sampler=stratified_sampler,
+        num_workers=config.get("NUM_WORKERS", 0),
         pin_memory=True,
     )
 
-    # # --- 3. Initialize Model, Optimizer, and Loss ---
-    # log_var_A = torch.zeros((1,), requires_grad=True, device=device)
-    # log_var_P = torch.zeros((1,), requires_grad=True, device=device)
-    # log_var_CC = torch.zeros((1,), requires_grad=True, device=device)
-
+    # --- Initialize Model, Optimizer, and Loss ---
     model = GammaPredictor(activation_fn=F.mish).to(device)
     optimizer = torch.optim.Adam(
-        list(model.parameters()),  # + [log_var_A, log_var_P, log_var_CC],
+        list(model.parameters()),
         lr=LEARNING_RATE,
         weight_decay=WEIGHT_DECAY,
     )
@@ -269,7 +359,6 @@ if __name__ == "__main__":
         optimizer, mode="min", factor=0.5, patience=5
     )
 
-    # criterion = ComponentWiseCDFLoss(quantile_levels=QUANTILE_LEVELS)
     criterion = CDFWeightedIntegralLoss(quantile_levels=QUANTILE_LEVELS)
 
     LOSS_LAMBDA = config.get("LOSS_LAMBDA", 0.5)
@@ -281,14 +370,13 @@ if __name__ == "__main__":
             log_file.write(
                 "epoch,train_loss_total,train_loss_main,train_loss_penalty,"
                 "val_loss_total,val_loss_main,val_loss_penalty,"
-                # "sigma_A,sigma_P,sigma_CC\n"
             )
         print(f"Log file will be saved to {log_file_path}")
     except IOError as e:
         print(f"Error creating log file: {e}")
         exit()
 
-    # --- 4. Training & Validation Loop ---
+    # --- Training & Validation Loop ---
     print("Starting training...")
     best_val_loss = float("inf")
     patience_counter = 0
@@ -306,11 +394,6 @@ if __name__ == "__main__":
             predicted_gamma_3d = model(input_data)
 
             main_loss = criterion(predicted_gamma_3d, target_gamma)
-            # loss_A, loss_P, loss_CC = criterion(predicted_gamma_3d, target_gamma)
-            # term_A = torch.exp(-log_var_A) * loss_A + log_var_A
-            # term_P = torch.exp(-log_var_P) * loss_P + log_var_P
-            # term_CC = torch.exp(-log_var_CC) * loss_CC + log_var_CC
-            # main_loss = (term_A + term_P + term_CC) * 0.5
 
             is_dry_mask = input_data.sum(dim=(1, 2, 3)) <= 1e-6
             zero_penalty = torch.tensor(0.0, device=device)
@@ -347,13 +430,7 @@ if __name__ == "__main__":
                 )
                 predicted_gamma_3d = model(input_data)
 
-                # Use the same homoscedastic loss for validation
                 main_loss = criterion(predicted_gamma_3d, target_gamma)
-                # loss_A, loss_P, loss_CC = criterion(predicted_gamma_3d, target_gamma)
-                # term_A = torch.exp(-log_var_A) * loss_A + log_var_A
-                # term_P = torch.exp(-log_var_P) * loss_P + log_var_P
-                # term_CC = torch.exp(-log_var_CC) * loss_CC + log_var_CC
-                # main_loss = (term_A + term_P + term_CC) * 0.5
 
                 is_dry_mask = input_data.sum(dim=(1, 2, 3)) <= 1e-6
                 zero_penalty = torch.tensor(0.0, device=device)
@@ -373,13 +450,7 @@ if __name__ == "__main__":
 
         scheduler.step(avg_val_loss)
 
-        # Get current values of learned uncertainty parameters (as std. dev.)
-        # sigma_A = torch.sqrt(torch.exp(log_var_A)).item()
-        # sigma_P = torch.sqrt(torch.exp(log_var_P)).item()
-        # sigma_CC = torch.sqrt(torch.exp(log_var_CC)).item()
-
         print(
-            # f"Epoch {epoch+1} Val Loss: Total={avg_val_loss:.4f} (Main={avg_val_main_loss:.4f}, Penalty={avg_val_penalty:.4f}) | Sigmas: A={sigma_A:.3f}, P={sigma_P:.3f}, CC={sigma_CC:.3f}"
             f"Epoch {epoch+1} Val Loss: Total={avg_val_loss:.4f} (Main={avg_val_main_loss:.4f}, Penalty={avg_val_penalty:.4f})"
         )
 
@@ -403,7 +474,6 @@ if __name__ == "__main__":
                 log_file.write(
                     f"{epoch+1},{avg_train_loss:.6f},{avg_main_loss:.6f},{avg_penalty:.6f},"
                     f"{avg_val_loss:.6f},{avg_val_main_loss:.6f},{avg_val_penalty:.6f},"
-                    # f"{sigma_A:.6f},{sigma_P:.6f},{sigma_CC:.6f}\n"
                 )
         except IOError as e:
             print(f"Error writing to log file: {e}")
