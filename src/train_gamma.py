@@ -161,9 +161,28 @@ class PreprocessedNpzDataset(Dataset):
 
 
 # --- Loss Function ---
-class ComponentWiseCDFLoss(nn.Module):
+# class ComponentWiseCDFLoss(nn.Module):
+#     def __init__(self, quantile_levels):
+#         super(ComponentWiseCDFLoss, self).__init__()
+#         self.register_buffer(
+#             "quantiles", torch.tensor(quantile_levels, dtype=torch.float32)
+#         )
+
+#     def forward(self, gamma_pred_3d, gamma_target_3d):
+#         abs_diff = torch.abs(gamma_pred_3d - gamma_target_3d)
+#         integrand = abs_diff * self.quantiles
+#         integral_per_component = torch.trapezoid(integrand, self.quantiles, dim=2)
+#         return (
+#             torch.mean(integral_per_component[:, 0]),
+#             torch.mean(integral_per_component[:, 1]),
+#             torch.mean(integral_per_component[:, 2]),
+#         )
+
+
+# --- CDF-Weighted Integral Loss Function ---
+class CDFWeightedIntegralLoss(nn.Module):
     def __init__(self, quantile_levels):
-        super(ComponentWiseCDFLoss, self).__init__()
+        super(CDFWeightedIntegralLoss, self).__init__()
         self.register_buffer(
             "quantiles", torch.tensor(quantile_levels, dtype=torch.float32)
         )
@@ -172,11 +191,8 @@ class ComponentWiseCDFLoss(nn.Module):
         abs_diff = torch.abs(gamma_pred_3d - gamma_target_3d)
         integrand = abs_diff * self.quantiles
         integral_per_component = torch.trapezoid(integrand, self.quantiles, dim=2)
-        return (
-            torch.mean(integral_per_component[:, 0]),
-            torch.mean(integral_per_component[:, 1]),
-            torch.mean(integral_per_component[:, 2]),
-        )
+        total_integral_per_sample = torch.sum(integral_per_component, dim=1)
+        return torch.mean(total_integral_per_sample)
 
 
 # --- Main Execution ---
@@ -238,14 +254,14 @@ if __name__ == "__main__":
         pin_memory=True,
     )
 
-    # --- 3. Initialize Model, Optimizer, and Loss ---
-    log_var_A = torch.zeros((1,), requires_grad=True, device=device)
-    log_var_P = torch.zeros((1,), requires_grad=True, device=device)
-    log_var_CC = torch.zeros((1,), requires_grad=True, device=device)
+    # # --- 3. Initialize Model, Optimizer, and Loss ---
+    # log_var_A = torch.zeros((1,), requires_grad=True, device=device)
+    # log_var_P = torch.zeros((1,), requires_grad=True, device=device)
+    # log_var_CC = torch.zeros((1,), requires_grad=True, device=device)
 
     model = GammaPredictor(activation_fn=F.mish).to(device)
     optimizer = torch.optim.Adam(
-        list(model.parameters()) + [log_var_A, log_var_P, log_var_CC],
+        list(model.parameters()),  # + [log_var_A, log_var_P, log_var_CC],
         lr=LEARNING_RATE,
         weight_decay=WEIGHT_DECAY,
     )
@@ -253,7 +269,8 @@ if __name__ == "__main__":
         optimizer, mode="min", factor=0.5, patience=5
     )
 
-    criterion = ComponentWiseCDFLoss(quantile_levels=QUANTILE_LEVELS)
+    # criterion = ComponentWiseCDFLoss(quantile_levels=QUANTILE_LEVELS)
+    criterion = CDFWeightedIntegralLoss(quantile_levels=QUANTILE_LEVELS)
 
     LOSS_LAMBDA = config.get("LOSS_LAMBDA", 0.5)
     print(f"Using weighted average loss with lambda = {LOSS_LAMBDA}")
@@ -264,7 +281,7 @@ if __name__ == "__main__":
             log_file.write(
                 "epoch,train_loss_total,train_loss_main,train_loss_penalty,"
                 "val_loss_total,val_loss_main,val_loss_penalty,"
-                "sigma_A,sigma_P,sigma_CC\n"
+                # "sigma_A,sigma_P,sigma_CC\n"
             )
         print(f"Log file will be saved to {log_file_path}")
     except IOError as e:
@@ -288,11 +305,12 @@ if __name__ == "__main__":
             optimizer.zero_grad()
             predicted_gamma_3d = model(input_data)
 
-            loss_A, loss_P, loss_CC = criterion(predicted_gamma_3d, target_gamma)
-            term_A = torch.exp(-log_var_A) * loss_A + log_var_A
-            term_P = torch.exp(-log_var_P) * loss_P + log_var_P
-            term_CC = torch.exp(-log_var_CC) * loss_CC + log_var_CC
-            main_loss = (term_A + term_P + term_CC) * 0.5
+            main_loss = criterion(predicted_gamma_3d, target_gamma)
+            # loss_A, loss_P, loss_CC = criterion(predicted_gamma_3d, target_gamma)
+            # term_A = torch.exp(-log_var_A) * loss_A + log_var_A
+            # term_P = torch.exp(-log_var_P) * loss_P + log_var_P
+            # term_CC = torch.exp(-log_var_CC) * loss_CC + log_var_CC
+            # main_loss = (term_A + term_P + term_CC) * 0.5
 
             is_dry_mask = input_data.sum(dim=(1, 2, 3)) <= 1e-6
             zero_penalty = torch.tensor(0.0, device=device)
@@ -330,11 +348,12 @@ if __name__ == "__main__":
                 predicted_gamma_3d = model(input_data)
 
                 # Use the same homoscedastic loss for validation
-                loss_A, loss_P, loss_CC = criterion(predicted_gamma_3d, target_gamma)
-                term_A = torch.exp(-log_var_A) * loss_A + log_var_A
-                term_P = torch.exp(-log_var_P) * loss_P + log_var_P
-                term_CC = torch.exp(-log_var_CC) * loss_CC + log_var_CC
-                main_loss = (term_A + term_P + term_CC) * 0.5
+                main_loss = criterion(predicted_gamma_3d, target_gamma)
+                # loss_A, loss_P, loss_CC = criterion(predicted_gamma_3d, target_gamma)
+                # term_A = torch.exp(-log_var_A) * loss_A + log_var_A
+                # term_P = torch.exp(-log_var_P) * loss_P + log_var_P
+                # term_CC = torch.exp(-log_var_CC) * loss_CC + log_var_CC
+                # main_loss = (term_A + term_P + term_CC) * 0.5
 
                 is_dry_mask = input_data.sum(dim=(1, 2, 3)) <= 1e-6
                 zero_penalty = torch.tensor(0.0, device=device)
@@ -355,12 +374,13 @@ if __name__ == "__main__":
         scheduler.step(avg_val_loss)
 
         # Get current values of learned uncertainty parameters (as std. dev.)
-        sigma_A = torch.sqrt(torch.exp(log_var_A)).item()
-        sigma_P = torch.sqrt(torch.exp(log_var_P)).item()
-        sigma_CC = torch.sqrt(torch.exp(log_var_CC)).item()
+        # sigma_A = torch.sqrt(torch.exp(log_var_A)).item()
+        # sigma_P = torch.sqrt(torch.exp(log_var_P)).item()
+        # sigma_CC = torch.sqrt(torch.exp(log_var_CC)).item()
 
         print(
-            f"Epoch {epoch+1} Val Loss: Total={avg_val_loss:.4f} (Main={avg_val_main_loss:.4f}, Penalty={avg_val_penalty:.4f}) | Sigmas: A={sigma_A:.3f}, P={sigma_P:.3f}, CC={sigma_CC:.3f}"
+            # f"Epoch {epoch+1} Val Loss: Total={avg_val_loss:.4f} (Main={avg_val_main_loss:.4f}, Penalty={avg_val_penalty:.4f}) | Sigmas: A={sigma_A:.3f}, P={sigma_P:.3f}, CC={sigma_CC:.3f}"
+            f"Epoch {epoch+1} Val Loss: Total={avg_val_loss:.4f} (Main={avg_val_main_loss:.4f}, Penalty={avg_val_penalty:.4f})"
         )
 
         if avg_val_loss < best_val_loss:
@@ -383,7 +403,7 @@ if __name__ == "__main__":
                 log_file.write(
                     f"{epoch+1},{avg_train_loss:.6f},{avg_main_loss:.6f},{avg_penalty:.6f},"
                     f"{avg_val_loss:.6f},{avg_val_main_loss:.6f},{avg_val_penalty:.6f},"
-                    f"{sigma_A:.6f},{sigma_P:.6f},{sigma_CC:.6f}\n"
+                    # f"{sigma_A:.6f},{sigma_P:.6f},{sigma_CC:.6f}\n"
                 )
         except IOError as e:
             print(f"Error writing to log file: {e}")
