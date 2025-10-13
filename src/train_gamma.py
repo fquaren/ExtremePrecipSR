@@ -184,7 +184,7 @@ class StratifiedBatchSampler(Sampler):
 
         # The number of batches will be limited by the smallest class we are sampling from
         # to ensure we don't run out of unique extreme samples too quickly in an epoch.
-        self.num_batches = len(indices_extreme) // batch_composition["extreme"]
+        self.num_batches = int(len(indices_extreme) // batch_composition["extreme"])
 
     def __iter__(self):
         # Create copies to shuffle without modifying the original lists
@@ -192,6 +192,10 @@ class StratifiedBatchSampler(Sampler):
         shuffled_normal = random.sample(self.indices_normal, len(self.indices_normal))
         shuffled_extreme = random.sample(
             self.indices_extreme, len(self.indices_extreme)
+        )
+
+        print(
+            f"Creating {self.num_batches} batches of size {self.batch_size} with composition {self.batch_composition}"
         )
 
         for i in range(self.num_batches):
@@ -321,14 +325,12 @@ if __name__ == "__main__":
     )
 
     # Define how you want each batch to be composed
-
     batch_composition = {
-        "dry": BATCH_SIZE / 4,
-        "normal": BATCH_SIZE / 2,
-        "extreme": BATCH_SIZE / 4,
+        "dry": int(BATCH_SIZE / 4),
+        "normal": int(BATCH_SIZE / 2),
+        "extreme": int(BATCH_SIZE / 4),
     }
     print(f"Each batch will contain: {batch_composition}")
-
     # Create an instance of your custom sampler
     stratified_sampler = StratifiedBatchSampler(
         indices_dry, indices_normal, indices_extreme, batch_composition
@@ -341,9 +343,12 @@ if __name__ == "__main__":
         num_workers=config.get("NUM_WORKERS", 0),
         pin_memory=True,
     )
+    # The val_loader should NOT use the stratified sampler to get an unbiased performance estimate.
+    # It should use a standard loader.
     val_loader = DataLoader(
         val_dataset,
-        batch_sampler=stratified_sampler,
+        batch_size=BATCH_SIZE,
+        shuffle=False,  # No need to shuffle validation data
         num_workers=config.get("NUM_WORKERS", 0),
         pin_memory=True,
     )
@@ -369,7 +374,7 @@ if __name__ == "__main__":
         with open(log_file_path, "w") as log_file:
             log_file.write(
                 "epoch,train_loss_total,train_loss_main,train_loss_penalty,"
-                "val_loss_total,val_loss_main,val_loss_penalty,"
+                "val_loss_total,val_loss_main,val_loss_penalty"
             )
         print(f"Log file will be saved to {log_file_path}")
     except IOError as e:
@@ -473,7 +478,7 @@ if __name__ == "__main__":
             with open(log_file_path, "a") as log_file:
                 log_file.write(
                     f"{epoch+1},{avg_train_loss:.6f},{avg_main_loss:.6f},{avg_penalty:.6f},"
-                    f"{avg_val_loss:.6f},{avg_val_main_loss:.6f},{avg_val_penalty:.6f},"
+                    f"{avg_val_loss:.6f},{avg_val_main_loss:.6f},{avg_val_penalty:.6f}\n"
                 )
         except IOError as e:
             print(f"Error writing to log file: {e}")
