@@ -15,6 +15,7 @@ PRECIP_VAR_NAME: "TOT_PREC"
 PATCH_SIZE: 128
 DOWNSCALING_FACTOR: 6
 DECLUTTER_THRESHOLD: 150.0
+PIXEL_AREA_KM2: 4.0 # Area of one high-res pixel in km^2
 
 
 ANALYSIS_DATA_PERCENTAGE: 100 # Use 100% of the data. Change to 50 for 50%, etc.
@@ -38,22 +39,27 @@ S_ESTIMATION_SAMPLES: 10000
 
 # Training
 EXPERIMENT_NAME: "GammaEmulatorv1"
-LOSS_LAMBDA: 0.8 # between 0 and 1 (Loss = lambda*zero_penalty + (1-lambda)*main_loss)
+LOSS_LAMBDA: 0.25 # between 0 and 1 (Loss = lambda*zero_penalty + (1-lambda)*main_loss)
+LAMBDA_MONOTONICITY: 1.0
+LAMBDA_PLAUSIBILITY: 1.0
+PLAUSIBILITY_THRESHOLD: 12.0  # >4*pi
+LAMBDA_BOUND: 1.0
 SUBSAMPLE_FRACTION: 1
 device: "cuda"
 NUM_EPOCHS: 100
 PATIENCE: 10
 EARLY_STOPPING: true
 EARLY_STOPPING_PATIENCE: 10
-LEARNING_RATE: 0.00001
+LEARNING_RATE: 0.0001
 QUANTILE_LEVELS: [
-    0.01,
-    0.05,
-    0.1,
-    0.25,
-    0.5,
-    0.75,
-    0.9,
-    0.95,
-    0.99,
+  0.0,
+  0.01,
+  0.05,
+  0.1,
+  0.25,
+  0.5,
+  0.75,
+  0.9,
+  0.95,
+  0.99,
 ]

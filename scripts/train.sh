@@ -19,8 +19,8 @@
 export SINGULARITY_BINDPATH="/work,/scratch,/users"
 
 container_path="/users/fquareng/singularity/dl_gh200.sif"
-singularity exec "$container_path" python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/precompute_gamma.py
-singularity exec "$container_path" python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_gamma.py
+# singularity exec "$container_path" python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/precompute_gamma.py
+singularity exec --nv "$container_path" python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_gamma.py
 
 # source /users/fquareng/.bashrc
 # micromamba activate dl

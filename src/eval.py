@@ -17,15 +17,10 @@ import pandas as pd
 class GammaPredictor(nn.Module):
     # This class must be identical to the one used for training.
     def __init__(
-        self,
-        input_shape,
-        num_output_features_flat,
-        n_quantiles,
-        activation_fn=F.gelu,
+        self, input_shape, num_output_features_flat, n_quantiles, activation_fn
     ):
         super(GammaPredictor, self).__init__()
-        self.n_quantiles = n_quantiles
-        self.activation = activation_fn
+        self.n_quantiles, self.activation = n_quantiles, activation_fn
         self.conv1 = nn.Conv2d(in_channels=1, out_channels=16, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(16)
         self.conv2 = nn.Conv2d(
@@ -65,26 +60,35 @@ class GammaPredictor(nn.Module):
         x = self.dropout2(x)
         x = self.fc3(x)
         x = x.view(-1, 3, self.n_quantiles)
-        return x
+        return F.relu(x)
 
 
-# This class is now used as an interpretable EVALUATION METRIC.
-# It calculates the total error per sample, which is ideal for ranking predictions.
-class TotalErrorMetric(nn.Module):
-    def __init__(self, quantile_levels):
-        super(TotalErrorMetric, self).__init__()
+# Renamed and updated the metric to use learned sigmas for normalization
+class NormalizedErrorMetric(nn.Module):
+    def __init__(self, quantile_levels, sigmas):
+        super(NormalizedErrorMetric, self).__init__()
         self.register_buffer(
             "quantiles", torch.tensor(quantile_levels, dtype=torch.float32)
         )
+        # Use sigmas to create precision (1/variance) terms
+        self.register_buffer("precision", 1 / (sigmas**2 + 1e-6))
+        print(
+            f"Evaluation metric using precisions (1/sigma^2): A={self.precision[0]:.4f}, P={self.precision[1]:.4f}, CC={self.precision[2]:.4f}"
+        )
 
     def forward(self, gamma_pred_3d, gamma_target_3d):
-        """Returns the total error for each sample in the batch."""
+        """Returns the normalized total error for each sample in the batch."""
         abs_diff = torch.abs(gamma_pred_3d - gamma_target_3d)
         integrand = abs_diff * self.quantiles
+        # integral_per_component has shape [B, 3]
         integral_per_component = torch.trapezoid(integrand, self.quantiles, dim=2)
-        # Return the sum of errors per-sample, shape: (B,)
-        total_integral_per_sample = torch.sum(integral_per_component, dim=1)
-        return total_integral_per_sample
+
+        # Normalize the error of each component by its learned precision
+        normalized_error = integral_per_component * self.precision
+
+        # Return the sum of normalized errors per-sample, shape: (B,)
+        total_normalized_error = torch.sum(normalized_error, dim=1)
+        return total_normalized_error
 
 
 # --- Dataset Definition ---
@@ -120,7 +124,7 @@ class PreprocessedNpzDataset(Dataset):
         return input_tensor, target_gamma_tensor, original_precip_tensor
 
 
-# --- Plotting Functions ---
+# --- Plotting Functions (unchanged from your previous script) ---
 def _plot_single_gamma_comparison(
     sample_idx,
     all_preds,
@@ -138,14 +142,12 @@ def _plot_single_gamma_comparison(
     loss = all_losses[sample_idx]
     mean_precip = np.mean(target_image)
     gamma_types = ["Area (km²)", "Perimeter (km)", "CCs"]
-
     fig = plt.figure(figsize=(20, 5))
     gs = gridspec.GridSpec(1, 4, wspace=0.4)
     ax_img = fig.add_subplot(gs[0, 0])
     im = ax_img.imshow(target_image, cmap="Blues", origin="lower", vmin=0)
     ax_img.set_title(f"Target Image (Mean: {mean_precip:.2f})")
     fig.colorbar(im, ax=ax_img, shrink=0.7, label="Precipitation (mm/hr)")
-
     for j in range(3):
         ax = fig.add_subplot(gs[0, j + 1])
         ax.plot(quantiles, target_gamma[j], "o-", label="Target", color="royalblue")
@@ -155,12 +157,12 @@ def _plot_single_gamma_comparison(
         ax.grid(True, linestyle="--", alpha=0.6)
         if j == 0:
             ax.legend()
-
     fig.suptitle(
-        f"{title_prefix} | Sample {sample_idx} | Loss: {loss:.4f}", fontsize=16, y=1.03
+        f"{title_prefix} | Sample {sample_idx} | Normalized Loss: {loss:.4f}",
+        fontsize=16,
+        y=1.03,
     )
     plt.tight_layout(rect=[0, 0, 1, 0.96])
-
     plot_save_dir = os.path.join(output_dir, "evaluation_plots", sub_folder)
     os.makedirs(plot_save_dir, exist_ok=True)
     save_path = os.path.join(
@@ -192,13 +194,10 @@ def plot_gamma_performance_by_quantile(
         ],
         "High_Precip (67-100%)": sorted_indices_by_mean[int(n_total * 0.67) :],
     }
-
     for group_name, candidate_indices in quantile_groups.items():
         print(f"\n--- Processing Group: {group_name} ---")
         if len(candidate_indices) == 0:
-            print("No samples in this group. Skipping.")
             continue
-
         candidate_losses = losses[candidate_indices]
         sorted_loss_indices_in_group = np.argsort(candidate_losses)
         best_in_group_indices = candidate_indices[
@@ -207,7 +206,6 @@ def plot_gamma_performance_by_quantile(
         worst_in_group_indices = candidate_indices[
             sorted_loss_indices_in_group[-n_samples:]
         ]
-
         print(f"Plotting {len(best_in_group_indices)} best samples...")
         for rank, sample_idx in enumerate(best_in_group_indices):
             _plot_single_gamma_comparison(
@@ -221,7 +219,6 @@ def plot_gamma_performance_by_quantile(
                 group_name,
                 output_dir,
             )
-
         print(f"Plotting {len(worst_in_group_indices)} worst samples...")
         for rank, sample_idx in enumerate(worst_in_group_indices):
             _plot_single_gamma_comparison(
@@ -243,17 +240,14 @@ def plot_training_log(log_path, output_dir):
             f"\nWarning: Log file not found at {log_path}. Skipping training history plot."
         )
         return
-
     print("\nGenerating training history plot...")
     try:
         df = pd.read_csv(log_path)
     except Exception as e:
         print(f"Error reading log file with pandas: {e}. Skipping plot.")
         return
-
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 12), sharex=True)
     fig.suptitle("Training History", fontsize=16)
-
     ax1.plot(
         df["epoch"],
         df["train_loss_total"],
@@ -273,40 +267,15 @@ def plot_training_log(log_path, output_dir):
     ax1.legend()
     ax1.grid(True, linestyle="--", alpha=0.6)
     ax1.set_yscale("log")
-
-    ax2.plot(
-        df["epoch"],
-        df["train_loss_main"],
-        "s--",
-        label="Train Main Loss",
-        color="lightblue",
-        alpha=0.8,
-    )
-    ax2.plot(
-        df["epoch"],
-        df["val_loss_main"],
-        "s--",
-        label="Val Main Loss",
-        color="lightcoral",
-        alpha=0.8,
-    )
-    ax2.plot(
-        df["epoch"],
-        df["train_loss_penalty"],
-        "x:",
-        label="Train Penalty",
-        color="dodgerblue",
-    )
-    ax2.plot(
-        df["epoch"], df["val_loss_penalty"], "x:", label="Val Penalty", color="red"
-    )
+    ax2.plot(df["epoch"], df["sigma_A"], "o-", label="Sigma A", color="green")
+    ax2.plot(df["epoch"], df["sigma_P"], "o-", label="Sigma P", color="purple")
+    ax2.plot(df["epoch"], df["sigma_CC"], "o-", label="Sigma CC", color="orange")
     ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("Loss Component")
-    ax2.set_title("Loss Components Over Epochs")
+    ax2.set_ylabel("Learned Std. Dev. (σ)")
+    ax2.set_title("Learned Uncertainty Parameters Over Epochs")
     ax2.legend()
     ax2.grid(True, linestyle="--", alpha=0.6)
     ax2.set_yscale("log")
-
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     save_path = os.path.join(output_dir, "training_history.png")
     plt.savefig(save_path, dpi=300)
@@ -353,16 +322,31 @@ if __name__ == "__main__":
         activation_fn=F.mish,
     ).to(device)
 
-    model_save_path = os.path.join(args.run_dir, "best_gamma_predictor_model.pth")
-    if not os.path.exists(model_save_path):
+    # Load the entire checkpoint which now includes log_vars
+    checkpoint_path = os.path.join(args.run_dir, "best_model_checkpoint.pth")
+    if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(
-            f"Error: Model file not found in run directory: '{model_save_path}'"
+            f"Error: Checkpoint file not found in run directory: '{checkpoint_path}'"
         )
 
-    print("Loading model weights...")
-    model.load_state_dict(torch.load(model_save_path, map_location=device))
+    print("Loading checkpoint...")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    print(checkpoint.keys())
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    # Load the log_vars to calculate the sigmas for the evaluation metric
+    log_var_A = checkpoint["log_var_A"]
+    log_var_P = checkpoint["log_var_P"]
+    log_var_CC = checkpoint["log_var_CC"]
+
     model.eval()
-    print("Model loaded successfully.")
+    print("Model and uncertainty parameters loaded successfully.")
+
+    # Calculate sigmas from the loaded log_vars
+    sigma_A = torch.sqrt(torch.exp(log_var_A))
+    sigma_P = torch.sqrt(torch.exp(log_var_P))
+    sigma_CC = torch.sqrt(torch.exp(log_var_CC))
+    sigmas = torch.cat([sigma_A, sigma_P, sigma_CC]).to(device)
 
     test_dataset = PreprocessedNpzDataset(
         preprocessed_data_dir=os.path.join(PREPROCESSED_DATA_DIR, "test"),
@@ -371,9 +355,10 @@ if __name__ == "__main__":
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
     print(f"Loaded {len(test_dataset)} samples for evaluation.")
 
-    # Instantiate the simple total error metric for evaluation.
-    # This is more interpretable than the complex homoscedastic training loss.
-    evaluation_metric = TotalErrorMetric(quantile_levels=QUANTILE_LEVELS).to(device)
+    # Instantiate the normalized error metric with the loaded sigmas
+    evaluation_metric = NormalizedErrorMetric(
+        quantile_levels=QUANTILE_LEVELS, sigmas=sigmas
+    ).to(device)
 
     all_preds, all_targets_gamma, all_original_images, all_losses = [], [], [], []
 
@@ -381,24 +366,21 @@ if __name__ == "__main__":
         for input_data, target_gamma, original_precip in tqdm(
             test_loader, desc="Generating predictions and calculating losses"
         ):
-            input_data = input_data.to(device)
+            input_data, target_gamma = input_data.to(device), target_gamma.to(device)
             predicted_gamma_3d = model(input_data)
-            target_gamma_device = target_gamma.to(device)
-
-            # Use the simplified metric to get per-sample error scores
-            per_sample_losses = evaluation_metric(
-                predicted_gamma_3d, target_gamma_device
-            )
+            per_sample_losses = evaluation_metric(predicted_gamma_3d, target_gamma)
 
             all_losses.append(per_sample_losses.cpu().numpy())
             all_preds.append(predicted_gamma_3d.cpu().numpy())
             all_targets_gamma.append(target_gamma.cpu().numpy())
             all_original_images.append(original_precip.squeeze(1).cpu().numpy())
 
-    all_preds = np.concatenate(all_preds, axis=0)
-    all_targets_gamma = np.concatenate(all_targets_gamma, axis=0)
-    all_original_images = np.concatenate(all_original_images, axis=0)
-    all_losses = np.concatenate(all_losses, axis=0)
+    all_preds, all_targets_gamma = np.concatenate(all_preds, axis=0), np.concatenate(
+        all_targets_gamma, axis=0
+    )
+    all_original_images, all_losses = np.concatenate(
+        all_original_images, axis=0
+    ), np.concatenate(all_losses, axis=0)
     print(f"Generated predictions and losses for {all_preds.shape[0]} samples.")
 
     plot_gamma_performance_by_quantile(
@@ -414,4 +396,4 @@ if __name__ == "__main__":
     log_file_path = os.path.join(args.run_dir, "training_log.csv")
     plot_training_log(log_file_path, args.run_dir)
 
-    print("\nEvaluation script finished.")
+    print("\n✅ Evaluation script finished.")
