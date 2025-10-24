@@ -32,6 +32,7 @@ LEARNING_RATE = config.get("LEARNING_RATE", 1e-4)
 WEIGHT_DECAY = config.get("WEIGHT_DECAY", 1e-5)
 NUM_EPOCHS = config.get("NUM_EPOCHS", 10)
 EARLY_STOPPING_PATIENCE = config.get("EARLY_STOPPING_PATIENCE", 10)
+EARLY_STOPPING_DELTA = config.get("EARLY_STOPPING_DELTA", 0.001)
 EXPERIMENT_NAME = config.get("EXPERIMENT_NAME", "Debugging")
 LAMBDA_MONOTONICITY = config.get("LAMBDA_MONOTONICITY", 1.0)
 LAMBDA_PLAUSIBILITY = config.get("LAMBDA_PLAUSIBILITY", 1.0)
@@ -155,9 +156,10 @@ class PreprocessedNpzDataset(Dataset):
         target_gamma = self.gamma_targets[idx]
         input_tensor = torch.from_numpy(original_precip).float().unsqueeze(0)
         target_gamma_tensor = torch.from_numpy(target_gamma).float()
+        log_target_gamma_tensor = torch.log1p(target_gamma_tensor)
         if self.augment:
             input_tensor = self.transform(input_tensor)
-        return input_tensor, target_gamma_tensor
+        return input_tensor, log_target_gamma_tensor
 
 
 # --- Stratified Sampler ---
@@ -347,7 +349,7 @@ if __name__ == "__main__":
     log_file_path = os.path.join(output_dir, "training_log.csv")
     try:
         with open(log_file_path, "w") as log_file:
-            # MODIFICATION: Add penalty columns to log header
+            # Add penalty columns to log header
             log_file.write(
                 "epoch,train_loss_total,train_loss_main,train_loss_zero_penalty,"
                 "train_penalty_mono,train_penalty_plaus,train_penalty_bound,"
@@ -502,7 +504,7 @@ if __name__ == "__main__":
                     predictions_for_dry_inputs = predicted_gamma_3d[is_dry_mask]
                     zero_penalty = torch.mean(torch.abs(predictions_for_dry_inputs))
 
-                # --- MODIFICATION: Calculate Physics Penalties ---
+                # --- Calculate Physics Penalties ---
                 pred_A = predicted_gamma_3d[:, 0, :]
                 pred_P = predicted_gamma_3d[:, 1, :]
                 pred_CC = predicted_gamma_3d[:, 2, :]
@@ -562,7 +564,8 @@ if __name__ == "__main__":
             f"           Val Penalties: Mono={avg_val_penalty_mono:.4f}, Plaus={avg_val_penalty_plaus:.4f}, Bound={avg_val_penalty_bound:.4f}"
         )
 
-        if avg_val_loss < best_val_loss:
+        if avg_val_loss < best_val_loss - EARLY_STOPPING_DELTA:
+            # Improvement is significant
             best_val_loss = avg_val_loss
             checkpoint = {
                 "epoch": epoch + 1,
@@ -575,20 +578,27 @@ if __name__ == "__main__":
             }
             model_save_path = os.path.join(output_dir, "best_model_checkpoint.pth")
             torch.save(checkpoint, model_save_path)
-            print(f"Model checkpoint saved to {model_save_path}.")
+            print(
+                f"Validation loss decreased significantly to {best_val_loss:.6f}. Model checkpoint saved."
+            )
+            # Reset patience counter on significant improvement
             patience_counter = 0
         else:
+            # Improvement is less than delta (or no improvement)
             patience_counter += 1
-            print(f"No improvement in validation loss for {patience_counter} epoch(s).")
+            print(
+                f"No significant improvement in validation loss for {patience_counter} epoch(s) (delta={EARLY_STOPPING_DELTA})."
+            )
+            # Check if patience has been exceeded
             if patience_counter >= EARLY_STOPPING_PATIENCE:
                 print(
-                    f"Early stopping triggered after {EARLY_STOPPING_PATIENCE} epochs without improvement."
+                    f"Early stopping triggered after {EARLY_STOPPING_PATIENCE} epochs without significant improvement."
                 )
                 break
 
         try:
             with open(log_file_path, "a") as log_file:
-                # MODIFICATION: Add penalty values to log record
+                # Add penalty values to log record
                 log_file.write(
                     f"{epoch+1},{avg_train_loss:.6f},{avg_main_loss:.6f},{avg_zero_penalty:.6f},"
                     f"{avg_penalty_mono:.6f},{avg_penalty_plaus:.6f},{avg_penalty_bound:.6f},"

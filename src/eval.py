@@ -60,33 +60,32 @@ class GammaPredictor(nn.Module):
         x = self.dropout2(x)
         x = self.fc3(x)
         x = x.view(-1, 3, self.n_quantiles)
+        # Note: The ReLU here might conflict slightly with log-space predictions if
+        # the model predicts exactly zero in log-space (which is -inf in linear space).
+        # However, it primarily prevents negative outputs which log1p handles.
         return F.relu(x)
 
 
-# Renamed and updated the metric to use learned sigmas for normalization
+# Evaluation Metric using learned sigmas for normalization
+# This metric compares values in LOG-SPACE
 class NormalizedErrorMetric(nn.Module):
     def __init__(self, quantile_levels, sigmas):
         super(NormalizedErrorMetric, self).__init__()
         self.register_buffer(
             "quantiles", torch.tensor(quantile_levels, dtype=torch.float32)
         )
-        # Use sigmas to create precision (1/variance) terms
+        # Sigmas are learned in log-space, so precision is 1/log_variance
         self.register_buffer("precision", 1 / (sigmas**2 + 1e-6))
         print(
-            f"Evaluation metric using precisions (1/sigma^2): A={self.precision[0]:.4f}, P={self.precision[1]:.4f}, CC={self.precision[2]:.4f}"
+            f"Evaluation metric (in log-space) using precisions (1/sigma^2): A={self.precision[0]:.4f}, P={self.precision[1]:.4f}, CC={self.precision[2]:.4f}"
         )
 
-    def forward(self, gamma_pred_3d, gamma_target_3d):
-        """Returns the normalized total error for each sample in the batch."""
-        abs_diff = torch.abs(gamma_pred_3d - gamma_target_3d)
-        integrand = abs_diff * self.quantiles
-        # integral_per_component has shape [B, 3]
+    def forward(self, log_gamma_pred_3d, log_gamma_target_3d):
+        # Compare directly in log-space
+        abs_diff_log = torch.abs(log_gamma_pred_3d - log_gamma_target_3d)
+        integrand = abs_diff_log * self.quantiles
         integral_per_component = torch.trapezoid(integrand, self.quantiles, dim=2)
-
-        # Normalize the error of each component by its learned precision
         normalized_error = integral_per_component * self.precision
-
-        # Return the sum of normalized errors per-sample, shape: (B,)
         total_normalized_error = torch.sum(normalized_error, dim=1)
         return total_normalized_error
 
@@ -116,30 +115,42 @@ class PreprocessedNpzDataset(Dataset):
 
     def __getitem__(self, idx):
         input_precip = self.input_patches[idx]
-        target_gamma = self.gamma_targets[idx]
+        target_gamma = self.gamma_targets[idx]  # Load original physical gamma
         original_precip = self.original_precip_patches[idx]
+
         input_tensor = torch.from_numpy(input_precip).float().unsqueeze(0)
-        target_gamma_tensor = torch.from_numpy(target_gamma).float()
+        target_gamma_tensor = torch.from_numpy(target_gamma).float()  # Physical gamma
         original_precip_tensor = torch.from_numpy(original_precip).float().unsqueeze(0)
-        return input_tensor, target_gamma_tensor, original_precip_tensor
+
+        # Return log-transformed target for loss calculation,
+        # AND the original physical target for plotting/analysis later
+        log_target_gamma_tensor = torch.log1p(target_gamma_tensor)
+
+        return (
+            input_tensor,
+            log_target_gamma_tensor,
+            original_precip_tensor,
+            target_gamma_tensor,
+        )
 
 
-# --- Plotting Functions (unchanged from your previous script) ---
+# --- Plotting Functions ---
+# These functions expect PHYSICAL SPACE values
 def _plot_single_gamma_comparison(
     sample_idx,
-    all_preds,
-    all_targets,
+    all_preds_phys,
+    all_targets_phys,
     all_images,
-    all_losses,
+    all_losses_log,
     quantiles,
     title_prefix,
     sub_folder,
     output_dir,
 ):
-    pred_gamma = all_preds[sample_idx]
-    target_gamma = all_targets[sample_idx]
+    pred_gamma = all_preds_phys[sample_idx]
+    target_gamma = all_targets_phys[sample_idx]
     target_image = all_images[sample_idx]
-    loss = all_losses[sample_idx]
+    loss = all_losses_log[sample_idx]  # Loss calculated in log space
     mean_precip = np.mean(target_image)
     gamma_types = ["Area (km²)", "Perimeter (km)", "CCs"]
     fig = plt.figure(figsize=(20, 5))
@@ -158,10 +169,10 @@ def _plot_single_gamma_comparison(
         if j == 0:
             ax.legend()
     fig.suptitle(
-        f"{title_prefix} | Sample {sample_idx} | Normalized Loss: {loss:.4f}",
+        f"{title_prefix} | Sample {sample_idx} | Normalized Log-Space Loss: {loss:.4f}",
         fontsize=16,
         y=1.03,
-    )
+    )  # Clarify loss is log-space
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plot_save_dir = os.path.join(output_dir, "evaluation_plots", sub_folder)
     os.makedirs(plot_save_dir, exist_ok=True)
@@ -175,15 +186,17 @@ def _plot_single_gamma_comparison(
 
 
 def plot_gamma_performance_by_quantile(
-    predictions,
-    targets_gamma,
+    predictions_phys,
+    targets_gamma_phys,
     target_images,
-    losses,
+    losses_log,
     quantiles,
     output_dir,
     n_samples=5,
 ):
-    print("\nGenerating plots for best and worst samples based on loss...")
+    print(
+        "\nGenerating plots for best and worst samples based on loss (calculated in log-space)..."
+    )
     all_means = np.mean(target_images, axis=(1, 2))
     sorted_indices_by_mean = np.argsort(all_means)
     n_total = len(target_images)
@@ -198,7 +211,7 @@ def plot_gamma_performance_by_quantile(
         print(f"\n--- Processing Group: {group_name} ---")
         if len(candidate_indices) == 0:
             continue
-        candidate_losses = losses[candidate_indices]
+        candidate_losses = losses_log[candidate_indices]
         sorted_loss_indices_in_group = np.argsort(candidate_losses)
         best_in_group_indices = candidate_indices[
             sorted_loss_indices_in_group[:n_samples]
@@ -210,10 +223,10 @@ def plot_gamma_performance_by_quantile(
         for rank, sample_idx in enumerate(best_in_group_indices):
             _plot_single_gamma_comparison(
                 sample_idx,
-                predictions,
-                targets_gamma,
+                predictions_phys,
+                targets_gamma_phys,
                 target_images,
-                losses,
+                losses_log,
                 quantiles,
                 f"Best Sample #{rank+1}",
                 group_name,
@@ -223,10 +236,10 @@ def plot_gamma_performance_by_quantile(
         for rank, sample_idx in enumerate(worst_in_group_indices):
             _plot_single_gamma_comparison(
                 sample_idx,
-                predictions,
-                targets_gamma,
+                predictions_phys,
+                targets_gamma_phys,
                 target_images,
-                losses,
+                losses_log,
                 quantiles,
                 f"Worst Sample #{rank+1}",
                 group_name,
@@ -246,7 +259,24 @@ def plot_training_log(log_path, output_dir):
     except Exception as e:
         print(f"Error reading log file with pandas: {e}. Skipping plot.")
         return
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 12), sharex=True)
+    required_cols = [
+        "epoch",
+        "train_loss_total",
+        "val_loss_total",
+        "sigma_A",
+        "sigma_P",
+        "sigma_CC",
+        "train_penalty_mono",
+        "train_penalty_plaus",
+        "train_penalty_bound",
+        "val_penalty_mono",
+        "val_penalty_plaus",
+        "val_penalty_bound",
+    ]
+    if not all(col in df.columns for col in required_cols):
+        print("Warning: Log file columns mismatch. Skipping training history plot.")
+        return
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 15), sharex=True)
     fig.suptitle("Training History", fontsize=16)
     ax1.plot(
         df["epoch"],
@@ -262,20 +292,73 @@ def plot_training_log(log_path, output_dir):
         label="Validation Total Loss",
         color="salmon",
     )
-    ax1.set_ylabel("Loss")
-    ax1.set_title("Total Training & Validation Loss Over Epochs")
+    ax1.set_ylabel("Total Loss")
+    ax1.set_title("Total Training & Validation Loss")
     ax1.legend()
     ax1.grid(True, linestyle="--", alpha=0.6)
     ax1.set_yscale("log")
     ax2.plot(df["epoch"], df["sigma_A"], "o-", label="Sigma A", color="green")
     ax2.plot(df["epoch"], df["sigma_P"], "o-", label="Sigma P", color="purple")
     ax2.plot(df["epoch"], df["sigma_CC"], "o-", label="Sigma CC", color="orange")
-    ax2.set_xlabel("Epoch")
     ax2.set_ylabel("Learned Std. Dev. (σ)")
-    ax2.set_title("Learned Uncertainty Parameters Over Epochs")
+    ax2.set_title("Learned Uncertainty Parameters")
     ax2.legend()
     ax2.grid(True, linestyle="--", alpha=0.6)
     ax2.set_yscale("log")
+    ax3.plot(
+        df["epoch"],
+        df["train_penalty_mono"],
+        "s--",
+        label="Train Mono Pen.",
+        color="lightblue",
+        alpha=0.8,
+    )
+    ax3.plot(
+        df["epoch"],
+        df["val_penalty_mono"],
+        "s-",
+        label="Val Mono Pen.",
+        color="blue",
+        alpha=0.8,
+    )
+    ax3.plot(
+        df["epoch"],
+        df["train_penalty_plaus"],
+        "x--",
+        label="Train Plaus Pen.",
+        color="lightgreen",
+        alpha=0.8,
+    )
+    ax3.plot(
+        df["epoch"],
+        df["val_penalty_plaus"],
+        "x-",
+        label="Val Plaus Pen.",
+        color="green",
+        alpha=0.8,
+    )
+    ax3.plot(
+        df["epoch"],
+        df["train_penalty_bound"],
+        "d--",
+        label="Train Bound Pen.",
+        color="wheat",
+        alpha=0.8,
+    )
+    ax3.plot(
+        df["epoch"],
+        df["val_penalty_bound"],
+        "d-",
+        label="Val Bound Pen.",
+        color="orange",
+        alpha=0.8,
+    )
+    ax3.set_xlabel("Epoch")
+    ax3.set_ylabel("Penalty Value")
+    ax3.set_title("Physics-Informed Penalty Terms")
+    ax3.legend(ncol=3)
+    ax3.grid(True, linestyle="--", alpha=0.6)
+    ax3.set_yscale("log")
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     save_path = os.path.join(output_dir, "training_history.png")
     plt.savefig(save_path, dpi=300)
@@ -322,32 +405,27 @@ if __name__ == "__main__":
         activation_fn=F.mish,
     ).to(device)
 
-    # Load the entire checkpoint which now includes log_vars
     checkpoint_path = os.path.join(args.run_dir, "best_model_checkpoint.pth")
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(
-            f"Error: Checkpoint file not found in run directory: '{checkpoint_path}'"
+            f"Error: Checkpoint file not found: '{checkpoint_path}'"
         )
 
     print("Loading checkpoint...")
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    print(checkpoint.keys())
     model.load_state_dict(checkpoint["model_state_dict"])
-
-    # Load the log_vars to calculate the sigmas for the evaluation metric
     log_var_A = checkpoint["log_var_A"]
     log_var_P = checkpoint["log_var_P"]
     log_var_CC = checkpoint["log_var_CC"]
-
     model.eval()
     print("Model and uncertainty parameters loaded successfully.")
 
-    # Calculate sigmas from the loaded log_vars
     sigma_A = torch.sqrt(torch.exp(log_var_A))
     sigma_P = torch.sqrt(torch.exp(log_var_P))
     sigma_CC = torch.sqrt(torch.exp(log_var_CC))
-    sigmas = torch.cat([sigma_A, sigma_P, sigma_CC]).to(device)
+    sigmas = torch.cat([sigma_A, sigma_P, sigma_CC]).squeeze().to(device)
 
+    # Dataset now returns log_target and original physical target
     test_dataset = PreprocessedNpzDataset(
         preprocessed_data_dir=os.path.join(PREPROCESSED_DATA_DIR, "test"),
         metadata_file=TEST_METADATA_FILE,
@@ -355,39 +433,57 @@ if __name__ == "__main__":
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
     print(f"Loaded {len(test_dataset)} samples for evaluation.")
 
-    # Instantiate the normalized error metric with the loaded sigmas
     evaluation_metric = NormalizedErrorMetric(
         quantile_levels=QUANTILE_LEVELS, sigmas=sigmas
     ).to(device)
 
-    all_preds, all_targets_gamma, all_original_images, all_losses = [], [], [], []
+    # Store predictions and targets in BOTH log and physical space
+    all_preds_log, all_targets_log = [], []
+    all_preds_phys, all_targets_phys = [], []
+    all_original_images, all_losses_log = [], []
 
     with torch.no_grad():
-        for input_data, target_gamma, original_precip in tqdm(
+        # Update loop to handle 4 outputs from dataset
+        for input_data, log_target_gamma, original_precip, target_gamma_phys in tqdm(
             test_loader, desc="Generating predictions and calculating losses"
         ):
-            input_data, target_gamma = input_data.to(device), target_gamma.to(device)
-            predicted_gamma_3d = model(input_data)
-            per_sample_losses = evaluation_metric(predicted_gamma_3d, target_gamma)
+            input_data, log_target_gamma = input_data.to(device), log_target_gamma.to(
+                device
+            )
 
-            all_losses.append(per_sample_losses.cpu().numpy())
-            all_preds.append(predicted_gamma_3d.cpu().numpy())
-            all_targets_gamma.append(target_gamma.cpu().numpy())
+            # Prediction is in log-space
+            predicted_gamma_log = model(input_data)
+
+            # Calculate loss in log-space
+            per_sample_losses = evaluation_metric(predicted_gamma_log, log_target_gamma)
+
+            # --- Store values for plotting ---
+            # Losses are calculated in log-space
+            all_losses_log.append(per_sample_losses.cpu().numpy())
+
+            # Convert predictions and targets back to physical space for plotting
+            predicted_gamma_phys = torch.expm1(predicted_gamma_log)
+            # target_gamma_phys = torch.expm1(log_target_gamma) # We already load the physical target
+
+            all_preds_phys.append(predicted_gamma_phys.cpu().numpy())
+            all_targets_phys.append(
+                target_gamma_phys.cpu().numpy()
+            )  # Store the original physical target
             all_original_images.append(original_precip.squeeze(1).cpu().numpy())
 
-    all_preds, all_targets_gamma = np.concatenate(all_preds, axis=0), np.concatenate(
-        all_targets_gamma, axis=0
-    )
-    all_original_images, all_losses = np.concatenate(
-        all_original_images, axis=0
-    ), np.concatenate(all_losses, axis=0)
-    print(f"Generated predictions and losses for {all_preds.shape[0]} samples.")
+    # Concatenate results
+    all_preds_phys = np.concatenate(all_preds_phys, axis=0)
+    all_targets_phys = np.concatenate(all_targets_phys, axis=0)
+    all_original_images = np.concatenate(all_original_images, axis=0)
+    all_losses_log = np.concatenate(all_losses_log, axis=0)
+    print(f"Generated predictions and losses for {all_preds_phys.shape[0]} samples.")
 
+    # Pass physical-space predictions/targets to plotting function
     plot_gamma_performance_by_quantile(
-        predictions=all_preds,
-        targets_gamma=all_targets_gamma,
+        predictions_phys=all_preds_phys,
+        targets_gamma_phys=all_targets_phys,
         target_images=all_original_images,
-        losses=all_losses,
+        losses_log=all_losses_log,  # Loss score is still the log-space value
         quantiles=QUANTILE_LEVELS,
         output_dir=args.run_dir,
         n_samples=5,
@@ -396,4 +492,4 @@ if __name__ == "__main__":
     log_file_path = os.path.join(args.run_dir, "training_log.csv")
     plot_training_log(log_file_path, args.run_dir)
 
-    print("\n✅ Evaluation script finished.")
+    print("\n Evaluation script finished.")
