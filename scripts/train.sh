@@ -13,8 +13,8 @@
 #SBATCH --gres-flags enforce-binding
 #SBATCH --nodes 1
 #SBATCH --ntasks 1
-#SBATCH --mem 150G
-#SBATCH --time 12:00:00
+#SBATCH --mem 250G
+#SBATCH --time 15:00:00
 
 export SINGULARITY_BINDPATH="/work,/scratch,/users"
 
@@ -24,4 +24,5 @@ export SINGULARITY_BINDPATH="/work,/scratch,/users"
 
 source /users/fquareng/.bashrc
 micromamba activate dl
+micromamba run -n dl python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/precompute_gamma.py
 micromamba run -n dl python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_gamma.py
