@@ -15,7 +15,7 @@ PRECIP_VAR_NAME: "TOT_PREC"
 PATCH_SIZE: 128
 DOWNSCALING_FACTOR: 6
 DECLUTTER_THRESHOLD: 150.0
-PIXEL_AREA_KM2: 4.0 # Area of one high-res pixel in km^2
+PIXEL_SIZE_KM: 2.0 # Size of one high-res pixel in km
 
 
 ANALYSIS_DATA_PERCENTAGE: 100 # Use 100% of the data. Change to 50 for 50%, etc.

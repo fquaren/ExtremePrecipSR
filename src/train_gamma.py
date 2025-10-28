@@ -35,10 +35,10 @@ NUM_EPOCHS = config.get("NUM_EPOCHS", 10)
 EARLY_STOPPING_PATIENCE = config.get("EARLY_STOPPING_PATIENCE", 10)
 EARLY_STOPPING_DELTA = config.get("EARLY_STOPPING_DELTA", 0.001)
 EXPERIMENT_NAME = config.get("EXPERIMENT_NAME", "Debugging")
-LAMBDA_BOUND = config.get("LAMBDA_BOUND", 1.0)  # Still needed
-PIXEL_AREA_KM2 = config.get("PIXEL_AREA_KM2", 1.0)
+PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 1.0)
 
 
+# Model now includes hard zero constraint
 class GammaPredictorHardConstraints(nn.Module):
     def __init__(
         self,
@@ -46,19 +46,16 @@ class GammaPredictorHardConstraints(nn.Module):
         num_output_features_flat=N,
         n_quantiles=N_QUANTILES,
         activation_fn=F.gelu,
-        quantile_levels=QUANTILE_LEVELS,  # Pass quantiles
-        pixel_area_km2=PIXEL_AREA_KM2,  # Pass pixel area
+        quantile_levels=QUANTILE_LEVELS,
+        pixel_area_km2=PIXEL_SIZE_KM**2,
     ):
         super(GammaPredictorHardConstraints, self).__init__()
         self.n_quantiles = n_quantiles
         self.activation = activation_fn
-        # Keep a buffer for quantiles for calculating A_total
         self.register_buffer(
             "quantile_levels_tensor", torch.tensor(quantile_levels, dtype=torch.float32)
         )
         self.pixel_area_km2 = pixel_area_km2
-
-        # --- Convolutional Body (same) ---
         self.conv1 = nn.Conv2d(in_channels=1, out_channels=16, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(16)
         self.conv2 = nn.Conv2d(
@@ -71,13 +68,10 @@ class GammaPredictorHardConstraints(nn.Module):
         self.bn3 = nn.BatchNorm2d(64)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
         self.fc_input_size = self._get_conv_output_size(input_shape)
-
-        # --- FC Layers (same) ---
         self.fc1 = nn.Linear(self.fc_input_size, 256)
         self.dropout1 = nn.Dropout(0.5)
         self.fc2 = nn.Linear(256, 128)
         self.dropout2 = nn.Dropout(0.5)
-        # Final layer still outputs features for all 3 components
         self.fc3 = nn.Linear(128, num_output_features_flat)
 
     def _get_conv_output_size(self, shape):
@@ -92,7 +86,6 @@ class GammaPredictorHardConstraints(nn.Module):
         x = self.pool(self.activation(self.bn3(self.conv3(x))))
         return x
 
-    # Implement hard constraints in the forward pass
     def forward(self, x):
         # --- Feature Extraction ---
         x_conv = self._forward_conv(x)
@@ -103,51 +96,43 @@ class GammaPredictorHardConstraints(nn.Module):
         x_fc = self.dropout2(x_fc)
         raw_output = self.fc3(x_fc)  # Shape [B, 3 * NQ]
 
-        # --- Split into Raw Outputs ---
+        # --- Reconstruct A and P with hard constraints ---
         raw_A_logits = raw_output[:, 0 * self.n_quantiles : 1 * self.n_quantiles]
-        raw_P_logits = raw_output[
-            :, 1 * self.n_quantiles : 2 * self.n_quantiles
-        ]  # Logits for excess P
-        raw_CC_pred = raw_output[
-            :, 2 * self.n_quantiles : 3 * self.n_quantiles
-        ]  # Direct prediction for CC
+        raw_P_logits = raw_output[:, 1 * self.n_quantiles : 2 * self.n_quantiles]
+        raw_CC_pred = raw_output[:, 2 * self.n_quantiles : 3 * self.n_quantiles]
 
-        # --- Calculate A_total Directly from Input ---
-        with torch.no_grad():
-            # Use the first quantile level (should be 0.0 or lowest value like 0.01)
+        with torch.no_grad():  # A_total calc doesn't need grad w.r.t input
             threshold = self.quantile_levels_tensor[0]
             mask = torch.nan_to_num(x, nan=-1.0) >= threshold
             A_total = mask.sum(dim=(2, 3)).float() * self.pixel_area_km2 + 1e-6
             A_total = A_total.unsqueeze(1)  # [B, 1]
 
-        # --- Apply Softmax and Reconstruct Monotonic Area (pred_A) ---
         probs_A = torch.softmax(raw_A_logits, dim=1)
         scaled_probs_A = probs_A * A_total
-        # Cumsum in reverse ensures non-increasing order
         pred_A = torch.flip(
             torch.cumsum(torch.flip(scaled_probs_A, dims=[1]), dim=1), dims=[1]
         )  # [B, NQ]
 
-        # --- Reconstruct Plausible Perimeter (pred_P) ---
         epsilon = 1e-6
-        # Calculate minimum perimeter based on reconstructed Area
         P_min = torch.sqrt(4 * math.pi * (pred_A + epsilon))
-        # Calculate excess perimeter using ReLU on logits (Softplus is also an option)
-        P_excess = F.relu(raw_P_logits)
-        # Final perimeter prediction
+        P_excess = F.relu(raw_P_logits)  # Or F.softplus
         pred_P = P_min + P_excess  # [B, NQ]
 
-        # --- Apply ReLU to CC (non-negativity) ---
         pred_CC = F.relu(raw_CC_pred)  # [B, NQ]
 
-        # --- Stack Components Back Together ---
-        final_output = torch.stack([pred_A, pred_P, pred_CC], dim=1)  # Shape [B, 3, NQ]
+        constrained_output = torch.stack([pred_A, pred_P, pred_CC], dim=1)  # [B, 3, NQ]
 
-        # NO final ReLU needed here as non-negativity is handled per-component
+        # --- Apply Hard Zero Constraint based on Input ---
+        with torch.no_grad():
+            is_dry_mask = x.sum(dim=(1, 2, 3)) <= 1e-6  # Shape [B]
+            wet_factor = (~is_dry_mask).float().view(-1, 1, 1)  # Shape [B, 1, 1]
+
+        final_output = constrained_output * wet_factor
+
         return final_output
 
 
-# --- Data Handling & Augmentation ---
+# --- Data Handling & Augmentation (using log1p transform) ---
 class AddGaussianNoise(object):
     def __init__(self, mean=0.0, std=0.01):
         self.std, self.mean = std, mean
@@ -163,7 +148,6 @@ class AddGaussianNoise(object):
         return self.__class__.__name__ + f"(mean={self.mean}, std={self.std})"
 
 
-# --- Data Handling & Augmentation (using log1p transform) ---
 class PreprocessedNpzDataset(Dataset):
     def __init__(
         self, preprocessed_data_dir, metadata_file, augment=False, noise_std=0.01
@@ -208,12 +192,12 @@ class PreprocessedNpzDataset(Dataset):
         target_gamma = self.gamma_targets[idx]
         input_tensor = torch.from_numpy(original_precip).float().unsqueeze(0)
         target_gamma_tensor = torch.from_numpy(target_gamma).float()
-        # Apply log transform to target
-        log_target_gamma_tensor = torch.log1p(target_gamma_tensor)
+        log_target_gamma_tensor = torch.log1p(
+            target_gamma_tensor
+        )  # Apply log transform
         if self.augment:
             input_tensor = self.transform(input_tensor)
-        # Return input and LOG TARGET
-        return input_tensor, log_target_gamma_tensor
+        return input_tensor, log_target_gamma_tensor  # Return input and LOG TARGET
 
 
 # --- Stratified Sampler ---
@@ -277,8 +261,7 @@ class ComponentWiseCDFLoss(nn.Module):
             "quantiles", torch.tensor(quantile_levels, dtype=torch.float32)
         )
 
-    def forward(self, gamma_pred_3d, gamma_target_3d):
-        # NOTE: This loss now compares LOG-TRANSFORMED values
+    def forward(self, gamma_pred_3d, gamma_target_3d):  # Expects LOG SPACE values
         abs_diff_log = torch.abs(gamma_pred_3d - gamma_target_3d)
         integrand = abs_diff_log * self.quantiles
         integral_per_component = torch.trapezoid(integrand, self.quantiles, dim=2)
@@ -384,8 +367,12 @@ if __name__ == "__main__":
     log_var_A = nn.Parameter(torch.zeros((1,), device=device))
     log_var_P = nn.Parameter(torch.zeros((1,), device=device))
     log_var_CC = nn.Parameter(torch.zeros((1,), device=device))
-    # Use the new model class
-    model = GammaPredictorHardConstraints(activation_fn=F.mish).to(device)
+    # Use the new model class with hard constraints
+    model = GammaPredictorHardConstraints(
+        activation_fn=F.mish,  # Ensure activation matches if needed
+        quantile_levels=QUANTILE_LEVELS,
+        pixel_area_km2=PIXEL_SIZE_KM**2,
+    ).to(device)
     optimizer = torch.optim.Adam(
         list(model.parameters()) + [log_var_A, log_var_P, log_var_CC],
         lr=LEARNING_RATE,
@@ -395,20 +382,16 @@ if __name__ == "__main__":
         optimizer, mode="min", factor=0.5, patience=5
     )
     criterion = ComponentWiseCDFLoss(quantile_levels=QUANTILE_LEVELS).to(device)
-    LOSS_LAMBDA = config.get("LOSS_LAMBDA", 0.5)  # Weight for zero penalty vs main loss
-    print(f"Using weighted average zero penalty with lambda = {LOSS_LAMBDA}")
-    # Remove unused lambdas from print statement
-    print(f"Using physics penalty: Bound={LAMBDA_BOUND}")
 
     log_file_path = os.path.join(output_dir, "training_log.csv")
     try:
         with open(log_file_path, "w") as log_file:
-            # Remove mono and plaus penalty columns from log header
+            # Update log header - remove zero penalty columns
             log_file.write(
-                "epoch,train_loss_total,train_loss_main,train_loss_zero_penalty,"
-                "train_penalty_bound,"  # Removed mono, plaus
-                "val_loss_total,val_loss_main,val_loss_zero_penalty,"
-                "val_penalty_bound,"  # Removed mono, plaus
+                "epoch,train_loss_total,train_loss_main,"
+                "train_penalty_bound,"  # Removed mono, plaus, zero
+                "val_loss_total,val_loss_main,"
+                "val_penalty_bound,"  # Removed mono, plaus, zero
                 "sigma_A,sigma_P,sigma_CC\n"
             )
         print(f"Log file will be saved to {log_file_path}")
@@ -423,21 +406,19 @@ if __name__ == "__main__":
 
     for epoch in range(NUM_EPOCHS):
         model.train()
-        # Remove accumulators for mono and plaus penalties
-        running_loss, running_main_loss, running_zero_penalty = 0.0, 0.0, 0.0
-        running_penalty_bound = 0.0
+        running_loss, running_main_loss = 0.0, 0.0
 
         for input_data, log_target_gamma in tqdm(
             train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} (Train)"
         ):
             input_data, log_target_gamma = input_data.to(device), log_target_gamma.to(
                 device
-            )  # Target is now log-transformed
+            )
             optimizer.zero_grad()
-            # Model output is in physical space due to reconstructions
+            # Model output is physical space due to hard constraints (including zero)
             predicted_gamma_phys = model(input_data)
 
-            # Need to transform prediction to log-space for loss comparison
+            # Need log-space prediction for the main loss comparison
             predicted_gamma_log = torch.log1p(predicted_gamma_phys)
 
             # --- Calculate Main Homoscedastic Loss (in log-space) ---
@@ -447,29 +428,9 @@ if __name__ == "__main__":
             term_CC = torch.exp(-log_var_CC) * loss_CC + log_var_CC
             main_loss_homo = (term_A + term_P + term_CC) * 0.5
 
-            # --- Calculate Zero Penalty (on physical predictions) ---
-            is_dry_mask = input_data.sum(dim=(1, 2, 3)) <= 1e-6
-            zero_penalty = torch.tensor(0.0, device=device)
-            if is_dry_mask.sum() > 0:
-                # Penalize the physical space prediction if input is dry
-                predictions_for_dry_inputs = predicted_gamma_phys[is_dry_mask]
-                zero_penalty = torch.mean(torch.abs(predictions_for_dry_inputs))
-
-            # --- Calculate Remaining Physics Penalty (Bound) ---
-            # Use physical space predictions for this penalty
-            pred_A_phys = predicted_gamma_phys[:, 0, :]
-            pred_CC_phys = predicted_gamma_phys[:, 2, :]
-            penalty_bound = torch.mean(
-                F.relu(pred_CC_phys - (pred_A_phys / PIXEL_AREA_KM2))
-            )
-
             # --- Combine ALL losses ---
-            # Monotonicity and Plausibility penalties are removed
-            total_loss = (
-                main_loss_homo
-                + LOSS_LAMBDA * zero_penalty
-                + LAMBDA_BOUND * penalty_bound
-            )
+            # Zero penalty removed from total loss
+            total_loss = main_loss_homo
 
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -478,33 +439,20 @@ if __name__ == "__main__":
             # --- Accumulate losses for logging ---
             running_loss += total_loss.item()
             running_main_loss += main_loss_homo.item()
-            running_zero_penalty += zero_penalty.item()
-            running_penalty_bound += penalty_bound.item()  # Keep bound penalty
 
         # Calculate average losses for the epoch
         num_batches = len(train_loader)
         avg_train_loss = running_loss / num_batches if num_batches > 0 else 0
         avg_main_loss = running_main_loss / num_batches if num_batches > 0 else 0
-        avg_zero_penalty = running_zero_penalty / num_batches if num_batches > 0 else 0
-        avg_penalty_bound = (
-            running_penalty_bound / num_batches if num_batches > 0 else 0
-        )
 
         # Update print statement
         print(
-            f"Epoch {epoch+1} Train Loss: Total={avg_train_loss:.4f} (Main={avg_main_loss:.4f}, ZeroPen={avg_zero_penalty:.4f})"
+            f"Epoch {epoch+1} Train Loss: Total={avg_train_loss:.4f} (Main={avg_main_loss:.4f})"
         )
-        print(f"             Penalties: Bound={avg_penalty_bound:.4f}")
-
         # --- Validation ---
         model.eval()
-        # Remove accumulators for mono and plaus penalties
-        val_running_loss, val_running_main_loss, val_running_zero_penalty = (
-            0.0,
-            0.0,
-            0.0,
-        )
-        val_running_penalty_bound = 0.0
+        # Remove zero penalty accumulator
+        val_running_loss, val_running_main_loss = 0.0, 0.0
 
         with torch.no_grad():
             for input_data, log_target_gamma in tqdm(
@@ -512,13 +460,11 @@ if __name__ == "__main__":
             ):
                 input_data, log_target_gamma = input_data.to(
                     device
-                ), log_target_gamma.to(
-                    device
-                )  # Target is log-transformed
-                # Model output is physical space
-                predicted_gamma_phys = model(input_data)
-                # Transform prediction to log-space for loss
-                predicted_gamma_log = torch.log1p(predicted_gamma_phys)
+                ), log_target_gamma.to(device)
+                predicted_gamma_phys = model(input_data)  # Physical space output
+                predicted_gamma_log = torch.log1p(
+                    predicted_gamma_phys
+                )  # Log space for loss
 
                 # --- Calculate Main Homoscedastic Loss (log-space)---
                 loss_A, loss_P, loss_CC = criterion(
@@ -529,44 +475,18 @@ if __name__ == "__main__":
                 term_CC = torch.exp(-log_var_CC) * loss_CC + log_var_CC
                 main_loss_homo = (term_A + term_P + term_CC) * 0.5
 
-                # --- Calculate Zero Penalty (physical space)---
-                is_dry_mask = input_data.sum(dim=(1, 2, 3)) <= 1e-6
-                zero_penalty = torch.tensor(0.0, device=device)
-                if is_dry_mask.sum() > 0:
-                    predictions_for_dry_inputs = predicted_gamma_phys[is_dry_mask]
-                    zero_penalty = torch.mean(torch.abs(predictions_for_dry_inputs))
-
-                # --- Calculate Physics Penalty (Bound - physical space) ---
-                pred_A_phys = predicted_gamma_phys[:, 0, :]
-                pred_CC_phys = predicted_gamma_phys[:, 2, :]
-                penalty_bound = torch.mean(
-                    F.relu(pred_CC_phys - (pred_A_phys / PIXEL_AREA_KM2))
-                )
-
                 # --- Combine ALL losses ---
-                total_loss = (
-                    main_loss_homo
-                    + LOSS_LAMBDA * zero_penalty
-                    + LAMBDA_BOUND * penalty_bound
-                )
+                total_loss = main_loss_homo
 
                 # --- Accumulate validation losses ---
                 val_running_loss += total_loss.item()
                 val_running_main_loss += main_loss_homo.item()
-                val_running_zero_penalty += zero_penalty.item()
-                val_running_penalty_bound += penalty_bound.item()
 
         # Calculate average validation losses
         num_val_batches = len(val_loader)
         avg_val_loss = val_running_loss / num_val_batches if num_val_batches > 0 else 0
         avg_val_main_loss = (
             val_running_main_loss / num_val_batches if num_val_batches > 0 else 0
-        )
-        avg_val_zero_penalty = (
-            val_running_zero_penalty / num_val_batches if num_val_batches > 0 else 0
-        )
-        avg_val_penalty_bound = (
-            val_running_penalty_bound / num_val_batches if num_val_batches > 0 else 0
         )
 
         scheduler.step(avg_val_loss)
@@ -576,10 +496,8 @@ if __name__ == "__main__":
 
         # Update print statement
         print(
-            f"Epoch {epoch+1} Val Loss: Total={avg_val_loss:.4f} (Main={avg_val_main_loss:.4f}, ZeroPen={avg_val_zero_penalty:.4f}) | Sigmas: A={sigma_A:.3f}, P={sigma_P:.3f}, CC={sigma_CC:.3f}"
+            f"Epoch {epoch+1} Val Loss: Total={avg_val_loss:.4f} (Main={avg_val_main_loss:.4f}) | Sigmas: A={sigma_A:.3f}, P={sigma_P:.3f}, CC={sigma_CC:.3f}"
         )
-        print(f"           Val Penalties: Bound={avg_val_penalty_bound:.4f}")
-
         if avg_val_loss < best_val_loss - EARLY_STOPPING_DELTA:
             best_val_loss = avg_val_loss
             checkpoint = {
@@ -610,10 +528,8 @@ if __name__ == "__main__":
             with open(log_file_path, "a") as log_file:
                 # Update log record format
                 log_file.write(
-                    f"{epoch+1},{avg_train_loss:.6f},{avg_main_loss:.6f},{avg_zero_penalty:.6f},"
-                    f"{avg_penalty_bound:.6f},"
-                    f"{avg_val_loss:.6f},{avg_val_main_loss:.6f},{avg_val_zero_penalty:.6f},"
-                    f"{avg_val_penalty_bound:.6f},"
+                    f"{epoch+1},{avg_train_loss:.6f},{avg_main_loss:.6f},"
+                    f"{avg_val_loss:.6f},{avg_val_main_loss:.6f},"
                     f"{sigma_A:.6f},{sigma_P:.6f},{sigma_CC:.6f}\n"
                 )
         except IOError as e:

@@ -18,6 +18,7 @@ with open(config_path, "r") as file:
 
 QUANTILE_LEVELS = config["QUANTILE_LEVELS"]
 PREPROCESSED_DATA_DIR = config["PREPROCESSED_DATA_DIR"]
+pixel_size_km = config.get("PIXEL_SIZE_KM", 1.0)
 
 
 # --- Core Geometric Calculation Functions (copied from original script) ---
