@@ -15,7 +15,8 @@ import math  # Needed for pi
 
 # --- Configuration Loading ---
 config_path = (
-    "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/config.yaml"
+    # "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/config.yaml"
+    "/home/fquareng/work/ExtremePrecipSR/config.yaml"
 )
 with open(config_path, "r") as file:
     config = yaml.safe_load(file)
@@ -337,7 +338,8 @@ if __name__ == "__main__":
         else:
             indices_extreme.append(i)
     print(
-        f"Stratification complete: {len(indices_dry)} Dry, {len(indices_normal)} Normal, {len(indices_extreme)} Extreme."
+        f"Stratification complete: {len(indices_dry)} \n"
+        f"Dry, {len(indices_normal)} Normal, {len(indices_extreme)} Extreme."
     )
     batch_composition = {
         "dry": int(BATCH_SIZE / 4),
@@ -447,7 +449,8 @@ if __name__ == "__main__":
 
         # Update print statement
         print(
-            f"Epoch {epoch+1} Train Loss: Total={avg_train_loss:.4f} (Main={avg_main_loss:.4f})"
+            f"Epoch {epoch+1}\n"
+            f"Train Loss: Total={avg_train_loss:.4f} (Main={avg_main_loss:.4f})"
         )
         # --- Validation ---
         model.eval()
@@ -496,7 +499,9 @@ if __name__ == "__main__":
 
         # Update print statement
         print(
-            f"Epoch {epoch+1} Val Loss: Total={avg_val_loss:.4f} (Main={avg_val_main_loss:.4f}) | Sigmas: A={sigma_A:.3f}, P={sigma_P:.3f}, CC={sigma_CC:.3f}"
+            f"Epoch {epoch+1}\n"
+            f"Val Loss: Total={avg_val_loss:.4f} (Main={avg_val_main_loss:.4f})\n"
+            f"Sigmas: A={sigma_A:.3f}, P={sigma_P:.3f}, CC={sigma_CC:.3f}"
         )
         if avg_val_loss < best_val_loss - EARLY_STOPPING_DELTA:
             best_val_loss = avg_val_loss

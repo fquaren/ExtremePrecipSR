@@ -16,7 +16,7 @@ from sklearn.metrics import r2_score
 
 
 # --- Model Definition ---
-# MODIFICATION: Use the hard constraint model class (must match training script)
+# Use the hard constraint model class (must match training script)
 class GammaPredictorHardConstraints(nn.Module):
     def __init__(
         self,
@@ -304,7 +304,7 @@ def plot_gamma_performance_by_quantile(
             )
 
 
-# MODIFICATION: Updated plot function for reduced number of penalties
+# Updated plot function for reduced number of penalties
 def plot_training_log(log_path, output_dir):
     if not os.path.exists(log_path):
         print(
@@ -447,7 +447,7 @@ if __name__ == "__main__":
     PREPROCESSED_DATA_DIR = config["PREPROCESSED_DATA_DIR"]
     TEST_METADATA_FILE = config["TEST_METADATA_FILE"]
     BATCH_SIZE = config.get("BATCH_SIZE", 16)
-    # MODIFICATION: Get pixel area needed for the hard constraint model init
+    # Get pixel area needed for the hard constraint model init
     PIXEL_AREA_KM2 = config.get(
         "PIXEL_AREA_KM2", 1.0
     )  # Default if missing in old config
@@ -455,7 +455,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # MODIFICATION: Instantiate the correct Hard Constraint model
+    # Instantiate the correct Hard Constraint model
     model = GammaPredictorHardConstraints(
         input_shape=(1, PATCH_SIZE, PATCH_SIZE),
         num_output_features_flat=N,
@@ -485,7 +485,7 @@ if __name__ == "__main__":
     sigma_CC = torch.sqrt(torch.exp(log_var_CC))
     sigmas = torch.cat([sigma_A, sigma_P, sigma_CC]).squeeze().to(device)
 
-    # MODIFICATION: Dataset now returns log_target and original physical target
+    # Dataset now returns log_target and original physical target
     test_dataset = PreprocessedNpzDataset(
         preprocessed_data_dir=os.path.join(PREPROCESSED_DATA_DIR, "test"),
         metadata_file=TEST_METADATA_FILE,
@@ -502,7 +502,7 @@ if __name__ == "__main__":
     all_original_images, all_losses_log = [], []
 
     with torch.no_grad():
-        # MODIFICATION: Update loop to handle 4 outputs from dataset
+        # Update loop to handle 4 outputs from dataset
         for input_data, log_target_gamma, original_precip, target_gamma_phys in tqdm(
             test_loader, desc="Generating predictions and calculating losses"
         ):
@@ -534,7 +534,7 @@ if __name__ == "__main__":
     all_losses_log = np.concatenate(all_losses_log, axis=0)
     print(f"Generated predictions and losses for {all_preds_phys.shape[0]} samples.")
 
-    # MODIFICATION: Calculate and print R^2 scores
+    # Calculate and print R^2 scores
     print("\nCalculating R^2 scores (coefficient of determination)...")
     # Reshape predictions and targets to [n_samples, n_features] for sklearn
     n_samples = all_preds_phys.shape[0]
