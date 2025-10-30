@@ -21,7 +21,7 @@ export SINGULARITY_BINDPATH="/work,/scratch,/users"
 
 # source /users/fquareng/.bashrc
 # micromamba activate dl
-# micromamba run -n dl python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/eval.py --run_dir /scratch/fquareng/experiment_runs/GammaEmulatorv1_2025-10-27_16-42-22
+# micromamba run -n dl python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/eval.py --run_dir /scratch/fquareng/experiment_runs/GammaEmulatorv1_2025-10-28_20-19-35
 
 container_path="/users/fquareng/singularity/dl_gh200.sif"
-singularity exec --nv "$container_path" python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/eval.py --run_dir /scratch/fquareng/experiment_runs/GammaEmulatorv1_2025-10-27_16-42-22
+singularity exec --nv "$container_path" python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/eval.py --run_dir /scratch/fquareng/experiment_runs/GammaEmulatorv1_2025-10-29_18-56-19

@@ -1,13 +1,13 @@
 # Paths
-# PREPROCESSED_DATA_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/precip"
-PREPROCESSED_DATA_DIR: "/home/fquareng/work/data/"
+PREPROCESSED_DATA_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/precip"
+# PREPROCESSED_DATA_DIR: "/home/fquareng/work/data/"
 
-# TRAIN_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/train_patches_metadata.txt"
-TRAIN_METADATA_FILE: "/home/fquareng/work/data/train_patches_metadata.txt"
-# VAL_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/val_patches_metadata.txt"
-VAL_METADATA_FILE: "/home/fquareng/work/data/val_patches_metadata.txt"
-# TEST_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/test_patches_metadata.txt"
-TEST_METADATA_FILE: "/home/fquareng/work/data/test_patches_metadata.txt"
+TRAIN_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/train_patches_metadata.txt"
+# TRAIN_METADATA_FILE: "/home/fquareng/work/data/train_patches_metadata.txt"
+VAL_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/val_patches_metadata.txt"
+# VAL_METADATA_FILE: "/home/fquareng/work/data/val_patches_metadata.txt"
+TEST_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/test_patches_metadata.txt"
+# TEST_METADATA_FILE: "/home/fquareng/work/data/test_patches_metadata.txt"
 
 # Precipitation patches
 PRECIP_VAR_NAME: "TOT_PREC"
@@ -15,6 +15,7 @@ PATCH_SIZE: 128
 DOWNSCALING_FACTOR: 6
 DECLUTTER_THRESHOLD: 150.0
 PIXEL_SIZE_KM: 2.0 # Size of one high-res pixel in km
+PIXEL_AREA_KM2: 4.0 # Area of one high-res pixel in km^2
 PERSISTENCE_THRESHOLD: 0.01 # Persistence threshold for topological simplification
 
 ANALYSIS_DATA_PERCENTAGE: 100 # Use 100% of the data. Change to 50 for 50%, etc.
@@ -27,8 +28,7 @@ SPLIT_RATIOS:
 
 # DataLoaders
 BATCH_SIZE: 32
-MAX_WORKERS: 8
-NUM_WORKERS: 1
+NUM_WORKERS: 16
 
 # UNet
 DROPOUT_PROB: 0.3

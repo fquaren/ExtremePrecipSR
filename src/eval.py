@@ -79,7 +79,7 @@ class GammaPredictorHardConstraints(nn.Module):
         x_fc = self.dropout2(x_fc)
         raw_output = self.fc3(x_fc)  # Shape [B, 3 * NQ]
 
-        # --- Split into Raw Outputs ---
+        # --- Reconstruct A and P with hard constraints ---
         raw_A_logits = raw_output[
             :, 0 * self.n_quantiles : 1 * self.n_quantiles
         ]  # [B, NQ]
@@ -90,36 +90,36 @@ class GammaPredictorHardConstraints(nn.Module):
             :, 2 * self.n_quantiles : 3 * self.n_quantiles
         ]  # [B, NQ]
 
-        # --- Calculate A_total Directly from Input ---
-        with torch.no_grad():
+        with torch.no_grad():  # A_total calc doesn't need grad w.r.t input
             threshold = self.quantile_levels_tensor[0]
             mask = torch.nan_to_num(x, nan=-1.0) >= threshold
+            # Ensure A_total has shape [B, 1] for correct broadcasting
             A_total = (
-                mask.sum(dim=(2, 3), keepdim=True).float() * self.pixel_area_km2 + 1e-6
-            )  # Shape [B, 1, 1, 1] -> [B, 1]
-            A_total = A_total.squeeze()  # Make it [B]
-            if A_total.dim() == 0:  # Handle batch size 1 case
-                A_total = A_total.unsqueeze(0)
-            A_total = A_total.unsqueeze(1)  # Make it [B, 1]
+                mask.sum(dim=(2, 3)).float() * self.pixel_area_km2 + 1e-6
+            )  # Shape [B, 1]
 
-        # --- Constrain Area (Monotonicity) ---
         probs_A = torch.softmax(raw_A_logits, dim=1)  # [B, NQ]
         scaled_probs_A = probs_A * A_total  # Broadcasting [B, NQ] * [B, 1] -> [B, NQ]
         pred_A = torch.flip(
             torch.cumsum(torch.flip(scaled_probs_A, dims=[1]), dim=1), dims=[1]
         )  # [B, NQ]
 
-        # --- Constrain Perimeter (Plausibility) ---
         epsilon = 1e-6
         P_min = torch.sqrt(4 * math.pi * (pred_A + epsilon))
         P_excess = F.relu(raw_P_logits)  # Or F.softplus(raw_P_logits)
         pred_P = P_min + P_excess  # [B, NQ]
 
-        # --- Constrain CC (Non-negativity) ---
         pred_CC = F.relu(raw_CC_pred)  # [B, NQ]
 
-        # --- Stack Components Back Together ---
-        final_output = torch.stack([pred_A, pred_P, pred_CC], dim=1)  # Shape [B, 3, NQ]
+        constrained_output = torch.stack([pred_A, pred_P, pred_CC], dim=1)  # [B, 3, NQ]
+
+        # --- Apply Hard Zero Constraint based on Input ---
+        with torch.no_grad():
+            is_dry_mask = x.sum(dim=(1, 2, 3)) <= 1e-6  # Shape [B]
+            wet_factor = (~is_dry_mask).float().view(-1, 1, 1)  # Shape [B, 1, 1]
+
+        # Apply the factor: Zeroes out predictions for dry samples
+        final_output = constrained_output * wet_factor
 
         return final_output
 
@@ -304,7 +304,7 @@ def plot_gamma_performance_by_quantile(
             )
 
 
-# Updated plot function for reduced number of penalties
+# Updated plot function to match new log format
 def plot_training_log(log_path, output_dir):
     if not os.path.exists(log_path):
         print(
@@ -317,8 +317,7 @@ def plot_training_log(log_path, output_dir):
     except Exception as e:
         print(f"Error reading log file with pandas: {e}. Skipping plot.")
         return
-
-    # Check for expected columns
+    # Check for expected columns for the hard constraint + bound penalty run
     required_cols = [
         "epoch",
         "train_loss_total",
@@ -328,10 +327,10 @@ def plot_training_log(log_path, output_dir):
         "sigma_CC",
         "train_penalty_bound",
         "val_penalty_bound",
-    ]  # Removed mono, plaus
+    ]
     if not all(col in df.columns for col in required_cols):
         print(
-            "Warning: Log file columns mismatch (expected hard constraint log). Skipping training history plot."
+            "Warning: Log file columns mismatch (expected hard constraint log). Skipping plot."
         )
         # print(f"Missing: {[c for c in required_cols if c not in df.columns]}")
         return
@@ -370,7 +369,7 @@ def plot_training_log(log_path, output_dir):
     ax2.grid(True, linestyle="--", alpha=0.6)
     ax2.set_yscale("log")
 
-    # --- Plot 3: Remaining Physics Penalty (Bound) ---
+    # --- Plot 3: Remaining Soft Penalty (Bound) ---
     ax3.plot(
         df["epoch"],
         df["train_penalty_bound"],
@@ -387,23 +386,27 @@ def plot_training_log(log_path, output_dir):
         color="orange",
         alpha=0.8,
     )
-    # You might also want to plot the zero penalty if it's informative
-    ax3.plot(
-        df["epoch"],
-        df["train_loss_zero_penalty"],
-        "p:",
-        label="Train Zero Pen.",
-        color="grey",
-        alpha=0.6,
-    )
-    ax3.plot(
-        df["epoch"],
-        df["val_loss_zero_penalty"],
-        "p:",
-        label="Val Zero Pen.",
-        color="black",
-        alpha=0.6,
-    )
+    # Plot zero penalty if columns exist (for backward compatibility or future use)
+    if (
+        "train_loss_zero_penalty" in df.columns
+        and "val_loss_zero_penalty" in df.columns
+    ):
+        ax3.plot(
+            df["epoch"],
+            df["train_loss_zero_penalty"],
+            "p:",
+            label="Train Zero Pen.",
+            color="grey",
+            alpha=0.6,
+        )
+        ax3.plot(
+            df["epoch"],
+            df["val_loss_zero_penalty"],
+            "p:",
+            label="Val Zero Pen.",
+            color="black",
+            alpha=0.6,
+        )
 
     ax3.set_xlabel("Epoch")
     ax3.set_ylabel("Penalty Value")
@@ -447,10 +450,7 @@ if __name__ == "__main__":
     PREPROCESSED_DATA_DIR = config["PREPROCESSED_DATA_DIR"]
     TEST_METADATA_FILE = config["TEST_METADATA_FILE"]
     BATCH_SIZE = config.get("BATCH_SIZE", 16)
-    # Get pixel area needed for the hard constraint model init
-    PIXEL_AREA_KM2 = config.get(
-        "PIXEL_AREA_KM2", 1.0
-    )  # Default if missing in old config
+    PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 1.0)  # Load pixel area
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -460,9 +460,9 @@ if __name__ == "__main__":
         input_shape=(1, PATCH_SIZE, PATCH_SIZE),
         num_output_features_flat=N,
         n_quantiles=N_QUANTILES,
-        activation_fn=F.mish,  # Make sure this matches training
+        activation_fn=F.mish,  # Ensure matches training
         quantile_levels=QUANTILE_LEVELS,
-        pixel_area_km2=PIXEL_AREA_KM2,
+        pixel_area_km2=PIXEL_SIZE_KM * PIXEL_SIZE_KM,
     ).to(device)
 
     checkpoint_path = os.path.join(args.run_dir, "best_model_checkpoint.pth")
@@ -536,27 +536,18 @@ if __name__ == "__main__":
 
     # Calculate and print R^2 scores
     print("\nCalculating R^2 scores (coefficient of determination)...")
-    # Reshape predictions and targets to [n_samples, n_features] for sklearn
     n_samples = all_preds_phys.shape[0]
     n_features = 3 * N_QUANTILES
     preds_flat = all_preds_phys.reshape(n_samples, n_features)
     targets_flat = all_targets_phys.reshape(n_samples, n_features)
-
-    # Calculate R^2 for each feature (component at each quantile)
     r2_scores_raw = r2_score(targets_flat, preds_flat, multioutput="raw_values")
-
-    # Reshape back to [3, NQ] for easier interpretation
     r2_scores_matrix = r2_scores_raw.reshape(3, N_QUANTILES)
-
-    # Calculate and print average R^2 per component
     avg_r2_A = np.mean(r2_scores_matrix[0, :])
     avg_r2_P = np.mean(r2_scores_matrix[1, :])
     avg_r2_CC = np.mean(r2_scores_matrix[2, :])
     print(f"Average R^2 Score - Area:      {avg_r2_A:.4f}")
     print(f"Average R^2 Score - Perimeter: {avg_r2_P:.4f}")
     print(f"Average R^2 Score - CC:        {avg_r2_CC:.4f}")
-
-    # Optionally, save all R^2 scores
     r2_save_path = os.path.join(args.run_dir, "r2_scores.npz")
     np.savez_compressed(
         r2_save_path, r2_matrix=r2_scores_matrix, quantiles=QUANTILE_LEVELS
@@ -571,7 +562,7 @@ if __name__ == "__main__":
         losses_log=all_losses_log,
         quantiles=QUANTILE_LEVELS,
         output_dir=args.run_dir,
-        n_samples=5,
+        n_samples=10,
     )
 
     log_file_path = os.path.join(args.run_dir, "training_log.csv")

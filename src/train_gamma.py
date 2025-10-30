@@ -15,8 +15,8 @@ import math  # Needed for pi
 
 # --- Configuration Loading ---
 config_path = (
-    # "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/config.yaml"
-    "/home/fquareng/work/ExtremePrecipSR/config.yaml"
+    "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/config.yaml"
+    # "/home/fquareng/work/ExtremePrecipSR/config.yaml"
 )
 with open(config_path, "r") as file:
     config = yaml.safe_load(file)
@@ -67,7 +67,7 @@ class GammaPredictorHardConstraints(nn.Module):
             in_channels=32, out_channels=64, kernel_size=3, padding=1
         )
         self.bn3 = nn.BatchNorm2d(64)
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.pool = nn.AvgPool2d(kernel_size=2, stride=2)
         self.fc_input_size = self._get_conv_output_size(input_shape)
         self.fc1 = nn.Linear(self.fc_input_size, 256)
         self.dropout1 = nn.Dropout(0.5)
@@ -98,37 +98,43 @@ class GammaPredictorHardConstraints(nn.Module):
         raw_output = self.fc3(x_fc)  # Shape [B, 3 * NQ]
 
         # --- Reconstruct A and P with hard constraints ---
-        raw_A_logits = raw_output[:, 0 * self.n_quantiles : 1 * self.n_quantiles]
-        raw_P_logits = raw_output[:, 1 * self.n_quantiles : 2 * self.n_quantiles]
-        raw_CC_pred = raw_output[:, 2 * self.n_quantiles : 3 * self.n_quantiles]
+        raw_A_logits = raw_output[
+            :, 0 * self.n_quantiles : 1 * self.n_quantiles
+        ]  # [B, NQ]
+        raw_P_logits = raw_output[
+            :, 1 * self.n_quantiles : 2 * self.n_quantiles
+        ]  # [B, NQ]
+        raw_CC_pred = raw_output[
+            :, 2 * self.n_quantiles : 3 * self.n_quantiles
+        ]  # [B, NQ]
 
-        with torch.no_grad():  # A_total calc doesn't need grad w.r.t input
+        # --- Calculate A_total Directly from Input ---
+        with torch.no_grad():
             threshold = self.quantile_levels_tensor[0]
             mask = torch.nan_to_num(x, nan=-1.0) >= threshold
-            A_total = mask.sum(dim=(2, 3)).float() * self.pixel_area_km2 + 1e-6
-            A_total = A_total.unsqueeze(1)  # [B, 1]
+            A_total = (
+                mask.sum(dim=(2, 3)).float() * self.pixel_area_km2 + 1e-6
+            )  # Shape [B, 1]
 
-        probs_A = torch.softmax(raw_A_logits, dim=1)
+        # --- Constrain Area (Monotonicity) ---
+        probs_A = torch.softmax(raw_A_logits, dim=1)  # [B, NQ]
+        # Broadcasting [B, NQ] * [B, 1] -> [B, NQ]
         scaled_probs_A = probs_A * A_total
         pred_A = torch.flip(
             torch.cumsum(torch.flip(scaled_probs_A, dims=[1]), dim=1), dims=[1]
         )  # [B, NQ]
 
+        # --- Constrain Perimeter (Plausibility) ---
         epsilon = 1e-6
         P_min = torch.sqrt(4 * math.pi * (pred_A + epsilon))
-        P_excess = F.relu(raw_P_logits)  # Or F.softplus
+        P_excess = F.relu(raw_P_logits)  # Or F.softplus(raw_P_logits)
         pred_P = P_min + P_excess  # [B, NQ]
 
+        # --- Constrain CC (Non-negativity) ---
         pred_CC = F.relu(raw_CC_pred)  # [B, NQ]
 
-        constrained_output = torch.stack([pred_A, pred_P, pred_CC], dim=1)  # [B, 3, NQ]
-
-        # --- Apply Hard Zero Constraint based on Input ---
-        with torch.no_grad():
-            is_dry_mask = x.sum(dim=(1, 2, 3)) <= 1e-6  # Shape [B]
-            wet_factor = (~is_dry_mask).float().view(-1, 1, 1)  # Shape [B, 1, 1]
-
-        final_output = constrained_output * wet_factor
+        # --- Stack Components Back Together ---
+        final_output = torch.stack([pred_A, pred_P, pred_CC], dim=1)  # Shape [B, 3, NQ]
 
         return final_output
 

@@ -12,8 +12,8 @@ warnings.filterwarnings("ignore", message="No contour found", category=UserWarni
 
 # --- Configuration Loading ---
 config_path = (
-    # "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/config.yaml"
-    "/home/fquareng/work/ExtremePrecipSR/config.yaml"
+    "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/config.yaml"
+    # "/home/fquareng/work/ExtremePrecipSR/config.yaml"
 )
 with open(config_path, "r") as file:
     config = yaml.safe_load(file)
@@ -29,10 +29,9 @@ def compute_A_P_CC_single_threshold_numpy(
     prec_2d_np,
     threshold,
     pixel_size_km=1.0,
-    persistence_threshold=PERSISTENCE_THRESHOLD,
 ):
     """Computes Area, Perimeter using skimage, and Connected Components using TDA."""
-    prec_2d_np_clean = np.nan_to_num(prec_2d_np, nan=-1.0)  # Use -1 for dry? or 0?
+    prec_2d_np_clean = np.nan_to_num(prec_2d_np, nan=-1.0)
     mask = prec_2d_np_clean >= threshold
 
     # --- Area ---
@@ -128,7 +127,7 @@ def process_and_save_gamma_targets(data_split):
     # without loading the whole thing into RAM.
 
     print(f"Reloading from memmap and compressing to {output_path}...")
-    final_data_mmap = np.load(temp_output_path, mmap_mode="r")
+    final_data_mmap = np.load(temp_output_path, mmap_mode="r", allow_pickle=True)
 
     np.savez_compressed(output_path, data=final_data_mmap)
 
