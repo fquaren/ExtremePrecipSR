@@ -1,6 +1,8 @@
 # Paths
 PREPROCESSED_DATA_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/precip"
 # PREPROCESSED_DATA_DIR: "/home/fquareng/work/data/"
+DEM_DATA_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/dem"
+DEM_STATS: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/dem/dem_stats.json"
 
 TRAIN_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/train_patches_metadata.txt"
 # TRAIN_METADATA_FILE: "/home/fquareng/work/data/train_patches_metadata.txt"
@@ -13,9 +15,7 @@ TEST_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/ext
 PRECIP_VAR_NAME: "TOT_PREC"
 PATCH_SIZE: 128
 DOWNSCALING_FACTOR: 6
-DECLUTTER_THRESHOLD: 150.0
 PIXEL_SIZE_KM: 2.0 # Size of one high-res pixel in km
-PIXEL_AREA_KM2: 4.0 # Area of one high-res pixel in km^2
 PERSISTENCE_THRESHOLD: 0.01 # Persistence threshold for topological simplification
 
 ANALYSIS_DATA_PERCENTAGE: 100 # Use 100% of the data. Change to 50 for 50%, etc.
@@ -27,16 +27,18 @@ SPLIT_RATIOS:
   test: 0.1
 
 # DataLoaders
-BATCH_SIZE: 32
 NUM_WORKERS: 16
-
-# UNet
-DROPOUT_PROB: 0.3
+BATCH_SIZE: 32
+BATCH_COMPOSITION:
+  "dry": 0.33
+  "normal": 0.33
+  "extreme": 0.33
 
 # Training
-EXPERIMENT_NAME: "GammaEmulatorv1"
+EXPERIMENT_NAME: "GammaEmulatorv2"
+HARD_CONSTRAINED: false
 LOSS_LAMBDA: 0.25 # between 0 and 1 (Loss = lambda*zero_penalty + (1-lambda)*main_loss)
-LAMBDA_BOUND: 0.0
+LAMBDA_BOUND: 0.25 # between 0 and 1 (Loss = (1-lambda)*main_loss + lambda*bound_penalty)
 SUBSAMPLE_FRACTION: 1
 device: "cuda"
 NUM_EPOCHS: 100
@@ -56,3 +58,8 @@ QUANTILE_LEVELS: [
   0.95,
   0.99,
 ]
+
+USE_SURROGATE_LOSS: false
+SURROGATE_LOSS_WEIGHT: 0.25 # Weight of the surrogate loss when USE_SURROGATE_LOSS is true (between 0 and 1)
+EMULATOR_CHECKPOINT_PATH: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/models/gamma_emulator_v2/best_model.pth"
+EMULATOR_IS_HARD_CONSTRAINED: true

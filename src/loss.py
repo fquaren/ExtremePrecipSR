@@ -1,91 +1,94 @@
-import numpy as np
-from skimage import measure, morphology
-from scipy.ndimage import label
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
 
 
-# --- Helper Function for Single Threshold Gamma Calculation (unchanged) ---
-def compute_A_P_CC_single_threshold_numpy(prec_2d_np, threshold, pixel_size_km=1.0):
-    prec_2d_np_clean = np.nan_to_num(prec_2d_np, nan=-1.0)
-    mask = prec_2d_np_clean >= threshold
-    area_km2 = mask.sum() * (pixel_size_km**2)
-    contours = measure.find_contours(mask.astype(float), 0.5)
-    perimeter_pixels = 0
-    for contour in contours:
-        perimeter_pixels += np.linalg.norm(np.diff(contour, axis=0), axis=1).sum()
-    perimeter_km = perimeter_pixels * pixel_size_km
-    structure = morphology.disk(1)  # 4-connectivity
-    _, num_features = label(mask, structure=structure)
-    return np.array([area_km2, perimeter_km, num_features], dtype=np.float32)
+# Utility functions for penalties
+def calculate_monotonicity_penalty(pred_A):
+    """
+    Penalizes non-monotonic (increasing) values in the Area prediction.
+    pred_A [B, NQ] should be monotonically decreasing.
+    """
+    diffs = pred_A[:, :-1] - pred_A[:, 1:]
+    penalty = torch.mean(F.relu(-diffs), dim=1)  # Per-sample penalty
+    return penalty
 
 
-# --- Function to Compute Gamma Matrix for an Image (unchanged) ---
-def compute_gamma_matrix_for_image(prec_2d_data, thresholds, pixel_size_km=1.0):
-    N_thresholds = len(thresholds)
-    gamma_matrix = np.zeros((3, N_thresholds), dtype=np.float32)
-    for i, threshold_value in enumerate(thresholds):
-        gamma_matrix[:, i] = compute_A_P_CC_single_threshold_numpy(
-            prec_2d_data, threshold_value, pixel_size_km
+def calculate_p_min_penalty(pred_A, pred_P):
+    """
+    Penalizes predictions where P < P_min.
+    P_min = sqrt(4 * pi * A)
+    """
+    epsilon = 1e-6
+    # We detach pred_A: backprop penalty only through P head.
+    P_min = torch.sqrt(4 * math.pi * (pred_A.detach() + epsilon))
+    penalty = torch.mean(F.relu(P_min - pred_P), dim=1)  # Per-sample penalty
+    return penalty
+
+
+def calculate_zero_penalty(input_data, predicted_gamma_phys):
+    """
+    Penalizes non-zero predictions for dry (all-zero) input patches.
+    """
+    with torch.no_grad():
+        is_dry_mask = input_data.sum(dim=(1, 2, 3)) <= 1e-6  # Shape [B]
+
+    # Calculate penalty for all samples (will be 0 for wet ones)
+    # Sum over components [3] and quantiles [NQ]
+    total_prediction_sum = predicted_gamma_phys.sum(dim=(1, 2))
+
+    # Only apply penalty where is_dry_mask is True
+    penalty = total_prediction_sum * is_dry_mask.float()
+    return penalty
+
+
+# --- Loss Function ---
+class ComponentWiseCDFLoss(nn.Module):
+    def __init__(self, quantile_levels, reduction="mean"):
+        super(ComponentWiseCDFLoss, self).__init__()
+        self.register_buffer(
+            "quantiles", torch.tensor(quantile_levels, dtype=torch.float32)
         )
-    return gamma_matrix
+        self.reduction = reduction
+
+    def forward(self, gamma_pred_3d, gamma_target_3d):  # Expects LOG SPACE values
+        abs_diff_log = torch.abs(gamma_pred_3d - gamma_target_3d)
+        integrand = abs_diff_log * self.quantiles
+        integral_per_component = torch.trapezoid(integrand, self.quantiles, dim=2)
+        if self.reduction is None:
+            return (
+                integral_per_component[:, 0],
+                integral_per_component[:, 1],
+                integral_per_component[:, 2],
+            )
+        else:
+            return (
+                torch.mean(integral_per_component[:, 0]),
+                torch.mean(integral_per_component[:, 1]),
+                torch.mean(integral_per_component[:, 2]),
+            )
 
 
-# --- Function to Estimate S_inv (unchanged, but note it needs the loaded quantiles) ---
-def estimate_S_inv_from_dataset(
-    dataset_of_target_precip_fields,
-    global_quantiles_as_thresholds,
-    pixel_size_km,
-    regularization_epsilon=1e-6,
-):
-    all_gamma_vectors_flat = []
-    for i, prec_field in enumerate(dataset_of_target_precip_fields):
-        gamma_matrix = compute_gamma_matrix_for_image(
-            prec_field, global_quantiles_as_thresholds, pixel_size_km
+# --- New Loss Metric for Evaluation ---
+class SimpleCDFLossMetric(nn.Module):
+    """
+    Calculates the per-sample loss, matching the simple loss
+    (loss_A + loss_P + loss_CC) from train.py.
+    """
+
+    def __init__(self, quantile_levels):
+        super(SimpleCDFLossMetric, self).__init__()
+        # Use the base loss, but ensure it does *not* reduce (mean)
+        self.criterion = ComponentWiseCDFLoss(
+            quantile_levels=quantile_levels, reduction=None
         )
-        all_gamma_vectors_flat.append(gamma_matrix.flatten())
 
-    if not all_gamma_vectors_flat:
-        raise ValueError(
-            "Dataset of target precipitation fields is empty. Cannot estimate S_inv."
-        )
+    def forward(self, log_gamma_pred_3d, log_gamma_target_3d):
+        # criterion returns [B, 3] tensor of losses (A, P, CC)
+        loss_A, loss_P, loss_CC = self.criterion(log_gamma_pred_3d, log_gamma_target_3d)
 
-    all_gamma_vectors_np = np.array(all_gamma_vectors_flat)
-
-    S = np.cov(all_gamma_vectors_np, rowvar=False)
-    S += np.eye(S.shape[0]) * regularization_epsilon
-    S_inv = np.linalg.inv(S)
-    return S_inv
-
-
-# --- Function to Compute Mahalanobis Distance (unchanged) ---
-def mahalanobis_distance(vec1, vec2, S_inv):
-    diff = vec1 - vec2
-    return np.sqrt(diff.T @ S_inv @ diff)
-
-
-# --- Main Geometric Accuracy Metric Function (unchanged) ---
-def geometric_accuracy_mahalanobis(
-    prec_2d_target,
-    prec_2d_pred,
-    global_quantiles_as_thresholds,
-    S_inv,
-    pixel_size_km=1.0,
-):
-    thresholds = global_quantiles_as_thresholds
-    gamma_target_matrix = compute_gamma_matrix_for_image(
-        prec_2d_target, thresholds, pixel_size_km
-    )
-    gamma_pred_matrix = compute_gamma_matrix_for_image(
-        prec_2d_pred, thresholds, pixel_size_km
-    )
-    gamma_target_flat = gamma_target_matrix.flatten()
-    gamma_pred_flat = gamma_pred_matrix.flatten()
-
-    expected_dim = len(thresholds) * 3
-    if gamma_target_flat.shape[0] != expected_dim or S_inv.shape[0] != expected_dim:
-        raise ValueError(
-            f"Dimension mismatch: Flattened gamma vector has shape {gamma_target_flat.shape[0]}, "
-            f"but expected {expected_dim} based on thresholds. S_inv has shape {S_inv.shape[0]}. "
-            f"Ensure global_quantiles_as_thresholds used for S_inv calculation matches this function call."
-        )
-    dist = mahalanobis_distance(gamma_target_flat, gamma_pred_flat, S_inv)
-    return dist
+        # Return the sum of component losses for each sample
+        # [B]
+        total_loss_per_sample = loss_A + loss_P + loss_CC
+        return total_loss_per_sample

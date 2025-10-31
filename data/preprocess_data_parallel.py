@@ -10,12 +10,6 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
 # --- Preprocessing Utility Functions ---
-def declutter_precip(arr, threshold):
-    arr_copy = arr.copy()
-    arr_copy[arr_copy > threshold] = 0
-    return arr_copy
-
-
 def coarsen_array(arr, factor):
     m, n = arr.shape
     m_new, n_new = m // factor, n // factor
@@ -76,8 +70,7 @@ def process_and_write_patch(args):
         original_precip[np.isnan(original_precip)] = 0.0
 
         # Perform transformations
-        decluttered = declutter_precip(original_precip, config["DECLUTTER_THRESHOLD"])
-        low_res = coarsen_array(decluttered, config["DOWNSCALING_FACTOR"])
+        low_res = coarsen_array(original_precip, config["DOWNSCALING_FACTOR"])
         interpolated = interpolate_array(
             low_res, config["DOWNSCALING_FACTOR"], target_shape=(patch_size, patch_size)
         )

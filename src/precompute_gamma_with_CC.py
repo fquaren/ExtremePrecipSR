@@ -20,7 +20,7 @@ with open(config_path, "r") as file:
 
 QUANTILE_LEVELS = config["QUANTILE_LEVELS"]
 PREPROCESSED_DATA_DIR = config["PREPROCESSED_DATA_DIR"]
-pixel_size_km = config.get("PIXEL_SIZE_KM", 1.0)
+PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 1.0)
 PERSISTENCE_THRESHOLD = config.get("PERSISTENCE_THRESHOLD", 0.05)
 
 
@@ -103,13 +103,12 @@ def process_and_save_gamma_targets(data_split):
     gamma_targets_array_mmap = np.memmap(
         temp_output_path, dtype=output_dtype, mode="w+", shape=output_shape
     )
-    # --------------------------------
 
     print("Computing Gamma matrices for all samples (writing to memmap)...")
     for i in tqdm(range(num_samples), desc=f"Calculating Gamma for {data_split}"):
         prec_field = precip_data[i]
         gamma_matrix = compute_gamma_matrix_for_image(
-            prec_field, QUANTILE_LEVELS, pixel_size_km=1.0
+            prec_field, QUANTILE_LEVELS, PIXEL_SIZE_KM
         )
 
         # 3. Write the result for this slice directly to the file

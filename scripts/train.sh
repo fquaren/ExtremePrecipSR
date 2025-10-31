@@ -4,7 +4,7 @@
 #SBATCH --mail-user filippo.quarenghi@unil.ch
 
 #SBATCH --chdir /scratch/fquareng/
-#SBATCH --job-name train_geom
+#SBATCH --job-name train
 #SBATCH --output outputs/%j
 #SBATCH --error job_errors/%j
 
@@ -14,16 +14,15 @@
 #SBATCH --nodes 1
 #SBATCH --ntasks 1
 #SBATCH --cpus-per-task 16
-#SBATCH --mem 350G
-#SBATCH --time 72:00:00
+#SBATCH --mem 250G
+#SBATCH --time 2:00:00
 
-export SINGULARITY_BINDPATH="/work,/scratch,/users"
+sleep 80000
 
-container_path="/users/fquareng/singularity/dl_gh200.sif"
-singularity exec "$container_path" python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/precompute_gamma.py  # _with_CC.py
-singularity exec --nv "$container_path" python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_gamma.py
+# export SINGULARITY_BINDPATH="/work,/scratch,/users"
+# container_path="/users/fquareng/singularity/dl_gh200.sif"
+# singularity exec --nv "$container_path" python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_gamma.py
 
 # source /users/fquareng/.bashrc
-# micromamba activate dl
-# micromamba run -n dl python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/precompute_gamma.py
-# micromamba run -n dl python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_gamma.py
+# micromamba activate dl-torch
+# micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_gamma.py

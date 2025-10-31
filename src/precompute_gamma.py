@@ -12,14 +12,23 @@ from functools import partial
 # Suppress specific warning from scikit-image
 warnings.filterwarnings("ignore", message="No contour found", category=UserWarning)
 
+# Prevent numpy/MKL/OpenBLAS from using internal threads,
+# which conflicts with multiprocessing.
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
 # --- Configuration Loading ---
-config_path = "/home/fquareng/work/ExtremePrecipSR/config.yaml"
+config_path = (
+    "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/config.yaml"
+)
+# /home/fquareng/work/ExtremePrecipSR/config.yaml"
 with open(config_path, "r") as file:
     config = yaml.safe_load(file)
 
 QUANTILE_LEVELS = config["QUANTILE_LEVELS"]
 PREPROCESSED_DATA_DIR = config["PREPROCESSED_DATA_DIR"]
-pixel_size_km = config.get("PIXEL_SIZE_KM", 1.0)  # Corrected config key
+PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 1.0)
 PERSISTENCE_THRESHOLD = config.get("PERSISTENCE_THRESHOLD", 0.05)
 NUM_WORKERS = config.get("NUM_WORKERS", os.cpu_count())
 
@@ -143,7 +152,7 @@ def process_and_save_gamma_targets(data_split):
     print(f"--- Processing data split: {data_split} ---")
     input_dir = os.path.join(PREPROCESSED_DATA_DIR, data_split)
     precip_path = os.path.join(input_dir, "original_precip.npz")
-    output_path = os.path.join(input_dir, "gamma_targets.npz")
+    output_path = os.path.join(input_dir, "gamma_targets_persistence.npz")
     temp_fd, temp_output_path = tempfile.mkstemp(suffix=".npy", dir=input_dir)
     os.close(temp_fd)
     print(f"Using temporary memmap file at: {temp_output_path}")
@@ -182,7 +191,7 @@ def process_and_save_gamma_targets(data_split):
         output_shape=output_shape,
         output_dtype=output_dtype,
         thresholds=QUANTILE_LEVELS,
-        pixel_size_km=pixel_size_km,
+        pixel_size_km=PIXEL_SIZE_KM,
         persistence_threshold=PERSISTENCE_THRESHOLD,
     )
 
@@ -209,6 +218,10 @@ def process_and_save_gamma_targets(data_split):
 
 
 if __name__ == "__main__":
+    # Set the start method to 'spawn' BEFORE any other
+    # multiprocessing code is called. 'force=True' is good practice.
+    multiprocessing.set_start_method("spawn", force=True)
+
     data_splits = ["train", "validation", "test"]
     for split in data_splits:
         process_and_save_gamma_targets(split)
