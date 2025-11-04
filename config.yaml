@@ -27,7 +27,7 @@ SPLIT_RATIOS:
   test: 0.1
 
 # DataLoaders
-NUM_WORKERS: 16
+NUM_WORKERS: 4
 BATCH_SIZE: 32
 BATCH_COMPOSITION:
   "dry": 0.33
@@ -36,9 +36,12 @@ BATCH_COMPOSITION:
 
 # Training
 EXPERIMENT_NAME: "GammaEmulatorv2"
-HARD_CONSTRAINED: false
+CONSTRAINT_MODE: "hybrid"  # 'soft', 'hard', or 'hybrid'
 LOSS_LAMBDA: 0.25 # between 0 and 1 (Loss = lambda*zero_penalty + (1-lambda)*main_loss)
-LAMBDA_BOUND: 0.25 # between 0 and 1 (Loss = (1-lambda)*main_loss + lambda*bound_penalty)
+WEIGHT_A: 1.0
+WEIGHT_P: 1.0
+WEIGHT_CC: 2.0 # This is the key parameter to tune
+LAMBDA_BOUND: 0.25 # Keep this soft constraint
 SUBSAMPLE_FRACTION: 1
 device: "cuda"
 NUM_EPOCHS: 100
@@ -59,7 +62,9 @@ QUANTILE_LEVELS: [
   0.99,
 ]
 
-USE_SURROGATE_LOSS: false
+# Evaluation emulator
+EMULATOR_CHECKPOINT_PATH: "/scratch/fquareng/experiment_runs/GammaEmulatorv2_2025-11-03_09-22-21/best_model_checkpoint.pth"
+
+# Training super resolution
+USE_SURROGATE_LOSS: true
 SURROGATE_LOSS_WEIGHT: 0.25 # Weight of the surrogate loss when USE_SURROGATE_LOSS is true (between 0 and 1)
-EMULATOR_CHECKPOINT_PATH: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/models/gamma_emulator_v2/best_model.pth"
-EMULATOR_IS_HARD_CONSTRAINED: true

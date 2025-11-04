@@ -59,9 +59,11 @@ class SRDataset(Dataset):
             self.metadata = [line.strip().split(",") for line in f]
 
         # Load data via memory-mapping
-        precip_path = os.path.join(preprocessed_data_dir, "original_precip.npz")
-        interp_path = os.path.join(preprocessed_data_dir, "interpolated_precip.npz")
-        gamma_path = os.path.join(preprocessed_data_dir, "gamma_targets.npz")
+        precip_path = os.path.join(preprocessed_data_dir, split, "original_precip.npz")
+        interp_path = os.path.join(
+            preprocessed_data_dir, split, "interpolated_precip.npz"
+        )
+        gamma_path = os.path.join(preprocessed_data_dir, split, "gamma_targets.npz")
 
         self.original_patches = np.load(precip_path, mmap_mode="r")["data"]
         self.interpolated_patches = np.load(interp_path, mmap_mode="r")["data"]
@@ -167,14 +169,11 @@ class SRDataset(Dataset):
 
         # 6. Prepare outputs
         target_gamma_tensor = torch.from_numpy(target_gamma).float()
-        log_target_gamma_tensor = torch.log1p(
-            target_gamma_tensor
-        )  # Apply log transform
 
         return (
             input_stack,  # [2, H, W]
             target_tensor,  # [1, H, W]
-            log_target_gamma_tensor,  # [3, NQ]
+            target_gamma_tensor,  # [3, NQ]
         )
 
 

@@ -28,12 +28,11 @@ class DoubleConv(nn.Module):
 
 class UNetSR(nn.Module):
     """
-    A standard UNet architecture designed for a super-resolution task.
+    A standard UNet architecture modified for a residual super-resolution task.
     It accepts a multi-channel input (e.g., precip + DEM)
-    and predicts a single-channel output.
+    and predicts a single-channel residual, which is added to the input precip.
 
-    This architecture assumes the input patch size is a power of 2 (e.g., 128),
-    which allows for perfect skip connections without cropping or padding.
+    This architecture assumes the input patch size is a power of 2 (e.g., 128).
     """
 
     def __init__(self, in_channels, out_channels, n_features_base=64):
@@ -86,14 +85,21 @@ class UNetSR(nn.Module):
             n_features_base + n_features_base, n_features_base
         )  # 128x128
 
-        # Final 1x1 convolution
+        # Final 1x1 convolution to produce the residual
         self.outc = nn.Conv2d(n_features_base, out_channels, kernel_size=1)
 
-        # Final activation to enforce non-negativity
+        # Final activation to enforce non-negativity *after* adding the residual
         self.final_activation = nn.ReLU()
 
     def forward(self, x):
         # x shape: (B, C_in, 128, 128)
+
+        # Extract the baseline (upscaled low-res precip)
+        # We assume this is the first channel.
+        # We must detach it if it's not part of the loss's target
+        # or if we only want to backprop through the residual.
+        # For a simple residual model, just select it.
+        baseline = x[:, 0:1, :, :]  # Shape: (B, 1, 128, 128)
 
         # --- Encoder ---
         x1 = self.inc(x)  # (B, 64, 128, 128)
@@ -104,29 +110,28 @@ class UNetSR(nn.Module):
 
         # --- Decoder ---
         x = self.up1(x5)  # (B, 512, 16, 16)
-        # Skip Connection 1
         x = torch.cat([x4, x], dim=1)  # (B, 1024, 16, 16)
         x = self.conv1(x)  # (B, 512, 16, 16)
 
         x = self.up2(x)  # (B, 256, 32, 32)
-        # Skip Connection 2
         x = torch.cat([x3, x], dim=1)  # (B, 512, 32, 32)
         x = self.conv2(x)  # (B, 256, 32, 32)
 
         x = self.up3(x)  # (B, 128, 64, 64)
-        # Skip Connection 3
         x = torch.cat([x2, x], dim=1)  # (B, 256, 64, 64)
         x = self.conv3(x)  # (B, 128, 64, 64)
 
         x = self.up4(x)  # (B, 64, 128, 128)
-        # Skip Connection 4
         x = torch.cat([x1, x], dim=1)  # (B, 128, 128, 128)
         x = self.conv4(x)  # (B, 64, 128, 128)
 
-        # Final output convolution
-        logits = self.outc(x)  # (B, C_out, 128, 128)
+        # This is now the predicted residual (can be positive or negative)
+        residual = self.outc(x)  # (B, C_out, 128, 128)
 
-        # Enforce non-negativity
-        output = self.final_activation(logits)
+        # Add the predicted residual to the baseline
+        output = baseline + residual
+
+        # Enforce non-negativity *after* the addition
+        output = self.final_activation(output)
 
         return output

@@ -27,8 +27,8 @@ with open(config_path, "r") as file:
 PREPROCESSED_DATA_DIR = config["PREPROCESSED_DATA_DIR"]
 DEM_DATA_DIR = config["DEM_DATA_DIR"]
 DEM_STATS = config["DEM_STATS"]
-METADATA_TRAIN_METADATA_FILE = config["METADATA_TRAIN_METADATA_FILE"]
-METADATA_VAL_METADATA_FILE = config["METADATA_VAL_METADATA_FILE"]
+METADATA_TRAIN_METADATA_FILE = config["TRAIN_METADATA_FILE"]
+METADATA_VAL_METADATA_FILE = config["VAL_METADATA_FILE"]
 
 GAMMA_TARGETS_DIR = config["PREPROCESSED_DATA_DIR"]
 BATCH_SIZE = config.get("SR_BATCH_SIZE", 16)
@@ -42,7 +42,7 @@ EXPERIMENT_NAME = config.get("EXPERIMENT_NAME", "SR_UNet_Baseline")
 USE_SURROGATE_LOSS = config.get("USE_SURROGATE_LOSS", False)
 SURROGATE_LOSS_WEIGHT = config.get("SURROGATE_LOSS_WEIGHT", 0.1)
 EMULATOR_CHECKPOINT_PATH = config.get("EMULATOR_CHECKPOINT_PATH", None)
-EMULATOR_IS_HARD_CONSTRAINED = config.get("HARD_CONSTRAINED", True)
+CONSTRAINT_MODE = config.get("CONSTRAINT_MODE", "hard")
 
 # --- Emulator Model Config (Needed to load the checkpoint) ---
 QUANTILE_LEVELS = config["QUANTILE_LEVELS"]
@@ -52,25 +52,24 @@ PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 1.0)
 
 
 # --- Helper to load the emulator ---
-def load_emulator(checkpoint_path, is_hard_constrained, device):
+def load_emulator(checkpoint_path, constrained_mode, device):
     print(f"Loading Gamma Emulator from: {checkpoint_path}")
 
     INPUT_SHAPE = (1, PATCH_SIZE, PATCH_SIZE)
-
-    if is_hard_constrained:
+    if CONSTRAINT_MODE == "soft":
+        print("Using SOFT constraints model (GammaPredictorSeparateHeadsSoft).")
+        model = GammaPredictorSeparateHeadsSoft(
+            input_shape=INPUT_SHAPE, n_quantiles=N_QUANTILES, activation_fn=nn.Mish()
+        ).to(device)
+    elif CONSTRAINT_MODE == "hybrid" or CONSTRAINT_MODE == "hard":
+        print("Using HYBRID constraints model (GammaPredictorSeparateHeadsHybrid).")
         model = GammaPredictorSeparateHeadsHard(
             input_shape=INPUT_SHAPE,
             n_quantiles=N_QUANTILES,
-            activation_fn=F.mish,
+            activation_fn=nn.Mish(),
             quantile_levels=QUANTILE_LEVELS,
             pixel_area_km2=PIXEL_SIZE_KM**2,
-        )
-    else:
-        model = GammaPredictorSeparateHeadsSoft(
-            input_shape=INPUT_SHAPE,
-            n_quantiles=N_QUANTILES,
-            activation_fn=F.mish,
-        )
+        ).to(device)
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -98,7 +97,11 @@ def main():
     with open(os.path.join(output_dir, "config.yaml"), "w") as f:
         yaml.dump(config, f)
 
-    dem_stats = json.load(open(DEM_STATS, "r"))
+    with open(DEM_STATS, "r") as f:
+        stats_dict = json.load(f)
+
+    dem_stats = (float(stats_dict["dem_mean"]), float(stats_dict["dem_std"]))
+    print(f"Loaded DEM stats: mean={dem_stats[0]}, std={dem_stats[1]}")
 
     # --- 1. Prepare Datasets ---
     train_dataset = SRDataset(
@@ -133,9 +136,8 @@ def main():
 
     # --- 2. Initialize Models and Losses ---
 
-    # --- SR UNet (The model we are training) ---
-    # We use the UNet from your model.py.
-    sr_model = UNetSR(in_channels=1, out_channels=1).to(device)
+    # --- SR UNet ---
+    sr_model = UNetSR(in_channels=2, out_channels=1).to(device)
 
     optimizer = torch.optim.Adam(
         sr_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
@@ -147,6 +149,9 @@ def main():
     # --- Primary Loss: MSE ---
     mse_criterion = nn.MSELoss()
 
+    # Mixed precision scaler
+    scaler = torch.amp.GradScaler()
+
     # --- Surrogate Loss (Optional) ---
     emulator_model = None
     surrogate_criterion = None
@@ -157,7 +162,7 @@ def main():
             )
 
         emulator_model = load_emulator(
-            EMULATOR_CHECKPOINT_PATH, EMULATOR_IS_HARD_CONSTRAINED, device
+            EMULATOR_CHECKPOINT_PATH, CONSTRAINT_MODE, device
         )
         # We use the CDF loss in log-space, just like the emulator was trained
         surrogate_criterion = ComponentWiseCDFLoss(quantile_levels=QUANTILE_LEVELS).to(
@@ -182,12 +187,11 @@ def main():
         running_loss, running_mse, running_surr = 0.0, 0.0, 0.0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} (Train)")
-        for X, Y_residual, Y_original, Y_gamma in pbar:
+        for X, Y, Y_gamma in pbar:
 
-            X, Y_residual, Y_original, Y_gamma = (
+            X, Y, Y_gamma = (
                 X.to(device),
-                Y_residual.to(device),
-                Y_original.to(device),
+                Y.to(device),
                 Y_gamma.to(device),
             )
 
@@ -195,10 +199,10 @@ def main():
 
             with torch.amp.autocast(device_type="cuda"):
                 # Predict the residual
-                pred_residual = sr_model(X)
+                pred_X = sr_model(X)
 
                 # --- 1. Calculate Primary MSE Loss ---
-                loss_mse = mse_criterion(pred_residual, Y_residual)
+                loss_mse = mse_criterion(pred_X, Y)
 
                 total_loss = loss_mse
                 loss_surrogate = torch.tensor(0.0, device=device)
@@ -206,11 +210,11 @@ def main():
                 # --- 2. Calculate Surrogate Loss (if enabled) ---
                 if USE_SURROGATE_LOSS:
                     # Reconstruct the full precipitation image
-                    pred_image = X + pred_residual
+                    pred_X
 
                     # Pass both pred and target images through the emulator
                     # The emulator expects physical, non-negative images
-                    pred_gamma_phys = emulator_model(F.relu(pred_image))
+                    pred_gamma_phys = emulator_model(F.relu(pred_X))
 
                     # We compare in log-space, just like the emulator was trained
                     pred_gamma_log = torch.log1p(pred_gamma_phys)
@@ -228,8 +232,10 @@ def main():
                     ) * loss_mse + SURROGATE_LOSS_WEIGHT * loss_surrogate
 
             # Backward pass
-            total_loss.backward()
-            optimizer.step()
+            scaler.scale(total_loss).backward()
+            scaler.unscale_(optimizer)
+            scaler.step(optimizer)
+            scaler.update()
 
             # --- Accumulate losses for logging ---
             running_loss += total_loss.item()
@@ -259,29 +265,27 @@ def main():
         val_running_loss, val_running_mse, val_running_surr = 0.0, 0.0, 0.0
 
         with torch.no_grad():
-            for X, Y_residual, Y_original, Y_gamma in tqdm(
+            for X, Y, Y_gamma in tqdm(
                 val_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} (Val)"
             ):
-                X, Y_residual, Y_original, Y_gamma = (
+                X, Y, Y_gamma = (
                     X.to(device),
-                    Y_residual.to(device),
-                    Y_original.to(device),
+                    Y.to(device),
                     Y_gamma.to(device),
                 )
 
                 with torch.amp.autocast(device_type="cuda"):
-                    pred_residual = sr_model(X)
+                    pred_X = sr_model(X)
 
                     # --- 1. Calculate Primary MSE Loss ---
-                    loss_mse = mse_criterion(pred_residual, Y_residual)
+                    loss_mse = mse_criterion(pred_X, Y)
 
                     total_loss = loss_mse
                     loss_surrogate = torch.tensor(0.0, device=device)
 
                     # --- 2. Calculate Surrogate Loss (if enabled) ---
                     if USE_SURROGATE_LOSS:
-                        pred_image = X + pred_residual
-                        pred_gamma_phys = emulator_model(F.relu(pred_image))
+                        pred_gamma_phys = emulator_model(F.relu(pred_X))
 
                         pred_gamma_log = torch.log1p(pred_gamma_phys)
                         true_gamma_log = torch.log1p(Y_gamma)

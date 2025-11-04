@@ -14,12 +14,7 @@ from gamma_predictors import (
     GammaPredictorSeparateHeadsHard,
     GammaPredictorSeparateHeadsSoft,
 )
-from loss import (
-    SimpleCDFLossMetric,
-    calculate_monotonicity_penalty,
-    calculate_p_min_penalty,
-    calculate_zero_penalty,
-)
+from loss import TotalErrorMetric
 from dataset import PreprocessedNpzDataset
 
 
@@ -35,10 +30,11 @@ def _plot_single_gamma_comparison(
     sub_folder,
     output_dir,
 ):
+    # ... (Plotting function remains the same, but title is updated)
     pred_gamma = all_preds_phys[sample_idx]
     target_gamma = all_targets_phys[sample_idx]
     target_image = all_images[sample_idx]
-    loss = all_losses[sample_idx]
+    loss = all_losses[sample_idx]  # This is now the total loss
     mean_precip = np.mean(target_image)
     gamma_types = ["Area (km²)", "Perimeter (km)", "CCs"]
     fig = plt.figure(figsize=(20, 5))
@@ -76,7 +72,7 @@ def plot_gamma_performance_by_quantile(
     predictions_phys,
     targets_gamma_phys,
     target_images,
-    losses_log,
+    losses_total,
     quantiles,
     output_dir,
     n_samples=10,
@@ -96,7 +92,7 @@ def plot_gamma_performance_by_quantile(
         print(f"\n--- Processing Group: {group_name} ---")
         if len(candidate_indices) == 0:
             continue
-        candidate_losses = losses_log[candidate_indices]
+        candidate_losses = losses_total[candidate_indices]
         sorted_loss_indices_in_group = np.argsort(candidate_losses)
         best_in_group_indices = candidate_indices[
             sorted_loss_indices_in_group[:n_samples]
@@ -111,7 +107,7 @@ def plot_gamma_performance_by_quantile(
                 predictions_phys,
                 targets_gamma_phys,
                 target_images,
-                losses_log,
+                losses_total,
                 quantiles,
                 f"Best Sample #{rank+1}",
                 group_name,
@@ -124,12 +120,13 @@ def plot_gamma_performance_by_quantile(
                 predictions_phys,
                 targets_gamma_phys,
                 target_images,
-                losses_log,
+                losses_total,
                 quantiles,
                 f"Worst Sample #{rank+1}",
                 group_name,
                 output_dir,
             )
+        # R^2 calculation logic (as provided by user)
         r2_scores_in_group = []
         for idx in candidate_indices:
             pred_flat = predictions_phys[idx].flatten()
@@ -145,7 +142,6 @@ def plot_gamma_performance_by_quantile(
         print(f"Mean R² Score for group '{group_name}': {mean_r2:.4f}")
 
 
-# --- Updated plot function to match new log format ---
 def plot_training_log(log_path, output_dir):
     if not os.path.exists(log_path):
         print(
@@ -159,103 +155,157 @@ def plot_training_log(log_path, output_dir):
         print(f"Error reading log file with pandas: {e}. Skipping plot.")
         return
 
-    # Define columns based on the new log file
+    # Check for expected columns
     required_cols = [
         "epoch",
         "train_loss_total",
-        "train_loss_main",
-        "train_penalty_zero",
-        "train_penalty_bound",
         "val_loss_total",
-        "val_loss_main",
+        "train_loss_A",
+        "train_loss_P",
+        "train_loss_CC",
+        "val_loss_A",
+        "val_loss_P",
+        "val_loss_CC",
+        "train_penalty_zero",
+        "train_penalty_mono",
+        "train_penalty_plaus",
+        "train_penalty_bound",
         "val_penalty_zero",
+        "val_penalty_mono",
+        "val_penalty_plaus",
         "val_penalty_bound",
     ]
     if not all(col in df.columns for col in required_cols):
-        print("Warning: Log file columns mismatch. Expected new format. Skipping plot.")
+        print("Warning: Log file columns mismatch. Skipping training history plot.")
         print(f"Missing: {[c for c in required_cols if c not in df.columns]}")
         return
 
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 15), sharex=True)
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 18), sharex=True)
     fig.suptitle("Training History", fontsize=16)
 
     # --- Plot 1: Total & Main Loss ---
-    ax1.plot(
-        df["epoch"],
-        df["train_loss_total"],
-        "o-",
-        label="Train Total Loss",
-        color="C0",
-    )
-    ax1.plot(
-        df["epoch"],
-        df["val_loss_total"],
-        "o-",
-        label="Val Total Loss",
-        color="C1",
-    )
+    ax1.plot(df["epoch"], df["train_loss_total"], "o-", label="Train Total", color="C0")
+    ax1.plot(df["epoch"], df["val_loss_total"], "o-", label="Val Total", color="C1")
     ax1.plot(
         df["epoch"],
         df["train_loss_main"],
         "x--",
-        label="Train Main Loss (CDF)",
+        label="Train Main",
         color="C0",
         alpha=0.6,
     )
     ax1.plot(
-        df["epoch"],
-        df["val_loss_main"],
-        "x--",
-        label="Val Main Loss (CDF)",
-        color="C1",
-        alpha=0.6,
+        df["epoch"], df["val_loss_main"], "x--", label="Val Main", color="C1", alpha=0.6
     )
     ax1.set_ylabel("Loss Value")
-    ax1.set_title("Total Training & Validation Loss")
+    ax1.set_title("Total & Main Loss")
     ax1.legend(ncol=2)
     ax1.grid(True, linestyle="--", alpha=0.6)
     ax1.set_yscale("log")
 
-    # --- Plot 2: Zero Penalty ---
+    # --- Plot 2: Component Losses ---
     ax2.plot(
         df["epoch"],
-        df["train_penalty_zero"],
-        "o-",
-        label="Train Zero Penalty",
-        color="C2",
+        df["train_loss_A"],
+        "s--",
+        label="Train Loss A",
+        color="lightblue",
+        alpha=0.8,
+    )
+    ax2.plot(
+        df["epoch"], df["val_loss_A"], "s-", label="Val Loss A", color="blue", alpha=0.8
     )
     ax2.plot(
         df["epoch"],
-        df["val_penalty_zero"],
-        "o-",
-        label="Val Zero Penalty",
-        color="C3",
+        df["train_loss_P"],
+        "x--",
+        label="Train Loss P",
+        color="lightgreen",
+        alpha=0.8,
     )
-    ax2.set_ylabel("Penalty Value")
-    ax2.set_title("Zero (Dry Patch) Penalty")
-    ax2.legend()
+    ax2.plot(
+        df["epoch"],
+        df["val_loss_P"],
+        "x-",
+        label="Val Loss P",
+        color="green",
+        alpha=0.8,
+    )
+    ax2.plot(
+        df["epoch"],
+        df["train_loss_CC"],
+        "d--",
+        label="Train Loss CC",
+        color="wheat",
+        alpha=0.8,
+    )
+    ax2.plot(
+        df["epoch"],
+        df["val_loss_CC"],
+        "d-",
+        label="Val Loss CC",
+        color="orange",
+        alpha=0.8,
+    )
+    ax2.set_ylabel("Component Loss")
+    ax2.set_title("Main Loss Components (in Log-Space)")
+    ax2.legend(ncol=3)
     ax2.grid(True, linestyle="--", alpha=0.6)
     ax2.set_yscale("log")
 
-    # --- Plot 3: Bound Penalties ---
+    # --- Plot 3: Soft Penalties ---
+    ax3.plot(
+        df["epoch"],
+        df["train_penalty_zero"],
+        "p:",
+        label="Train Zero Pen.",
+        color="black",
+        alpha=0.6,
+    )
+    ax3.plot(
+        df["epoch"], df["val_penalty_zero"], "p-", label="Val Zero Pen.", color="black"
+    )
+    ax3.plot(
+        df["epoch"],
+        df["train_penalty_mono"],
+        "s:",
+        label="Train Mono Pen.",
+        color="cyan",
+        alpha=0.6,
+    )
+    ax3.plot(
+        df["epoch"], df["val_penalty_mono"], "s-", label="Val Mono Pen.", color="cyan"
+    )
+    ax3.plot(
+        df["epoch"],
+        df["train_penalty_plaus"],
+        "x:",
+        label="Train Plaus Pen.",
+        color="lime",
+        alpha=0.6,
+    )
+    ax3.plot(
+        df["epoch"], df["val_penalty_plaus"], "x-", label="Val Plaus Pen.", color="lime"
+    )
     ax3.plot(
         df["epoch"],
         df["train_penalty_bound"],
-        "o-",
-        label="Train Bound Penalty (Mono + P_min)",
-        color="C4",
+        "d:",
+        label="Train Bound Pen.",
+        color="magenta",
+        alpha=0.6,
     )
     ax3.plot(
         df["epoch"],
         df["val_penalty_bound"],
-        "o-",
-        label="Val Bound Penalty (Mono + P_min)",
-        color="C5",
+        "d-",
+        label="Val Bound Pen.",
+        color="magenta",
     )
     ax3.set_xlabel("Epoch")
     ax3.set_ylabel("Penalty Value")
-    ax3.set_title("Physical Bound Penalties (Monotonicity + Isoperimetric)")
-    ax3.legend()
+    ax3.set_title("Soft Penalty Terms")
+    ax3.legend(ncol=4)
     ax3.grid(True, linestyle="--", alpha=0.6)
     ax3.set_yscale("log")
 
@@ -287,7 +337,6 @@ if __name__ == "__main__":
     with open(config_path, "r") as file:
         config = yaml.safe_load(file)
 
-    # --- Load all relevant config values ---
     QUANTILE_LEVELS = config["QUANTILE_LEVELS"]
     N_QUANTILES = len(QUANTILE_LEVELS)
     PATCH_SIZE = config["PATCH_SIZE"]
@@ -295,31 +344,28 @@ if __name__ == "__main__":
     TEST_METADATA_FILE = config["TEST_METADATA_FILE"]
     BATCH_SIZE = config.get("BATCH_SIZE", 32)
     PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 1.0)
-    HARD_CONSTRAINED = config.get("HARD_CONSTRAINED", True)
-    LOSS_LAMBDA = config.get("LOSS_LAMBDA", 0.0)  # For soft constraints
-    LAMBDA_BOUND = config.get("LAMBDA_BOUND", 0.0)  # For soft constraints
+    # Get constraint mode to load correct model
+    CONSTRAINT_MODE = config.get("CONSTRAINT_MODE", "hybrid")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     # --- Dynamic Model Instantiation ---
     INPUT_SHAPE = (1, PATCH_SIZE, PATCH_SIZE)
-
-    if HARD_CONSTRAINED:
-        print("Loading GammaPredictor with hard constraints.")
+    # Model selection based on CONSTRAINT_MODE
+    if CONSTRAINT_MODE == "soft":
+        print("Using SOFT constraints model (GammaPredictorSeparateHeadsSoft).")
+        model = GammaPredictorSeparateHeadsSoft(
+            input_shape=INPUT_SHAPE, n_quantiles=N_QUANTILES, activation_fn=nn.Mish()
+        ).to(device)
+    elif CONSTRAINT_MODE == "hybrid" or CONSTRAINT_MODE == "hard":
+        print("Using HYBRID constraints model (GammaPredictorSeparateHeadsHybrid).")
         model = GammaPredictorSeparateHeadsHard(
             input_shape=INPUT_SHAPE,
             n_quantiles=N_QUANTILES,
             activation_fn=nn.Mish(),
             quantile_levels=QUANTILE_LEVELS,
             pixel_area_km2=PIXEL_SIZE_KM**2,
-        ).to(device)
-    else:
-        print("Loading GammaPredictor with soft constraints.")
-        model = GammaPredictorSeparateHeadsSoft(
-            input_shape=INPUT_SHAPE,
-            n_quantiles=N_QUANTILES,
-            activation_fn=nn.Mish(),
         ).to(device)
 
     checkpoint_path = os.path.join(args.run_dir, "best_model_checkpoint.pth")
@@ -334,14 +380,7 @@ if __name__ == "__main__":
     model.eval()
     print("Model loaded successfully.")
 
-    # --- Remove sigma/log_var loading ---
-    # (The new checkpoint doesn't contain them)
-
-    # --- Use the new SimpleCDFLossMetric ---
-    # We use this to calculate the "main_loss" component
-    evaluation_metric = SimpleCDFLossMetric(quantile_levels=QUANTILE_LEVELS).to(device)
-
-    # Dataset now returns log_target and original physical target
+    # --- Load Dataset ---
     test_dataset = PreprocessedNpzDataset(
         preprocessed_data_dir=os.path.join(PREPROCESSED_DATA_DIR, "test"),
         metadata_file=TEST_METADATA_FILE,
@@ -355,7 +394,12 @@ if __name__ == "__main__":
     )
     print(f"Loaded {len(test_dataset)} samples for evaluation.")
 
-    # Store predictions and targets in PHYSICAL space for plotting
+    # --- Initialize Evaluation Metric ---
+    # This metric computes the total loss per sample, mirroring the training logic
+    evaluation_metric = TotalErrorMetric(
+        quantile_levels=QUANTILE_LEVELS, config=config
+    ).to(device)
+
     all_preds_phys, all_targets_phys = [], []
     all_original_images, all_total_losses = [], []
 
@@ -370,38 +414,12 @@ if __name__ == "__main__":
             # Model prediction is in PHYSICAL space
             predicted_gamma_phys = model(input_data)
 
-            # Transform prediction to LOG-SPACE for loss calculation
-            predicted_gamma_log = torch.log1p(predicted_gamma_phys)
-
-            # --- Calculate per-sample losses ---
-            # 1. Main CDF Loss (per-sample)
-            main_loss_per_sample = evaluation_metric(
-                predicted_gamma_log, log_target_gamma
+            # --- Calculate per-sample total loss (matching training logic) ---
+            per_sample_losses = evaluation_metric(
+                input_data, predicted_gamma_phys, log_target_gamma
             )
 
-            total_loss_per_sample = main_loss_per_sample
-
-            # 2. Add soft penalties if in that mode
-            if not HARD_CONSTRAINED:
-                if LAMBDA_BOUND > 0:
-                    pred_A = predicted_gamma_phys[:, 0, :]
-                    pred_P = predicted_gamma_phys[:, 1, :]
-                    mono_penalty = calculate_monotonicity_penalty(pred_A)
-                    p_min_penalty = calculate_p_min_penalty(pred_A, pred_P)
-                    total_loss_per_sample = total_loss_per_sample + LAMBDA_BOUND * (
-                        mono_penalty + p_min_penalty
-                    )
-
-                if LOSS_LAMBDA > 0:
-                    penalty_zero = calculate_zero_penalty(
-                        input_data, predicted_gamma_phys
-                    )
-                    total_loss_per_sample = (
-                        total_loss_per_sample + LOSS_LAMBDA * penalty_zero
-                    )
-
-            # Store values
-            all_total_losses.append(total_loss_per_sample.cpu().numpy())
+            all_total_losses.append(per_sample_losses.cpu().numpy())
             all_preds_phys.append(predicted_gamma_phys.cpu().numpy())
             all_targets_phys.append(target_gamma_phys.cpu().numpy())
             all_original_images.append(original_precip.squeeze(1).cpu().numpy())
@@ -420,14 +438,11 @@ if __name__ == "__main__":
     n_features = 3 * N_QUANTILES
     preds_flat = all_preds_phys.reshape(n_samples, n_features)
     targets_flat = all_targets_phys.reshape(n_samples, n_features)
-
-    # Handle NaNs/Infs in targets just in case
     mask = np.isfinite(targets_flat).all(axis=1) & np.isfinite(preds_flat).all(axis=1)
     if not np.all(mask):
         print(
             f"Warning: Filtering {np.sum(~mask)} samples with NaNs/Infs before R^2 calculation."
         )
-
     r2_scores_raw = r2_score(
         targets_flat[mask], preds_flat[mask], multioutput="raw_values"
     )
@@ -449,7 +464,7 @@ if __name__ == "__main__":
         predictions_phys=all_preds_phys,
         targets_gamma_phys=all_targets_phys,
         target_images=all_original_images,
-        losses_log=all_total_losses,
+        losses_total=all_total_losses,
         quantiles=QUANTILE_LEVELS,
         output_dir=args.run_dir,
         n_samples=15,

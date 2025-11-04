@@ -4,43 +4,41 @@ import torch.nn.functional as F
 import math
 
 
-# Utility functions for penalties
-def calculate_monotonicity_penalty(pred_A):
-    """
-    Penalizes non-monotonic (increasing) values in the Area prediction.
-    pred_A [B, NQ] should be monotonically decreasing.
-    """
-    diffs = pred_A[:, :-1] - pred_A[:, 1:]
-    penalty = torch.mean(F.relu(-diffs), dim=1)  # Per-sample penalty
+def calculate_monotonicity_penalty(pred_A_phys):
+    diffs = pred_A_phys[:, :-1] - pred_A_phys[:, 1:]
+    penalty = torch.mean(F.relu(-diffs), dim=1)  # Per-sample
     return penalty
 
 
-def calculate_p_min_penalty(pred_A, pred_P):
-    """
-    Penalizes predictions where P < P_min.
-    P_min = sqrt(4 * pi * A)
-    """
+def calculate_plausibility_penalty(pred_A_phys, pred_P_phys):
     epsilon = 1e-6
-    # We detach pred_A: backprop penalty only through P head.
-    P_min = torch.sqrt(4 * math.pi * (pred_A.detach() + epsilon))
-    penalty = torch.mean(F.relu(P_min - pred_P), dim=1)  # Per-sample penalty
+    P_min = torch.sqrt(4 * math.pi * (pred_A_phys + epsilon))
+    penalty = torch.mean(F.relu(P_min - pred_P_phys), dim=1)  # Per-sample
+    return penalty
+
+
+def calculate_bound_penalty(pred_A_phys, pred_CC_phys, pixel_area_km2):
+    epsilon = 1e-6
+    CC_max = (pred_A_phys / pixel_area_km2) + epsilon
+    penalty = torch.mean(F.relu(pred_CC_phys - CC_max), dim=1)  # Per-sample
     return penalty
 
 
 def calculate_zero_penalty(input_data, predicted_gamma_phys):
-    """
-    Penalizes non-zero predictions for dry (all-zero) input patches.
-    """
     with torch.no_grad():
         is_dry_mask = input_data.sum(dim=(1, 2, 3)) <= 1e-6  # Shape [B]
+    if not is_dry_mask.any():
+        return torch.tensor(0.0, device=input_data.device)
+    # Return per-sample penalty
+    dry_predictions = predicted_gamma_phys[is_dry_mask]
+    penalty = torch.mean(
+        torch.abs(dry_predictions), dim=(1, 2)
+    )  # Mean over components and quantiles
 
-    # Calculate penalty for all samples (will be 0 for wet ones)
-    # Sum over components [3] and quantiles [NQ]
-    total_prediction_sum = predicted_gamma_phys.sum(dim=(1, 2))
-
-    # Only apply penalty where is_dry_mask is True
-    penalty = total_prediction_sum * is_dry_mask.float()
-    return penalty
+    # Create a full-batch tensor, zero for wet samples
+    full_penalty = torch.zeros(input_data.shape[0], device=input_data.device)
+    full_penalty[is_dry_mask] = penalty
+    return full_penalty
 
 
 # --- Loss Function ---
@@ -71,24 +69,60 @@ class ComponentWiseCDFLoss(nn.Module):
 
 
 # --- New Loss Metric for Evaluation ---
-class SimpleCDFLossMetric(nn.Module):
-    """
-    Calculates the per-sample loss, matching the simple loss
-    (loss_A + loss_P + loss_CC) from train.py.
-    """
+class TotalErrorMetric(nn.Module):
+    def __init__(self, quantile_levels, config):
+        super(TotalErrorMetric, self).__init__()
+        self.component_criterion = ComponentWiseCDFLoss(quantile_levels)
+        self.config = config
+        self.pixel_area_km2 = config.get("PIXEL_SIZE_KM", 1.0) ** 2
 
-    def __init__(self, quantile_levels):
-        super(SimpleCDFLossMetric, self).__init__()
-        # Use the base loss, but ensure it does *not* reduce (mean)
-        self.criterion = ComponentWiseCDFLoss(
-            quantile_levels=quantile_levels, reduction=None
+    def forward(self, input_data, predicted_gamma_phys, log_target_gamma):
+        # 1. Calculate main loss in log space
+        predicted_gamma_log = torch.log1p(predicted_gamma_phys)
+        loss_A, loss_P, loss_CC = self.component_criterion(
+            predicted_gamma_log, log_target_gamma
         )
 
-    def forward(self, log_gamma_pred_3d, log_gamma_target_3d):
-        # criterion returns [B, 3] tensor of losses (A, P, CC)
-        loss_A, loss_P, loss_CC = self.criterion(log_gamma_pred_3d, log_gamma_target_3d)
+        main_loss = (
+            (self.config.get("WEIGHT_A", 1.0) * loss_A)
+            + (self.config.get("WEIGHT_P", 1.0) * loss_P)
+            + (self.config.get("WEIGHT_CC", 1.0) * loss_CC)
+        )
 
-        # Return the sum of component losses for each sample
-        # [B]
-        total_loss_per_sample = loss_A + loss_P + loss_CC
-        return total_loss_per_sample
+        total_loss = main_loss
+
+        # 2. Add soft penalties if in that mode
+        # These penalties are calculated PER-SAMPLE
+        constraint_mode = self.config.get("CONSTRAINT_MODE", "hybrid")
+
+        if constraint_mode == "soft":
+            pred_A_phys = predicted_gamma_phys[:, 0, :]
+            pred_P_phys = predicted_gamma_phys[:, 1, :]
+            pred_CC_phys = predicted_gamma_phys[:, 2, :]
+
+            penalty_zero = calculate_zero_penalty(input_data, predicted_gamma_phys)
+            penalty_mono = calculate_monotonicity_penalty(pred_A_phys)
+            penalty_plaus = calculate_plausibility_penalty(pred_A_phys, pred_P_phys)
+            penalty_bound = calculate_bound_penalty(
+                pred_A_phys, pred_CC_phys, self.pixel_area_km2
+            )
+
+            total_loss = (
+                main_loss
+                + self.config.get("LOSS_LAMBDA", 0.0) * penalty_zero
+                + self.config.get("LAMBDA_MONOTONICITY", 0.0) * penalty_mono
+                + self.config.get("LAMBDA_PLAUSIBILITY", 0.0) * penalty_plaus
+                + self.config.get("LAMBDA_BOUND", 0.0) * penalty_bound
+            )
+
+        elif constraint_mode == "hybrid":
+            pred_A_phys = predicted_gamma_phys[:, 0, :]
+            pred_CC_phys = predicted_gamma_phys[:, 2, :]
+            penalty_bound = calculate_bound_penalty(
+                pred_A_phys, pred_CC_phys, self.pixel_area_km2
+            )
+            total_loss = (
+                main_loss + self.config.get("LAMBDA_BOUND", 0.0) * penalty_bound
+            )
+
+        return total_loss

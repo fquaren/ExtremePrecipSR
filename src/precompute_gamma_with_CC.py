@@ -20,8 +20,7 @@ with open(config_path, "r") as file:
 
 QUANTILE_LEVELS = config["QUANTILE_LEVELS"]
 PREPROCESSED_DATA_DIR = config["PREPROCESSED_DATA_DIR"]
-PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 1.0)
-PERSISTENCE_THRESHOLD = config.get("PERSISTENCE_THRESHOLD", 0.05)
+PIXEL_SIZE_KM = config["PIXEL_SIZE_KM"]
 
 
 # --- Core Geometric Calculation Functions ---
@@ -53,7 +52,7 @@ def compute_A_P_CC_single_threshold_numpy(
     return np.array([area_km2, perimeter_km, num_features], dtype=np.float32)
 
 
-def compute_gamma_matrix_for_image(prec_2d_data, thresholds, pixel_size_km=1.0):
+def compute_gamma_matrix_for_image(prec_2d_data, thresholds, pixel_size_km):
     """Computes the 3xN_quantiles Gamma matrix for a single precipitation image."""
     gamma_matrix = np.zeros((3, len(thresholds)), dtype=np.float32)
     for i, threshold_value in enumerate(thresholds):
@@ -126,7 +125,9 @@ def process_and_save_gamma_targets(data_split):
     # without loading the whole thing into RAM.
 
     print(f"Reloading from memmap and compressing to {output_path}...")
-    final_data_mmap = np.load(temp_output_path, mmap_mode="r", allow_pickle=True)
+    final_data_mmap = np.memmap(
+        temp_output_path, dtype=output_dtype, mode="r", shape=output_shape
+    )
 
     np.savez_compressed(output_path, data=final_data_mmap)
 

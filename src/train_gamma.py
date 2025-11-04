@@ -16,6 +16,7 @@ from gamma_predictors import (
     GammaPredictorSeparateHeadsSoft,
 )
 
+
 # --- Configuration Loading ---
 config_path = (
     "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/config.yaml"
@@ -40,72 +41,59 @@ EARLY_STOPPING_PATIENCE = config.get("EARLY_STOPPING_PATIENCE", 10)
 EARLY_STOPPING_DELTA = config.get("EARLY_STOPPING_DELTA", 0.001)
 EXPERIMENT_NAME = config.get("EXPERIMENT_NAME", "Debugging")
 PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 1.0)
-HARD_CONSTRAINED = config.get("HARD_CONSTRAINED", True)
-LOSS_LAMBDA = config.get("LOSS_LAMBDA", 0.0)
-LAMBDA_BOUND = config.get("LAMBDA_BOUND", 0.0)
+
+# --- Constraint Configuration ---
+CONSTRAINT_MODE = config.get("CONSTRAINT_MODE", "hybrid")  # 'soft', 'hard', or 'hybrid'
+LOSS_LAMBDA = config.get("LOSS_LAMBDA", 0.25)  # For soft zero penalty
+LAMBDA_MONOTONICITY = config.get("LAMBDA_MONOTONICITY", 1.0)
+LAMBDA_PLAUSIBILITY = config.get("LAMBDA_PLAUSIBILITY", 1.0)
+PLAUSIBILITY_THRESHOLD = config.get("PLAUSIBILITY_THRESHOLD", 12.0)
+WEIGHT_A = config.get("WEIGHT_A", 1.0)
+WEIGHT_P = config.get("WEIGHT_P", 1.0)
+WEIGHT_CC = config.get("WEIGHT_CC", 1.0)
+LAMBDA_BOUND = config.get("LAMBDA_BOUND", 0.1)
 
 
 # --- Soft Constraint Penalty Functions ---
-def calculate_monotonicity_penalty(pred_A):
-    """
-    Penalizes non-monotonic (increasing) values in the Area prediction.
-    pred_A [B, NQ] should be monotonically decreasing.
-    """
-    # diffs shape: [B, NQ-1]
-    diffs = pred_A[:, :-1] - pred_A[:, 1:]
-    # We only care about *negative* diffs (where A_q_i < A_q_i+1)
-    # F.relu(-diffs) will be > 0 only if diffs is negative.
-    penalty = torch.mean(F.relu(-diffs))
+# These are only used if CONSTRAINT_MODE == 'soft'
+def calculate_monotonicity_penalty(pred_A_phys):
+    diffs = pred_A_phys[:, :-1] - pred_A_phys[:, 1:]  # P(i) - P(i+1)
+    penalty = torch.mean(F.relu(-diffs))  # Penalize if P(i) < P(i+1)
     return penalty
 
 
-def calculate_p_min_penalty(pred_A, pred_P):
-    """
-    Penalizes predictions where P < P_min.
-    P_min = sqrt(4 * pi * A)
-    """
+def calculate_plausibility_penalty(pred_A_phys, pred_P_phys):
     epsilon = 1e-6
-    # We detach pred_A: backprop penalty only through P head.
-    P_min = torch.sqrt(4 * math.pi * (pred_A.detach() + epsilon))
+    P_min = torch.sqrt(4 * math.pi * (pred_A_phys + epsilon))
+    penalty = torch.mean(F.relu(P_min - pred_P_phys))  # Penalize if P_min > P_pred
+    return penalty
 
-    # We only care about P_min > P
-    penalty = torch.mean(F.relu(P_min - pred_P))
+
+def calculate_bound_penalty(pred_A_phys, pred_CC_phys, pixel_area_km2):
+    epsilon = 1e-6
+    CC_max = (pred_A_phys / pixel_area_km2) + epsilon
+    penalty = torch.mean(F.relu(pred_CC_phys - CC_max))  # Penalize if CC > CC_max
     return penalty
 
 
 def calculate_zero_penalty(input_data, predicted_gamma_phys):
-    """
-    Penalizes non-zero predictions for dry (all-zero) input patches.
-    """
     with torch.no_grad():
-        # Find "dry" samples in the batch.
-        is_dry_mask = input_data.sum(dim=(1, 2, 3)) <= 1e-6  # Shape [B]
-
+        is_dry_mask = input_data.sum(dim=(1, 2, 3)) <= 1e-6
     if not is_dry_mask.any():
-        return torch.tensor(0.0, device=input_data.device)  # No dry samples, no penalty
+        return torch.tensor(0.0, device=input_data.device)
 
-    # Select the predictions for *only* the dry samples
     dry_predictions = predicted_gamma_phys[is_dry_mask]
 
-    # The penalty is the mean sum of predicted values for these dry samples.
-    penalty = torch.mean(dry_predictions.sum(dim=(1, 2)))
+    penalty = torch.mean(torch.abs(dry_predictions))
     return penalty
 
 
+# --- Main Execution ---
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # --- Check for logical errors in config ---
-    if not HARD_CONSTRAINED and (LOSS_LAMBDA == 0.0 and LAMBDA_BOUND == 0.0):
-        print(
-            "Warning: Running with SOFT constraints, but all penalty weights (LOSS_LAMBDA, LAMBDA_BOUND) are 0."
-        )
-    if HARD_CONSTRAINED and (LOSS_LAMBDA > 0.0 or LAMBDA_BOUND > 0.0):
-        print(
-            "Warning: Running with HARD constraints. Soft penalty weights will be ignored."
-        )
-
+    # --- Setup Experiment Directory ---
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     run_name = f"{EXPERIMENT_NAME}_{timestamp}"
     output_dir = os.path.join("experiment_runs", run_name)
@@ -117,7 +105,7 @@ def main():
     except IOError as e:
         print(f"Error saving config file: {e}")
 
-    # --- 1. Prepare Datasets ---
+    # --- 1. Prepare Datasets & Sampler ---
     train_dataset_full = PreprocessedNpzDataset(
         preprocessed_data_dir=os.path.join(PREPROCESSED_DATA_DIR, "train"),
         metadata_file=TRAIN_METADATA_FILE,
@@ -142,7 +130,6 @@ def main():
         val_dataset_full, config["SUBSAMPLE_FRACTION"], seed=0
     )
 
-    # --- Oversampling Strategy ---
     print("Stratifying dataset using MAX precipitation...")
     wet_event_metrics = [
         np.max(patch)
@@ -166,19 +153,21 @@ def main():
         else:
             indices_extreme.append(i)
     print(
-        f"Stratification complete: {len(indices_dry)} \n"
-        f"Dry, {len(indices_normal)} Normal, {len(indices_extreme)} Extreme."
+        f"Stratification complete: {len(indices_dry)} Dry, {len(indices_normal)} Normal, {len(indices_extreme)} Extreme."
     )
+    comp = config["BATCH_COMPOSITION"]
     batch_composition = {
-        "dry": int(BATCH_SIZE * float(config["BATCH_COMPOSITION"]["dry"])),
-        "normal": int(BATCH_SIZE * float(config["BATCH_COMPOSITION"]["normal"])),
-        "extreme": int(BATCH_SIZE * float(config["BATCH_COMPOSITION"]["extreme"])),
+        "dry": int(BATCH_SIZE * float(comp["dry"])),
+        "normal": int(BATCH_SIZE * float(comp["normal"])),
     }
+    batch_composition["extreme"] = (
+        BATCH_SIZE - batch_composition["dry"] - batch_composition["normal"]
+    )
     stratified_sampler = StratifiedBatchSampler(
         indices_dry, indices_normal, indices_extreme, batch_composition
     )
 
-    # --- Prepare DataLoaders ---
+    # --- 2. Prepare DataLoaders ---
     train_loader = DataLoader(
         train_dataset_full,
         batch_sampler=stratified_sampler,
@@ -194,12 +183,16 @@ def main():
     )
 
     # --- 3. Initialize Model, Optimizer, and Loss ---
-
-    # Define the shared input shape
     INPUT_SHAPE = (1, PATCH_SIZE, PATCH_SIZE)
 
-    if HARD_CONSTRAINED:
-        print("Using GammaPredictor with hard constraints.")
+    # Model selection based on CONSTRAINT_MODE
+    if CONSTRAINT_MODE == "soft":
+        print("Using SOFT constraints model (GammaPredictorSeparateHeadsSoft).")
+        model = GammaPredictorSeparateHeadsSoft(
+            input_shape=INPUT_SHAPE, n_quantiles=N_QUANTILES, activation_fn=nn.Mish()
+        ).to(device)
+    elif CONSTRAINT_MODE == "hybrid" or CONSTRAINT_MODE == "hard":
+        print("Using HYBRID constraints model (GammaPredictorSeparateHeadsHybrid).")
         model = GammaPredictorSeparateHeadsHard(
             input_shape=INPUT_SHAPE,
             n_quantiles=N_QUANTILES,
@@ -207,16 +200,10 @@ def main():
             quantile_levels=QUANTILE_LEVELS,
             pixel_area_km2=PIXEL_SIZE_KM**2,
         ).to(device)
-    else:
-        print("Using GammaPredictor with soft constraints.")
-        model = GammaPredictorSeparateHeadsSoft(
-            input_shape=INPUT_SHAPE,
-            n_quantiles=N_QUANTILES,
-            activation_fn=nn.Mish(),
-        ).to(device)
 
+    # Use manual weights, not homoscedastic
     optimizer = torch.optim.Adam(
-        model.parameters(),
+        list(model.parameters()),  # No log_vars
         lr=LEARNING_RATE,
         weight_decay=WEIGHT_DECAY,
     )
@@ -228,10 +215,12 @@ def main():
     log_file_path = os.path.join(output_dir, "training_log.csv")
     try:
         with open(log_file_path, "w") as log_file:
-            # Added columns for penalty logging
+            # Updated log file header
             log_file.write(
-                "epoch,train_loss_total,train_loss_main,train_penalty_zero,train_penalty_bound,"
-                "val_loss_total,val_loss_main,val_penalty_zero,val_penalty_bound\n"
+                "epoch,train_loss_total,train_loss_main,train_loss_A,train_loss_P,train_loss_CC,"
+                "train_penalty_zero,train_penalty_mono,train_penalty_plaus,train_penalty_bound,"
+                "val_loss_total,val_loss_main,val_loss_A,val_loss_P,val_loss_CC,"
+                "val_penalty_zero,val_penalty_mono,val_penalty_plaus,val_penalty_bound\n"
             )
         print(f"Log file will be saved to {log_file_path}")
     except IOError as e:
@@ -245,94 +234,126 @@ def main():
 
     for epoch in range(NUM_EPOCHS):
         model.train()
-        running_loss = 0.0
-        running_main_loss = 0.0
-        running_penalty_zero = 0.0
-        running_penalty_bound = 0.0
+        # Add accumulators for component losses
+        running_loss_A, running_loss_P, running_loss_CC = 0.0, 0.0, 0.0
+        (
+            running_loss,
+            running_main,
+            running_pen_zero,
+            running_pen_mono,
+            running_pen_plaus,
+            running_pen_bound,
+        ) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} (Train)")
+        # Remove unused unpacks
         for input_data, log_target_gamma, _, _ in pbar:
             input_data, log_target_gamma = input_data.to(device), log_target_gamma.to(
                 device
             )
             optimizer.zero_grad()
 
-            # Model output is physical space
             predicted_gamma_phys = model(input_data)
-
-            # Need log-space prediction for the main loss comparison
             predicted_gamma_log = torch.log1p(predicted_gamma_phys)
 
-            # --- Calculate Main Loss ---
+            # --- Calculate Main Weighted Loss ---
             loss_A, loss_P, loss_CC = criterion(predicted_gamma_log, log_target_gamma)
-            main_loss = loss_A + loss_P + loss_CC
-
+            # Apply manual weights
+            SUM_WEIGHTS = WEIGHT_A + WEIGHT_P + WEIGHT_CC
+            main_loss = (
+                (WEIGHT_A / SUM_WEIGHTS * loss_A)
+                + (WEIGHT_P / SUM_WEIGHTS * loss_P)
+                + (WEIGHT_CC / SUM_WEIGHTS * loss_CC)
+            )
             total_loss = main_loss
+
+            # --- Initialize penalties ---
             penalty_zero = torch.tensor(0.0, device=device)
+            penalty_mono = torch.tensor(0.0, device=device)
+            penalty_plaus = torch.tensor(0.0, device=device)
             penalty_bound = torch.tensor(0.0, device=device)
 
-            # --- Add soft constraint penalties if NOT hard_constrained ---
-            if not HARD_CONSTRAINED:
-                if LAMBDA_BOUND > 0:
-                    pred_A = predicted_gamma_phys[:, 0, :]
-                    pred_P = predicted_gamma_phys[:, 1, :]
-                    mono_penalty = calculate_monotonicity_penalty(pred_A)
-                    p_min_penalty = calculate_p_min_penalty(pred_A, pred_P)
-                    penalty_bound = mono_penalty + p_min_penalty
-                    total_loss = (
-                        1 - LAMBDA_BOUND
-                    ) * total_loss + LAMBDA_BOUND * penalty_bound
+            # --- Apply Penalties based on Mode ---
+            if CONSTRAINT_MODE == "soft":
+                pred_A_phys = predicted_gamma_phys[:, 0, :]
+                pred_P_phys = predicted_gamma_phys[:, 1, :]
+                pred_CC_phys = predicted_gamma_phys[:, 2, :]
 
-                if LOSS_LAMBDA > 0:
-                    penalty_zero = calculate_zero_penalty(
-                        input_data, predicted_gamma_phys
-                    )
-                    total_loss = (
-                        1 - LOSS_LAMBDA
-                    ) * total_loss + LOSS_LAMBDA * penalty_zero
+                penalty_zero = calculate_zero_penalty(input_data, predicted_gamma_phys)
+                penalty_mono = calculate_monotonicity_penalty(pred_A_phys)
+                penalty_plaus = calculate_plausibility_penalty(pred_A_phys, pred_P_phys)
+                penalty_bound = calculate_bound_penalty(
+                    pred_A_phys, pred_CC_phys, PIXEL_SIZE_KM**2
+                )
+
+                # Use simple weighted sum for loss
+                total_loss = (
+                    main_loss
+                    + LOSS_LAMBDA * penalty_zero
+                    + LAMBDA_MONOTONICITY * penalty_mono
+                    + LAMBDA_PLAUSIBILITY * penalty_plaus
+                    + LAMBDA_BOUND * penalty_bound
+                )
+
+            elif CONSTRAINT_MODE == "hybrid":
+                pred_A_phys = predicted_gamma_phys[:, 0, :]
+                pred_CC_phys = predicted_gamma_phys[:, 2, :]
+
+                penalty_bound = calculate_bound_penalty(
+                    pred_A_phys, pred_CC_phys, PIXEL_SIZE_KM**2
+                )
+                total_loss = main_loss + LAMBDA_BOUND * penalty_bound
+
+            # If 'hard' mode, no penalties are added
 
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             # --- Accumulate losses for logging ---
+            running_loss_A += loss_A.item()
+            running_loss_P += loss_P.item()
+            running_loss_CC += loss_CC.item()
             running_loss += total_loss.item()
-            running_main_loss += main_loss.item()
-            running_penalty_zero += penalty_zero.item()
-            running_penalty_bound += penalty_bound.item()
+            running_main += main_loss.item()
+            running_pen_zero += penalty_zero.item()
+            running_pen_mono += penalty_mono.item()
+            running_pen_plaus += penalty_plaus.item()
+            running_pen_bound += penalty_bound.item()
 
             pbar.set_postfix(
-                loss=f"{total_loss.item():.3f}",
-                main=f"{main_loss.item():.3f}",
-                p_bound=f"{penalty_bound.item():.3f}",
-                p_zero=f"{penalty_zero.item():.3f}",
+                loss=f"{total_loss.item():.3f}", main=f"{main_loss.item():.3f}"
             )
 
         # Calculate average losses for the epoch
         num_batches = len(train_loader)
         avg_train_loss = running_loss / num_batches if num_batches > 0 else 0
-        avg_train_main_loss = running_main_loss / num_batches if num_batches > 0 else 0
-        avg_train_pen_zero = (
-            running_penalty_zero / num_batches if num_batches > 0 else 0
-        )
-        avg_train_pen_bound = (
-            running_penalty_bound / num_batches if num_batches > 0 else 0
-        )
+        avg_main_loss = running_main / num_batches if num_batches > 0 else 0
+        avg_loss_A = running_loss_A / num_batches if num_batches > 0 else 0
+        avg_loss_P = running_loss_P / num_batches if num_batches > 0 else 0
+        avg_loss_CC = running_loss_CC / num_batches if num_batches > 0 else 0
+        avg_pen_zero = running_pen_zero / num_batches if num_batches > 0 else 0
+        avg_pen_mono = running_pen_mono / num_batches if num_batches > 0 else 0
+        avg_pen_plaus = running_pen_plaus / num_batches if num_batches > 0 else 0
+        avg_pen_bound = running_pen_bound / num_batches if num_batches > 0 else 0
 
         print(
             f"Epoch {epoch+1}\n"
-            f"Train Loss: Total={avg_train_loss:.4f}, "
-            f"Main={avg_train_main_loss:.4f}, "
-            f"ZeroPen={avg_train_pen_zero:.4f}, "
-            f"BoundPen={avg_train_pen_bound:.4f}"
+            f"Train Loss: Total={avg_train_loss:.4f}, Main={avg_main_loss:.4f}\n"
+            f"Train Penalties: Zero={avg_pen_zero:.4f}, Mono={avg_pen_mono:.4f}, Plaus={avg_pen_plaus:.4f}, Bound={avg_pen_bound:.4f}\n"
+            f"Train Comps: A={avg_loss_A:.4f}, P={avg_loss_P:.4f}, CC={avg_loss_CC:.4f}"
         )
 
         # --- Validation ---
         model.eval()
-        val_running_loss = 0.0
-        val_running_main_loss = 0.0
-        val_running_penalty_zero = 0.0
-        val_running_penalty_bound = 0.0
+        val_running_loss_A, val_running_loss_P, val_running_loss_CC = 0.0, 0.0, 0.0
+        val_running_loss, val_running_main = 0.0, 0.0
+        (
+            val_running_pen_zero,
+            val_running_pen_mono,
+            val_running_pen_plaus,
+            val_running_pen_bound,
+        ) = (0.0, 0.0, 0.0, 0.0)
 
         with torch.no_grad():
             for input_data, log_target_gamma, _, _ in tqdm(
@@ -341,62 +362,95 @@ def main():
                 input_data, log_target_gamma = input_data.to(
                     device
                 ), log_target_gamma.to(device)
-
                 predicted_gamma_phys = model(input_data)
                 predicted_gamma_log = torch.log1p(predicted_gamma_phys)
 
-                # --- Calculate Main Loss ---
                 loss_A, loss_P, loss_CC = criterion(
                     predicted_gamma_log, log_target_gamma
                 )
-                main_loss = loss_A + loss_P + loss_CC
-
+                main_loss = (
+                    (WEIGHT_A * loss_A) + (WEIGHT_P * loss_P) + (WEIGHT_CC * loss_CC)
+                )
                 total_loss = main_loss
+
                 penalty_zero = torch.tensor(0.0, device=device)
+                penalty_mono = torch.tensor(0.0, device=device)
+                penalty_plaus = torch.tensor(0.0, device=device)
                 penalty_bound = torch.tensor(0.0, device=device)
 
-                # --- Calculate penalties for logging ---
-                if not HARD_CONSTRAINED:
-                    if LAMBDA_BOUND > 0:
-                        pred_A = predicted_gamma_phys[:, 0, :]
-                        pred_P = predicted_gamma_phys[:, 1, :]
-                        mono_penalty = calculate_monotonicity_penalty(pred_A)
-                        p_min_penalty = calculate_p_min_penalty(pred_A, pred_P)
-                        penalty_bound = mono_penalty + p_min_penalty
-                        total_loss = total_loss + LAMBDA_BOUND * penalty_bound
+                pred_A_phys = predicted_gamma_phys[:, 0, :]
+                pred_P_phys = predicted_gamma_phys[:, 1, :]
+                pred_CC_phys = predicted_gamma_phys[:, 2, :]
 
-                    if LOSS_LAMBDA > 0:
-                        penalty_zero = calculate_zero_penalty(
-                            input_data, predicted_gamma_phys
-                        )
-                        total_loss = total_loss + LOSS_LAMBDA * penalty_zero
+                if CONSTRAINT_MODE == "soft":
+                    penalty_zero = calculate_zero_penalty(
+                        input_data, predicted_gamma_phys
+                    )
+                    penalty_mono = calculate_monotonicity_penalty(pred_A_phys)
+                    penalty_plaus = calculate_plausibility_penalty(
+                        pred_A_phys, pred_P_phys
+                    )
+                    penalty_bound = calculate_bound_penalty(
+                        pred_A_phys, pred_CC_phys, PIXEL_SIZE_KM**2
+                    )
+                    total_loss = (
+                        main_loss
+                        + LOSS_LAMBDA * penalty_zero
+                        + LAMBDA_MONOTONICITY * penalty_mono
+                        + LAMBDA_PLAUSIBILITY * penalty_plaus
+                        + LAMBDA_BOUND * penalty_bound
+                    )
 
+                elif CONSTRAINT_MODE == "hybrid":
+                    penalty_bound = calculate_bound_penalty(
+                        pred_A_phys, pred_CC_phys, PIXEL_SIZE_KM**2
+                    )
+                    total_loss = main_loss + LAMBDA_BOUND * penalty_bound
+
+                val_running_loss_A += loss_A.item()
+                val_running_loss_P += loss_P.item()
+                val_running_loss_CC += loss_CC.item()
                 val_running_loss += total_loss.item()
-                val_running_main_loss += main_loss.item()
-                val_running_penalty_zero += penalty_zero.item()
-                val_running_penalty_bound += penalty_bound.item()
+                val_running_main += main_loss.item()
+                val_running_pen_zero += penalty_zero.item()
+                val_running_pen_mono += penalty_mono.item()
+                val_running_pen_plaus += penalty_plaus.item()
+                val_running_pen_bound += penalty_bound.item()
 
-        # Calculate average validation losses
         num_val_batches = len(val_loader)
         avg_val_loss = val_running_loss / num_val_batches if num_val_batches > 0 else 0
         avg_val_main_loss = (
-            val_running_main_loss / num_val_batches if num_val_batches > 0 else 0
+            val_running_main / num_val_batches if num_val_batches > 0 else 0
+        )
+        avg_val_loss_A = (
+            val_running_loss_A / num_val_batches if num_val_batches > 0 else 0
+        )
+        avg_val_loss_P = (
+            val_running_loss_P / num_val_batches if num_val_batches > 0 else 0
+        )
+        avg_val_loss_CC = (
+            val_running_loss_CC / num_val_batches if num_val_batches > 0 else 0
         )
         avg_val_pen_zero = (
-            val_running_penalty_zero / num_val_batches if num_val_batches > 0 else 0
+            val_running_pen_zero / num_val_batches if num_val_batches > 0 else 0
+        )
+        avg_val_pen_mono = (
+            val_running_pen_mono / num_val_batches if num_val_batches > 0 else 0
+        )
+        avg_val_pen_plaus = (
+            val_running_pen_plaus / num_val_batches if num_val_batches > 0 else 0
         )
         avg_val_pen_bound = (
-            val_running_penalty_bound / num_val_batches if num_val_batches > 0 else 0
+            val_running_pen_bound / num_val_batches if num_val_batches > 0 else 0
         )
 
         scheduler.step(avg_val_loss)
 
         print(
             f"Epoch {epoch+1}\n"
-            f"Val Loss: Total={avg_val_loss:.4f}, "
-            f"Main={avg_val_main_loss:.4f}, "
-            f"ZeroPen={avg_val_pen_zero:.4f}, "
-            f"BoundPen={avg_val_pen_bound:.4f}\n"
+            f"Val Loss: Total={avg_val_loss:.4f}, Main={avg_val_main_loss:.4f}\n"
+            f"Val Penalties: Zero={avg_val_pen_zero:.4f}, Mono={avg_val_pen_mono:.4f}, Plaus={avg_val_pen_plaus:.4f}, Bound={avg_val_pen_bound:.4f}\n"
+            f"Val Comps: A={avg_val_loss_A:.4f}, P={avg_val_loss_P:.4f}, CC={avg_val_loss_CC:.4f}"
         )
 
         if avg_val_loss < best_val_loss - EARLY_STOPPING_DELTA:
@@ -410,7 +464,7 @@ def main():
             model_save_path = os.path.join(output_dir, "best_model_checkpoint.pth")
             torch.save(checkpoint, model_save_path)
             print(
-                f"Validation loss decreased significantly to {best_val_loss:.6f}. Model checkpoint saved."
+                f"Validation loss decreased to {best_val_loss:.6f}. Checkpoint saved."
             )
             patience_counter = 0
         else:
@@ -426,10 +480,12 @@ def main():
             with open(log_file_path, "a") as log_file:
                 # Updated log write
                 log_file.write(
-                    f"{epoch+1},{avg_train_loss:.6f},{avg_train_main_loss:.6f},"
-                    f"{avg_train_pen_zero:.6f},{avg_train_pen_bound:.6f},"
+                    f"{epoch+1},{avg_train_loss:.6f},{avg_main_loss:.6f},"
+                    f"{avg_loss_A:.6f},{avg_loss_P:.6f},{avg_loss_CC:.6f},"
+                    f"{avg_pen_zero:.6f},{avg_pen_mono:.6f},{avg_pen_plaus:.6f},{avg_pen_bound:.6f},"
                     f"{avg_val_loss:.6f},{avg_val_main_loss:.6f},"
-                    f"{avg_val_pen_zero:.6f},{avg_val_pen_bound:.6f}\n"
+                    f"{avg_val_loss_A:.6f},{avg_val_loss_P:.6f},{avg_val_loss_CC:.6f},"
+                    f"{avg_val_pen_zero:.6f},{avg_val_pen_mono:.6f},{avg_val_pen_plaus:.6f},{avg_val_pen_bound:.6f}\n"
                 )
         except IOError as e:
             print(f"Error writing to log file: {e}")

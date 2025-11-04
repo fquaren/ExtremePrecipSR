@@ -1,1 +1,3 @@
 *.txt
+*cache*
+src/__pycache__
