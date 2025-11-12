@@ -88,7 +88,6 @@ def calculate_zero_penalty(input_data, predicted_gamma_phys):
     return penalty
 
 
-# --- Main Execution ---
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -153,7 +152,7 @@ def main():
         else:
             indices_extreme.append(i)
     print(
-        f"Stratification complete: {len(indices_dry)} Dry, {len(indices_normal)} Normal, {len(indices_extreme)} Extreme."
+        f"Stratification: {len(indices_dry)} Dry, {len(indices_normal)} Normal, {len(indices_extreme)} Extreme."
     )
     comp = config["BATCH_COMPOSITION"]
     batch_composition = {
@@ -185,12 +184,20 @@ def main():
     # --- 3. Initialize Model, Optimizer, and Loss ---
     INPUT_SHAPE = (1, PATCH_SIZE, PATCH_SIZE)
 
-    # Model selection based on CONSTRAINT_MODE
-    if CONSTRAINT_MODE == "soft":
-        print("Using SOFT constraints model (GammaPredictorSeparateHeadsSoft).")
+    # Model selection now includes 'none'
+    if CONSTRAINT_MODE == "soft" or CONSTRAINT_MODE == "none":
+        if CONSTRAINT_MODE == "soft":
+            print(
+                "Using SOFT constraints model (GammaPredictorSeparateHeadsSoft) with soft penalties."
+            )
+        else:
+            print(
+                "Using NO constraints model (GammaPredictorSeparateHeadsSoft) with main loss only."
+            )
         model = GammaPredictorSeparateHeadsSoft(
             input_shape=INPUT_SHAPE, n_quantiles=N_QUANTILES, activation_fn=nn.Mish()
         ).to(device)
+
     elif CONSTRAINT_MODE == "hybrid" or CONSTRAINT_MODE == "hard":
         print("Using HYBRID constraints model (GammaPredictorSeparateHeadsHybrid).")
         model = GammaPredictorSeparateHeadsHard(
@@ -200,10 +207,14 @@ def main():
             quantile_levels=QUANTILE_LEVELS,
             pixel_area_km2=PIXEL_SIZE_KM**2,
         ).to(device)
+    else:
+        raise ValueError(
+            f"Unknown CONSTRAINT_MODE: {CONSTRAINT_MODE}. Must be 'soft', 'hybrid', 'hard', or 'none'."
+        )
 
-    # Use manual weights, not homoscedastic
+    # Use manual weights, not homoscedastic uncertainty
     optimizer = torch.optim.Adam(
-        list(model.parameters()),  # No log_vars
+        list(model.parameters()),
         lr=LEARNING_RATE,
         weight_decay=WEIGHT_DECAY,
     )
@@ -234,7 +245,7 @@ def main():
 
     for epoch in range(NUM_EPOCHS):
         model.train()
-        # Add accumulators for component losses
+        # Accumulators for component losses
         running_loss_A, running_loss_P, running_loss_CC = 0.0, 0.0, 0.0
         (
             running_loss,
@@ -246,7 +257,7 @@ def main():
         ) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} (Train)")
-        # Remove unused unpacks
+
         for input_data, log_target_gamma, _, _ in pbar:
             input_data, log_target_gamma = input_data.to(device), log_target_gamma.to(
                 device
@@ -304,7 +315,9 @@ def main():
                 )
                 total_loss = main_loss + LAMBDA_BOUND * penalty_bound
 
-            # If 'hard' mode, no penalties are added
+            # If CONSTRAINT_MODE is 'none' or 'hard', no penalties are added
+            # The 'hard' mode's constraints are built into the model's forward pass
+            # The 'none' mode's logic is to have no penalties.
 
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -407,6 +420,8 @@ def main():
                     )
                     total_loss = main_loss + LAMBDA_BOUND * penalty_bound
 
+                # If 'none' or 'hard', total_loss remains main_loss
+
                 val_running_loss_A += loss_A.item()
                 val_running_loss_P += loss_P.item()
                 val_running_loss_CC += loss_CC.item()
@@ -478,7 +493,6 @@ def main():
 
         try:
             with open(log_file_path, "a") as log_file:
-                # Updated log write
                 log_file.write(
                     f"{epoch+1},{avg_train_loss:.6f},{avg_main_loss:.6f},"
                     f"{avg_loss_A:.6f},{avg_loss_P:.6f},{avg_loss_CC:.6f},"

@@ -1,20 +1,28 @@
 import yaml
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
 import os
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-import torch.nn as nn
 import argparse
 import pandas as pd
 from sklearn.metrics import r2_score
+
+# --- Import from your local files ---
 from gamma_predictors import (
     GammaPredictorSeparateHeadsHard,
     GammaPredictorSeparateHeadsSoft,
 )
-from loss import TotalErrorMetric
+
+# MODIFICATION: Import the new loss and helper
+from loss import (
+    TotalErrorMetric,
+    GeometricLossSeparate,
+    estimate_s_inv_from_dataset,
+)
 from dataset import PreprocessedNpzDataset
 
 
@@ -30,11 +38,11 @@ def _plot_single_gamma_comparison(
     sub_folder,
     output_dir,
 ):
-    # ... (Plotting function remains the same, but title is updated)
+    # ... (Plotting function remains the same)
     pred_gamma = all_preds_phys[sample_idx]
     target_gamma = all_targets_phys[sample_idx]
     target_image = all_images[sample_idx]
-    loss = all_losses[sample_idx]  # This is now the total loss
+    loss = all_losses[sample_idx]
     mean_precip = np.mean(target_image)
     gamma_types = ["Area (km²)", "Perimeter (km)", "CCs"]
     fig = plt.figure(figsize=(20, 5))
@@ -126,7 +134,6 @@ def plot_gamma_performance_by_quantile(
                 group_name,
                 output_dir,
             )
-        # R^2 calculation logic (as provided by user)
         r2_scores_in_group = []
         for idx in candidate_indices:
             pred_flat = predictions_phys[idx].flatten()
@@ -154,8 +161,6 @@ def plot_training_log(log_path, output_dir):
     except Exception as e:
         print(f"Error reading log file with pandas: {e}. Skipping plot.")
         return
-
-    # Check for expected columns
     required_cols = [
         "epoch",
         "train_loss_total",
@@ -179,11 +184,8 @@ def plot_training_log(log_path, output_dir):
         print("Warning: Log file columns mismatch. Skipping training history plot.")
         print(f"Missing: {[c for c in required_cols if c not in df.columns]}")
         return
-
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 18), sharex=True)
     fig.suptitle("Training History", fontsize=16)
-
-    # --- Plot 1: Total & Main Loss ---
     ax1.plot(df["epoch"], df["train_loss_total"], "o-", label="Train Total", color="C0")
     ax1.plot(df["epoch"], df["val_loss_total"], "o-", label="Val Total", color="C1")
     ax1.plot(
@@ -202,8 +204,6 @@ def plot_training_log(log_path, output_dir):
     ax1.legend(ncol=2)
     ax1.grid(True, linestyle="--", alpha=0.6)
     ax1.set_yscale("log")
-
-    # --- Plot 2: Component Losses ---
     ax2.plot(
         df["epoch"],
         df["train_loss_A"],
@@ -252,8 +252,6 @@ def plot_training_log(log_path, output_dir):
     ax2.legend(ncol=3)
     ax2.grid(True, linestyle="--", alpha=0.6)
     ax2.set_yscale("log")
-
-    # --- Plot 3: Soft Penalties ---
     ax3.plot(
         df["epoch"],
         df["train_penalty_zero"],
@@ -308,12 +306,38 @@ def plot_training_log(log_path, output_dir):
     ax3.legend(ncol=4)
     ax3.grid(True, linestyle="--", alpha=0.6)
     ax3.set_yscale("log")
-
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     save_path = os.path.join(output_dir, "training_history.png")
     plt.savefig(save_path, dpi=300)
     plt.close(fig)
     print(f"Saved training history plot to: {save_path}")
+
+
+# --- Save_metrics function ---
+def save_metrics_to_file(output_dir, metrics_dict):
+    """Saves the key evaluation metrics to a text file."""
+    file_path = os.path.join(output_dir, "evaluation_metrics.txt")
+    print(f"\nSaving evaluation metrics to {file_path}...")
+
+    try:
+        with open(file_path, "w") as f:
+            f.write("--- Overall Evaluation Metrics ---\n")
+            f.write(
+                f"Mean Total Evaluation Loss (from config): {metrics_dict['mean_total_loss']:.6f}\n"
+            )
+            # Add the new metric
+            f.write(
+                f"Mean Geometric (Mahalanobis) Loss:      {metrics_dict['mean_geometric_loss']:.6f}\n"
+            )
+
+            f.write("\n--- Average Gamma R^2 Scores ---\n")
+            f.write(f"Average Gamma R^2 - Area:      {metrics_dict['avg_r2_A']:.4f}\n")
+            f.write(f"Average Gamma R^2 - Perimeter: {metrics_dict['avg_r2_P']:.4f}\n")
+            f.write(f"Average Gamma R^2 - CC:        {metrics_dict['avg_r2_CC']:.4f}\n")
+
+        print("Metrics saved successfully.")
+    except IOError as e:
+        print(f"Error saving metrics file: {e}")
 
 
 # --- Main Execution ---
@@ -344,16 +368,17 @@ if __name__ == "__main__":
     TEST_METADATA_FILE = config["TEST_METADATA_FILE"]
     BATCH_SIZE = config.get("BATCH_SIZE", 32)
     PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 1.0)
-    # Get constraint mode to load correct model
     CONSTRAINT_MODE = config.get("CONSTRAINT_MODE", "hybrid")
+    # MODIFICATION: Need S_ESTIMATION_SAMPLES and TRAIN_METADATA_FILE
+    S_ESTIMATION_SAMPLES = config.get("S_ESTIMATION_SAMPLES", 1000)
+    TRAIN_METADATA_FILE = config["TRAIN_METADATA_FILE"]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     # --- Dynamic Model Instantiation ---
     INPUT_SHAPE = (1, PATCH_SIZE, PATCH_SIZE)
-    # Model selection based on CONSTRAINT_MODE
-    if CONSTRAINT_MODE == "soft":
+    if CONSTRAINT_MODE == "soft" or CONSTRAINT_MODE == "none":
         print("Using SOFT constraints model (GammaPredictorSeparateHeadsSoft).")
         model = GammaPredictorSeparateHeadsSoft(
             input_shape=INPUT_SHAPE, n_quantiles=N_QUANTILES, activation_fn=nn.Mish()
@@ -373,14 +398,13 @@ if __name__ == "__main__":
         raise FileNotFoundError(
             f"Error: Checkpoint file not found: '{checkpoint_path}'"
         )
-
     print("Loading checkpoint...")
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     print("Model loaded successfully.")
 
-    # --- Load Dataset ---
+    # --- Load Test Dataset ---
     test_dataset = PreprocessedNpzDataset(
         preprocessed_data_dir=os.path.join(PREPROCESSED_DATA_DIR, "test"),
         metadata_file=TEST_METADATA_FILE,
@@ -395,29 +419,49 @@ if __name__ == "__main__":
     print(f"Loaded {len(test_dataset)} samples for evaluation.")
 
     # --- Initialize Evaluation Metric ---
-    # This metric computes the total loss per sample, mirroring the training logic
     evaluation_metric = TotalErrorMetric(
         quantile_levels=QUANTILE_LEVELS, config=config
     ).to(device)
 
+    # --- Initialize Geometric Loss Metric ---
+    print("Loading train dataset to compute S_inv for geometric loss...")
+    train_dataset_for_s_inv = PreprocessedNpzDataset(
+        preprocessed_data_dir=os.path.join(PREPROCESSED_DATA_DIR, "train"),
+        metadata_file=TRAIN_METADATA_FILE,
+        augment=False,  # No augment needed for this
+    )
+    S_inv_tensors = estimate_s_inv_from_dataset(
+        train_dataset_for_s_inv, S_ESTIMATION_SAMPLES, device, N_QUANTILES
+    )
+    geometric_metric = GeometricLossSeparate(S_inv_tensors).to(device)
+
     all_preds_phys, all_targets_phys = [], []
     all_original_images, all_total_losses = [], []
+    total_geometric_loss = 0.0
 
     with torch.no_grad():
         for input_data, log_target_gamma, original_precip, target_gamma_phys in tqdm(
             test_loader, desc="Generating predictions and calculating losses"
         ):
-            input_data, log_target_gamma = input_data.to(device), log_target_gamma.to(
-                device
+            input_data, log_target_gamma, target_gamma_phys = (
+                input_data.to(device),
+                log_target_gamma.to(device),
+                target_gamma_phys.to(device),
             )
 
-            # Model prediction is in PHYSICAL space
             predicted_gamma_phys = model(input_data)
 
             # --- Calculate per-sample total loss (matching training logic) ---
             per_sample_losses = evaluation_metric(
                 input_data, predicted_gamma_phys, log_target_gamma
             )
+
+            # --- Calculate geometric loss for the batch ---
+            # This metric returns a scalar (mean loss for the batch)
+            loss_geom_batch = geometric_metric(predicted_gamma_phys, target_gamma_phys)
+            total_geometric_loss += (
+                loss_geom_batch.item() * input_data.shape[0]
+            )  # Accumulate total sum
 
             all_total_losses.append(per_sample_losses.cpu().numpy())
             all_preds_phys.append(predicted_gamma_phys.cpu().numpy())
@@ -429,8 +473,13 @@ if __name__ == "__main__":
     all_targets_phys = np.concatenate(all_targets_phys, axis=0)
     all_original_images = np.concatenate(all_original_images, axis=0)
     all_total_losses = np.concatenate(all_total_losses, axis=0)
+
+    mean_total_loss = np.mean(all_total_losses)
+    mean_geometric_loss = total_geometric_loss / len(test_dataset)
+
     print(f"Generated predictions and losses for {all_preds_phys.shape[0]} samples.")
-    print(f"Mean Total Evaluation Loss: {np.mean(all_total_losses):.4f}")
+    print(f"Mean Total Evaluation Loss (from config): {mean_total_loss:.4f}")
+    print(f"Mean Geometric (Mahalanobis) Loss:    {mean_geometric_loss:.4f}")
 
     # Calculate and print R^2 scores
     print("\nCalculating R^2 scores (coefficient of determination)...")
@@ -440,9 +489,7 @@ if __name__ == "__main__":
     targets_flat = all_targets_phys.reshape(n_samples, n_features)
     mask = np.isfinite(targets_flat).all(axis=1) & np.isfinite(preds_flat).all(axis=1)
     if not np.all(mask):
-        print(
-            f"Warning: Filtering {np.sum(~mask)} samples with NaNs/Infs before R^2 calculation."
-        )
+        print(f"Warning: Filtering {np.sum(~mask)} samples with NaNs/Infs.")
     r2_scores_raw = r2_score(
         targets_flat[mask], preds_flat[mask], multioutput="raw_values"
     )
@@ -458,6 +505,16 @@ if __name__ == "__main__":
         r2_save_path, r2_matrix=r2_scores_matrix, quantiles=QUANTILE_LEVELS
     )
     print(f"Detailed R^2 scores saved to: {r2_save_path}")
+
+    # --- Collect metrics and save to file ---
+    metrics_to_save = {
+        "mean_total_loss": mean_total_loss,
+        "mean_geometric_loss": mean_geometric_loss,  # Add new metric
+        "avg_r2_A": avg_r2_A,
+        "avg_r2_P": avg_r2_P,
+        "avg_r2_CC": avg_r2_CC,
+    }
+    save_metrics_to_file(args.run_dir, metrics_to_save)
 
     # --- Plotting ---
     plot_gamma_performance_by_quantile(

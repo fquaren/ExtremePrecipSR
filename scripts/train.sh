@@ -4,7 +4,7 @@
 #SBATCH --mail-user filippo.quarenghi@unil.ch
 
 #SBATCH --chdir /scratch/fquareng/
-#SBATCH --job-name train
+#SBATCH --job-name trainmode
 #SBATCH --output outputs/%j
 #SBATCH --error job_errors/%j
 
@@ -15,7 +15,7 @@
 #SBATCH --ntasks 1
 #SBATCH --cpus-per-task 4
 #SBATCH --mem 350G
-#SBATCH --time 72:00:00
+#SBATCH --time 30:00:00
 
 
 # export SINGULARITY_BINDPATH="/work,/scratch,/users"
@@ -25,4 +25,4 @@
 
 source /users/fquareng/.bashrc
 micromamba activate dl-torch
-micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_sr_unet.py
+micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_sr_unet.py --metric_loss_mode train

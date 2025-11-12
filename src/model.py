@@ -5,8 +5,8 @@ import torch.nn as nn
 class DoubleConv(nn.Module):
     """
     A block of two sequential 3x3 convolutions, each followed by
-    Batch Normalization and a LeakyReLU activation.
-    (CONV -> BN -> LeakyReLU) * 2
+    Batch Normalization and a Mish activation.
+    (CONV -> BN -> Mish) * 2
     """
 
     def __init__(self, in_channels, out_channels, mid_channels=None):
@@ -16,10 +16,10 @@ class DoubleConv(nn.Module):
         self.double_conv = nn.Sequential(
             nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(mid_channels),
-            nn.LeakyReLU(inplace=True),
+            nn.Mish(),
             nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
-            nn.LeakyReLU(inplace=True),
+            nn.Mish(),
         )
 
     def forward(self, x):
@@ -41,18 +41,18 @@ class UNetSR(nn.Module):
         # Encoder (Downsampling Path)
         self.inc = DoubleConv(in_channels, n_features_base)  # 128x128
         self.down1 = nn.Sequential(
-            nn.MaxPool2d(2), DoubleConv(n_features_base, n_features_base * 2)  # 64x64
+            nn.AvgPool2d(2), DoubleConv(n_features_base, n_features_base * 2)  # 64x64
         )
         self.down2 = nn.Sequential(
-            nn.MaxPool2d(2),
+            nn.AvgPool2d(2),
             DoubleConv(n_features_base * 2, n_features_base * 4),  # 32x32
         )
         self.down3 = nn.Sequential(
-            nn.MaxPool2d(2),
+            nn.AvgPool2d(2),
             DoubleConv(n_features_base * 4, n_features_base * 8),  # 16x16
         )
         self.down4 = nn.Sequential(
-            nn.MaxPool2d(2),
+            nn.AvgPool2d(2),
             DoubleConv(n_features_base * 8, n_features_base * 16),  # 8x8 (Bottleneck)
         )
 
@@ -89,7 +89,7 @@ class UNetSR(nn.Module):
         self.outc = nn.Conv2d(n_features_base, out_channels, kernel_size=1)
 
         # Final activation to enforce non-negativity *after* adding the residual
-        self.final_activation = nn.ReLU()
+        self.final_activation = nn.Mish()
 
     def forward(self, x):
         # x shape: (B, C_in, 128, 128)

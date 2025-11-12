@@ -34,13 +34,14 @@ BATCH_COMPOSITION:
   "normal": 0.33
   "extreme": 0.33
 
-# Training
-EXPERIMENT_NAME: "GammaEmulatorv2"
-CONSTRAINT_MODE: "hybrid"  # 'soft', 'hard', or 'hybrid'
+EXPERIMENT_NAME: "SR_UNet_Baseline"
+
+# Training Gamma emulator
+CONSTRAINT_MODE: "hybrid"  # 'soft', 'hard', 'hybrid', 'none'
 LOSS_LAMBDA: 0.25 # between 0 and 1 (Loss = lambda*zero_penalty + (1-lambda)*main_loss)
 WEIGHT_A: 1.0
 WEIGHT_P: 1.0
-WEIGHT_CC: 2.0 # This is the key parameter to tune
+WEIGHT_CC: 2.0
 LAMBDA_BOUND: 0.25 # Keep this soft constraint
 SUBSAMPLE_FRACTION: 1
 device: "cuda"
@@ -66,5 +67,12 @@ QUANTILE_LEVELS: [
 EMULATOR_CHECKPOINT_PATH: "/scratch/fquareng/experiment_runs/GammaEmulatorv2_2025-11-03_09-22-21/best_model_checkpoint.pth"
 
 # Training super resolution
-USE_SURROGATE_LOSS: true
-SURROGATE_LOSS_WEIGHT: 0.25 # Weight of the surrogate loss when USE_SURROGATE_LOSS is true (between 0 and 1)
+METRIC_LOSS_MODE: 'train'  # 'none', 'train', 'validate'
+METRIC_LOSS_TYPE: 'geometric'  # 'cdf', 'geometric'
+METRIC_WARMUP_EPOCHS: 15 # Number of epochs with no METRIC loss
+METRIC_RAMP_EPOCHS: 10 # Number of epochs to ramp up the METRIC loss
+METRIC_LOSS_WEIGHT: 0.75 # Weight of the METRIC loss when METRIC_LOSS_MODE is not 'none' (between 0 and 1)
+S_ESTIMATION_SAMPLES: 1000 # Number of samples to estimate METRIC loss
+
+# Evaluation
+EVAL_MODE: 'train'  # 'none', 'train', 'validate'
