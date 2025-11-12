@@ -69,7 +69,7 @@ EMULATOR_CHECKPOINT_PATH: "/scratch/fquareng/experiment_runs/GammaEmulatorv2_202
 # Training super resolution
 METRIC_LOSS_MODE: 'train'  # 'none', 'train', 'validate'
 METRIC_LOSS_TYPE: 'geometric'  # 'cdf', 'geometric'
-METRIC_WARMUP_EPOCHS: 15 # Number of epochs with no METRIC loss
+METRIC_WARMUP_EPOCHS: 10 # Number of epochs with no METRIC loss
 METRIC_RAMP_EPOCHS: 10 # Number of epochs to ramp up the METRIC loss
 METRIC_LOSS_WEIGHT: 0.75 # Weight of the METRIC loss when METRIC_LOSS_MODE is not 'none' (between 0 and 1)
 S_ESTIMATION_SAMPLES: 1000 # Number of samples to estimate METRIC loss

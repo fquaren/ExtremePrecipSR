@@ -11,13 +11,10 @@ import argparse
 import pandas as pd
 from sklearn.metrics import r2_score
 
-# --- Import from your local files ---
 from gamma_predictors import (
     GammaPredictorSeparateHeadsHard,
     GammaPredictorSeparateHeadsSoft,
 )
-
-# MODIFICATION: Import the new loss and helper
 from loss import (
     TotalErrorMetric,
     GeometricLossSeparate,
@@ -38,7 +35,6 @@ def _plot_single_gamma_comparison(
     sub_folder,
     output_dir,
 ):
-    # ... (Plotting function remains the same)
     pred_gamma = all_preds_phys[sample_idx]
     target_gamma = all_targets_phys[sample_idx]
     target_image = all_images[sample_idx]
@@ -134,19 +130,21 @@ def plot_gamma_performance_by_quantile(
                 group_name,
                 output_dir,
             )
+        # R2 calculation in this function seems to be for the *group*,
+        # let's keep it as is.
         r2_scores_in_group = []
         for idx in candidate_indices:
             pred_flat = predictions_phys[idx].flatten()
             target_flat = targets_gamma_phys[idx].flatten()
             mask = np.isfinite(pred_flat) & np.isfinite(target_flat)
-            if np.sum(mask) == 0:
-                r2_scores_in_group.append(-np.inf)
+            if np.sum(mask) < 2:
+                r2_scores_in_group.append(np.nan)
             else:
                 r2 = r2_score(target_flat[mask], pred_flat[mask])
                 r2_scores_in_group.append(r2)
         r2_scores_in_group = np.array(r2_scores_in_group)
-        mean_r2 = np.mean(r2_scores_in_group[r2_scores_in_group > -np.inf])
-        print(f"Mean R² Score for group '{group_name}': {mean_r2:.4f}")
+        mean_r2 = np.nanmean(r2_scores_in_group)
+        print(f"Mean Per-Sample R² Score for group '{group_name}': {mean_r2:.4f}")
 
 
 def plot_training_log(log_path, output_dir):
@@ -161,6 +159,15 @@ def plot_training_log(log_path, output_dir):
     except Exception as e:
         print(f"Error reading log file with pandas: {e}. Skipping plot.")
         return
+
+    # Check for main loss columns, handle if missing
+    if "train_loss_main" not in df.columns:
+        df["train_loss_main"] = (
+            df["train_loss_A"] + df["train_loss_P"] + df["train_loss_CC"]
+        )
+    if "val_loss_main" not in df.columns:
+        df["val_loss_main"] = df["val_loss_A"] + df["val_loss_P"] + df["val_loss_CC"]
+
     required_cols = [
         "epoch",
         "train_loss_total",
@@ -171,6 +178,8 @@ def plot_training_log(log_path, output_dir):
         "val_loss_A",
         "val_loss_P",
         "val_loss_CC",
+        "train_loss_main",
+        "val_loss_main",
         "train_penalty_zero",
         "train_penalty_mono",
         "train_penalty_plaus",
@@ -180,10 +189,12 @@ def plot_training_log(log_path, output_dir):
         "val_penalty_plaus",
         "val_penalty_bound",
     ]
+
     if not all(col in df.columns for col in required_cols):
         print("Warning: Log file columns mismatch. Skipping training history plot.")
         print(f"Missing: {[c for c in required_cols if c not in df.columns]}")
         return
+
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 18), sharex=True)
     fig.suptitle("Training History", fontsize=16)
     ax1.plot(df["epoch"], df["train_loss_total"], "o-", label="Train Total", color="C0")
@@ -313,6 +324,181 @@ def plot_training_log(log_path, output_dir):
     print(f"Saved training history plot to: {save_path}")
 
 
+def plot_metric_distributions(
+    total_losses,
+    geom_losses,
+    r2_A,
+    r2_P,
+    r2_CC,
+    output_dir,
+):
+    """Generates box plots for the distributions of key evaluation metrics."""
+    print("\nGenerating metric distribution box plots...")
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle("Evaluation Metric Distributions (Test Set)", fontsize=16, y=1.02)
+
+    # Filter NaNs
+    valid_total_losses = total_losses[np.isfinite(total_losses)]
+    valid_geom_losses = geom_losses[np.isfinite(geom_losses)]
+    valid_r2_A = r2_A[np.isfinite(r2_A)]
+    valid_r2_P = r2_P[np.isfinite(r2_P)]
+    valid_r2_CC = r2_CC[np.isfinite(r2_CC)]
+    medianprops = dict(color="red", linewidth=1.5)
+
+    # Plot 1: Total Loss
+    ax1.boxplot(
+        valid_total_losses,
+        vert=True,
+        patch_artist=True,
+        labels=["Total Loss"],
+        medianprops=medianprops,
+    )
+    ax1.set_title(f"Total Loss (Config) \nMean: {np.mean(valid_total_losses):.4f}")
+    ax1.set_ylabel("Loss Value")
+    ax1.grid(True, linestyle="--", alpha=0.6)
+    ax1.set_yscale("log")
+
+    # Plot 2: Geometric Loss
+    ax2.boxplot(
+        valid_geom_losses,
+        vert=True,
+        patch_artist=True,
+        labels=["Geometric Loss"],
+        medianprops=medianprops,
+    )
+    ax2.set_title(
+        f"Geometric (Mahalanobis) Loss \nMean: {np.mean(valid_geom_losses):.4f}"
+    )
+    ax2.set_ylabel("Loss Value")
+    ax2.grid(True, linestyle="--", alpha=0.6)
+    ax2.set_yscale("log")
+
+    # Plot 3: R^2 Score (per component)
+    data_to_plot = [valid_r2_A, valid_r2_P, valid_r2_CC]
+    labels = [
+        f"Area (Mean: {np.mean(valid_r2_A):.3f})",
+        f"Perim. (Mean: {np.mean(valid_r2_P):.3f})",
+        f"CC (Mean: {np.mean(valid_r2_CC):.3f})",
+    ]
+    ax3.boxplot(
+        data_to_plot,
+        vert=True,
+        patch_artist=True,
+        labels=labels,
+        medianprops=medianprops,
+    )
+    ax3.set_title("Per-Sample R² Score by Component")
+    ax3.set_ylabel("R² Value")
+    ax3.set_ylim(-1.05, 1.05)  # R2 can be negative
+    ax3.axhline(0, color="black", linestyle="--", linewidth=0.8)
+    ax3.grid(True, linestyle="--", alpha=0.6)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    save_path = os.path.join(output_dir, "evaluation_metric_distributions.png")
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved metric distribution plots to: {save_path}")
+
+
+def plot_gamma_mean_std_by_quantile(
+    predictions_phys,
+    targets_gamma_phys,
+    target_images,
+    quantiles,
+    output_dir,
+):
+    """Plots the mean and std dev of Gamma functions, grouped by precipitation."""
+    print("\nGenerating plots for mean/std performance by precip group...")
+    all_means = np.mean(target_images, axis=(1, 2))
+    sorted_indices_by_mean = np.argsort(all_means)
+    n_total = len(target_images)
+
+    # Define groups
+    quantile_groups = {
+        "Low_Precip (0-33%)": sorted_indices_by_mean[: int(n_total * 0.33)],
+        "Mid_Precip (33-67%)": sorted_indices_by_mean[
+            int(n_total * 0.33) : int(n_total * 0.67)
+        ],
+        "High_Precip (67-100%)": sorted_indices_by_mean[int(n_total * 0.67) :],
+        "All_Samples (0-100%)": sorted_indices_by_mean,  # Add an overall plot
+    }
+
+    gamma_types = ["Area (km²)", "Perimeter (km)", "CCs"]
+    plot_save_dir = os.path.join(output_dir, "evaluation_plots", "mean_std_groups")
+    os.makedirs(plot_save_dir, exist_ok=True)
+
+    for group_name, indices in quantile_groups.items():
+        print(f"--- Processing Group: {group_name} ---")
+        if len(indices) == 0:
+            print("Skipping group, no samples.")
+            continue
+
+        group_preds = predictions_phys[indices]
+        group_targets = targets_gamma_phys[indices]
+
+        # Calculate statistics, ignoring NaNs
+        mean_preds = np.nanmean(group_preds, axis=0)
+        std_preds = np.nanstd(group_preds, axis=0)
+        mean_targets = np.nanmean(group_targets, axis=0)
+        std_targets = np.nanstd(group_targets, axis=0)
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=False)
+
+        for j in range(3):  # Loop over A, P, CC
+            ax = axes[j]
+
+            # Plot Target
+            ax.plot(
+                quantiles, mean_targets[j], "o-", label="Target Mean", color="royalblue"
+            )
+            ax.fill_between(
+                quantiles,
+                mean_targets[j] - std_targets[j],
+                mean_targets[j] + std_targets[j],
+                color="royalblue",
+                alpha=0.2,
+                label="Target ±1σ",
+            )
+
+            # Plot Prediction
+            ax.plot(quantiles, mean_preds[j], "x--", label="Pred. Mean", color="salmon")
+            ax.fill_between(
+                quantiles,
+                mean_preds[j] - std_preds[j],
+                mean_preds[j] + std_preds[j],
+                color="salmon",
+                alpha=0.2,
+                label="Pred. ±1σ",
+            )
+
+            ax.set_title(gamma_types[j])
+            ax.set_xlabel("Precip. Threshold (mm/hr)")
+            ax.grid(True, linestyle="--", alpha=0.6)
+            if j == 0:
+                ax.legend()
+                ax.set_ylabel("Value")
+
+            # Use log scale for A and P if their mean is large
+            if j < 2 and np.nanmax(mean_targets[j]) > 100:
+                ax.set_yscale("log")
+
+        fig.suptitle(
+            f"Mean Gamma Function Comparison (±1 Std. Dev.)\nGroup: {group_name} (N={len(indices)})",
+            fontsize=16,
+            y=1.05,
+        )
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+        save_path = os.path.join(
+            plot_save_dir,
+            f"mean_std_gamma_group_{group_name.split(' ')[0].lower()}.png",
+        )
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+
+    print(f"Saved mean/std plots to: {plot_save_dir}")
+
+
 # --- Save_metrics function ---
 def save_metrics_to_file(output_dir, metrics_dict):
     """Saves the key evaluation metrics to a text file."""
@@ -325,15 +511,25 @@ def save_metrics_to_file(output_dir, metrics_dict):
             f.write(
                 f"Mean Total Evaluation Loss (from config): {metrics_dict['mean_total_loss']:.6f}\n"
             )
-            # Add the new metric
             f.write(
                 f"Mean Geometric (Mahalanobis) Loss:      {metrics_dict['mean_geometric_loss']:.6f}\n"
             )
 
-            f.write("\n--- Average Gamma R^2 Scores ---\n")
+            f.write("\n--- Average R^2 Scores (per-feature, over all samples) ---\n")
             f.write(f"Average Gamma R^2 - Area:      {metrics_dict['avg_r2_A']:.4f}\n")
             f.write(f"Average Gamma R^2 - Perimeter: {metrics_dict['avg_r2_P']:.4f}\n")
             f.write(f"Average Gamma R^2 - CC:        {metrics_dict['avg_r2_CC']:.4f}\n")
+
+            f.write("\n--- Mean Per-Sample R^2 Scores (averaged over samples) ---\n")
+            f.write(
+                f"Mean Per-Sample R^2 - Area:      {metrics_dict['mean_per_sample_r2_A']:.4f}\n"
+            )
+            f.write(
+                f"Mean Per-Sample R^2 - Perimeter: {metrics_dict['mean_per_sample_r2_P']:.4f}\n"
+            )
+            f.write(
+                f"Mean Per-Sample R^2 - CC:        {metrics_dict['mean_per_sample_r2_CC']:.4f}\n"
+            )
 
         print("Metrics saved successfully.")
     except IOError as e:
@@ -350,6 +546,12 @@ if __name__ == "__main__":
         type=str,
         required=True,
         help="Path to the timestamped experiment run directory.",
+    )
+    parser.add_argument(
+        "--constraint_mode",
+        type=str,
+        required=False,
+        help="Constraint mode to use (none, soft, hybrid, hard).",
     )
     args = parser.parse_args()
 
@@ -368,8 +570,11 @@ if __name__ == "__main__":
     TEST_METADATA_FILE = config["TEST_METADATA_FILE"]
     BATCH_SIZE = config.get("BATCH_SIZE", 32)
     PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 1.0)
-    CONSTRAINT_MODE = config.get("CONSTRAINT_MODE", "hybrid")
-    # MODIFICATION: Need S_ESTIMATION_SAMPLES and TRAIN_METADATA_FILE
+    if args.constraint_mode:
+        CONSTRAINT_MODE = args.constraint_mode
+        print(f"Overriding constraint mode to: {CONSTRAINT_MODE}")
+    else:
+        CONSTRAINT_MODE = config.get("CONSTRAINT_MODE", "hybrid")
     S_ESTIMATION_SAMPLES = config.get("S_ESTIMATION_SAMPLES", 1000)
     TRAIN_METADATA_FILE = config["TRAIN_METADATA_FILE"]
 
@@ -384,7 +589,7 @@ if __name__ == "__main__":
             input_shape=INPUT_SHAPE, n_quantiles=N_QUANTILES, activation_fn=nn.Mish()
         ).to(device)
     elif CONSTRAINT_MODE == "hybrid" or CONSTRAINT_MODE == "hard":
-        print("Using HYBRID constraints model (GammaPredictorSeparateHeadsHybrid).")
+        print("Using HYBRID constraints model (GammaPredictorSeparateHeadsHard).")
         model = GammaPredictorSeparateHeadsHard(
             input_shape=INPUT_SHAPE,
             n_quantiles=N_QUANTILES,
@@ -431,12 +636,24 @@ if __name__ == "__main__":
         augment=False,  # No augment needed for this
     )
     S_inv_tensors = estimate_s_inv_from_dataset(
-        train_dataset_for_s_inv, S_ESTIMATION_SAMPLES, device, N_QUANTILES
+        train_dataset_for_s_inv, S_ESTIMATION_SAMPLES, device
     )
-    geometric_metric = GeometricLossSeparate(S_inv_tensors).to(device)
+
+    print(
+        "Note: Assuming 'GeometricLossSeparate' accepts 'reduction' argument ('mean' or 'none')."
+    )
+    # Original metric for mean batch loss
+    geometric_metric_mean = GeometricLossSeparate(S_inv_tensors, reduction="mean").to(
+        device
+    )
+    # New metric for per-sample loss
+    geometric_metric_none = GeometricLossSeparate(S_inv_tensors, reduction="none").to(
+        device
+    )
 
     all_preds_phys, all_targets_phys = [], []
     all_original_images, all_total_losses = [], []
+    all_geom_losses = []  # for per-sample geometric loss
     total_geometric_loss = 0.0
 
     with torch.no_grad():
@@ -456,12 +673,18 @@ if __name__ == "__main__":
                 input_data, predicted_gamma_phys, log_target_gamma
             )
 
-            # --- Calculate geometric loss for the batch ---
-            # This metric returns a scalar (mean loss for the batch)
-            loss_geom_batch = geometric_metric(predicted_gamma_phys, target_gamma_phys)
-            total_geometric_loss += (
-                loss_geom_batch.item() * input_data.shape[0]
-            )  # Accumulate total sum
+            # --- Calculate geometric loss for the batch (MODIFIED) ---
+            # Calculate mean geometric loss for the batch (original)
+            loss_geom_batch = geometric_metric_mean(
+                predicted_gamma_phys, target_gamma_phys
+            )
+            total_geometric_loss += loss_geom_batch.item() * input_data.shape[0]
+
+            # Calculate per-sample geometric loss (new)
+            per_sample_geom_losses = geometric_metric_none(
+                predicted_gamma_phys, target_gamma_phys
+            )
+            all_geom_losses.append(per_sample_geom_losses.cpu().numpy())
 
             all_total_losses.append(per_sample_losses.cpu().numpy())
             all_preds_phys.append(predicted_gamma_phys.cpu().numpy())
@@ -473,16 +696,23 @@ if __name__ == "__main__":
     all_targets_phys = np.concatenate(all_targets_phys, axis=0)
     all_original_images = np.concatenate(all_original_images, axis=0)
     all_total_losses = np.concatenate(all_total_losses, axis=0)
+    all_geom_losses = np.concatenate(all_geom_losses, axis=0)
 
-    mean_total_loss = np.mean(all_total_losses)
-    mean_geometric_loss = total_geometric_loss / len(test_dataset)
+    mean_total_loss = np.nanmean(all_total_losses)
+    mean_geometric_loss = np.nanmean(all_geom_losses)  # Use per-sample mean
+
+    # Sanity check: ensure the manually accumulated mean is close
+    mean_geometric_loss_accum = total_geometric_loss / len(test_dataset)
+    print(f"Mean Geometric (Mahalanobis) Loss (per-sample): {mean_geometric_loss:.6f}")
+    print(
+        f"Mean Geometric (Mahalanobis) Loss (accum):    {mean_geometric_loss_accum:.6f}"
+    )
 
     print(f"Generated predictions and losses for {all_preds_phys.shape[0]} samples.")
-    print(f"Mean Total Evaluation Loss (from config): {mean_total_loss:.4f}")
-    print(f"Mean Geometric (Mahalanobis) Loss:    {mean_geometric_loss:.4f}")
+    print(f"Mean Total Evaluation Loss (from config): {mean_total_loss:.6f}")
 
-    # Calculate and print R^2 scores
-    print("\nCalculating R^2 scores (coefficient of determination)...")
+    # --- Calculate per-feature R^2 scores (Original) ---
+    print("\nCalculating R^2 scores (per-feature, over all samples)...")
     n_samples = all_preds_phys.shape[0]
     n_features = 3 * N_QUANTILES
     preds_flat = all_preds_phys.reshape(n_samples, n_features)
@@ -490,6 +720,7 @@ if __name__ == "__main__":
     mask = np.isfinite(targets_flat).all(axis=1) & np.isfinite(preds_flat).all(axis=1)
     if not np.all(mask):
         print(f"Warning: Filtering {np.sum(~mask)} samples with NaNs/Infs.")
+
     r2_scores_raw = r2_score(
         targets_flat[mask], preds_flat[mask], multioutput="raw_values"
     )
@@ -500,19 +731,77 @@ if __name__ == "__main__":
     print(f"Average R^2 Score - Area:      {avg_r2_A:.4f}")
     print(f"Average R^2 Score - Perimeter: {avg_r2_P:.4f}")
     print(f"Average R^2 Score - CC:        {avg_r2_CC:.4f}")
-    r2_save_path = os.path.join(args.run_dir, "r2_scores.npz")
+    r2_save_path = os.path.join(args.run_dir, "r2_scores_per_feature.npz")
     np.savez_compressed(
         r2_save_path, r2_matrix=r2_scores_matrix, quantiles=QUANTILE_LEVELS
     )
-    print(f"Detailed R^2 scores saved to: {r2_save_path}")
+    print(f"Detailed per-feature R^2 scores saved to: {r2_save_path}")
+
+    # --- Calculate per-sample R^2 scores ---
+    print("\nCalculating per-sample R^2 scores (by component)...")
+    all_r2_A, all_r2_P, all_r2_CC = [], [], []
+    for i in range(n_samples):
+        # Shape is (3, N_QUANTILES)
+        pred_sample = all_preds_phys[i]
+        target_sample = all_targets_phys[i]
+
+        # R2 for Area (component 0)
+        mask_A = np.isfinite(pred_sample[0]) & np.isfinite(target_sample[0])
+        if np.sum(mask_A) < 2:
+            all_r2_A.append(np.nan)
+        else:
+            all_r2_A.append(r2_score(target_sample[0][mask_A], pred_sample[0][mask_A]))
+
+        # R2 for Perimeter (component 1)
+        mask_P = np.isfinite(pred_sample[1]) & np.isfinite(target_sample[1])
+        if np.sum(mask_P) < 2:
+            all_r2_P.append(np.nan)
+        else:
+            all_r2_P.append(r2_score(target_sample[1][mask_P], pred_sample[1][mask_P]))
+
+        # R2 for CC (component 2)
+        mask_CC = np.isfinite(pred_sample[2]) & np.isfinite(target_sample[2])
+        if np.sum(mask_CC) < 2:
+            all_r2_CC.append(np.nan)
+        else:
+            all_r2_CC.append(
+                r2_score(target_sample[2][mask_CC], pred_sample[2][mask_CC])
+            )
+
+    all_r2_A = np.array(all_r2_A)
+    all_r2_P = np.array(all_r2_P)
+    all_r2_CC = np.array(all_r2_CC)
+    mean_per_sample_r2_A = np.nanmean(all_r2_A)
+    mean_per_sample_r2_P = np.nanmean(all_r2_P)
+    mean_per_sample_r2_CC = np.nanmean(all_r2_CC)
+    print(f"Mean Per-Sample R^2 - Area:      {mean_per_sample_r2_A:.4f}")
+    print(f"Mean Per-Sample R^2 - Perimeter: {mean_per_sample_r2_P:.4f}")
+    print(f"Mean Per-Sample R^2 - CC:        {mean_per_sample_r2_CC:.4f}")
+
+    # --- Save full metrics to NPZ ---
+    full_metrics_save_path = os.path.join(args.run_dir, "full_evaluation_metrics.npz")
+    print(f"\nSaving full metrics arrays to: {full_metrics_save_path}")
+    np.savez_compressed(
+        full_metrics_save_path,
+        total_losses=all_total_losses,
+        geometric_losses=all_geom_losses,
+        r2_per_sample_Area=all_r2_A,
+        r2_per_sample_Perimeter=all_r2_P,
+        r2_per_sample_CC=all_r2_CC,
+        r2_matrix_per_feature=r2_scores_matrix,
+        quantiles=QUANTILE_LEVELS,
+    )
 
     # --- Collect metrics and save to file ---
     metrics_to_save = {
         "mean_total_loss": mean_total_loss,
-        "mean_geometric_loss": mean_geometric_loss,  # Add new metric
+        "mean_geometric_loss": mean_geometric_loss,
         "avg_r2_A": avg_r2_A,
         "avg_r2_P": avg_r2_P,
         "avg_r2_CC": avg_r2_CC,
+        "mean_per_sample_r2_A": mean_per_sample_r2_A,
+        "mean_per_sample_r2_P": mean_per_sample_r2_P,
+        "mean_per_sample_r2_CC": mean_per_sample_r2_CC,
     }
     save_metrics_to_file(args.run_dir, metrics_to_save)
 
@@ -527,6 +816,24 @@ if __name__ == "__main__":
         n_samples=15,
     )
 
+    plot_metric_distributions(
+        total_losses=all_total_losses,
+        geom_losses=all_geom_losses,
+        r2_A=all_r2_A,
+        r2_P=all_r2_P,
+        r2_CC=all_r2_CC,
+        output_dir=args.run_dir,
+    )
+
+    plot_gamma_mean_std_by_quantile(
+        predictions_phys=all_preds_phys,
+        targets_gamma_phys=all_targets_phys,
+        target_images=all_original_images,
+        quantiles=QUANTILE_LEVELS,
+        output_dir=args.run_dir,
+    )
+
+    # --- Original Training Log Plot ---
     log_file_path = os.path.join(args.run_dir, "training_log.csv")
     plot_training_log(log_file_path, args.run_dir)
 
