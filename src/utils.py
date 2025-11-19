@@ -24,11 +24,11 @@ N_QUANTILES = len(QUANTILE_LEVELS)
 PATCH_SIZE = config["PATCH_SIZE"]
 PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 1.0)
 
-ARCHITECTURE = config.get("ARCHITECTURE", "CNN")
-if ARCHITECTURE == "CNN":
+ARCHITECTURE = config.get("ARCHITECTURE", "Vanilla")
+if ARCHITECTURE == "Vanilla":
     HARD_EMULATOR = GammaPredictorSeparateHeadsHard
     SOFT_EMULATOR = GammaPredictorSeparateHeadsSoft
-elif ARCHITECTURE == "RESNET":
+elif ARCHITECTURE == "Attention":
     HARD_EMULATOR = GammaPredictorResNetHardHierarchical
     SOFT_EMULATOR = GammaPredictorResNetSoftHierarchical
 

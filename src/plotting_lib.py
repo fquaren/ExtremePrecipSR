@@ -21,7 +21,7 @@ def _plot_single_gamma_comparison(
 
     'sample_row' is a row from metrics_df, containing columns:
     'pred_gamma', 'target_gamma', 'target_image', 'total_loss',
-    'geom_loss', 'r2_A', 'r2_P', 'r2_CC', 'mean_precip',
+    'geom_loss', 'R2_A', 'R2_P', 'R2_CC', 'mean_precip',
     and its name is the 'sample_idx'.
     """
 
@@ -35,9 +35,9 @@ def _plot_single_gamma_comparison(
     # Extract metrics
     loss = sample_row["total_loss"]
     geom_loss = sample_row["geom_loss"]
-    r2_A = sample_row["r2_A"]
-    r2_P = sample_row["r2_P"]
-    r2_CC = sample_row["r2_CC"]
+    R2_A = sample_row["R2_A"]
+    R2_P = sample_row["R2_P"]
+    R2_CC = sample_row["R2_CC"]
 
     # --- Create Plot ---
     gamma_types = ["Area (km²)", "Perimeter (km)", "CCs"]
@@ -72,7 +72,7 @@ def _plot_single_gamma_comparison(
     # Create a second line for all the metrics
     metrics_str = (
         f"Total Loss: {loss:.4f} | Geom. Loss: {geom_loss:.4f} | "
-        f"R² (A/P/CC): {r2_A:.3f} / {r2_P:.3f} / {r2_CC:.3f}"
+        f"R² (A/P/CC): {R2_A:.3f} / {R2_P:.3f} / {R2_CC:.3f}"
     )
 
     fig.suptitle(
@@ -179,9 +179,9 @@ def plot_metric_distributions(
     # Filter NaNs from the DataFrame columns
     valid_total_losses = metrics_df["total_loss"].dropna()
     valid_geom_losses = metrics_df["geom_loss"].dropna()
-    valid_r2_A = metrics_df["r2_A"].dropna()
-    valid_r2_P = metrics_df["r2_P"].dropna()
-    valid_r2_CC = metrics_df["r2_CC"].dropna()
+    valid_R2_A = metrics_df["R2_A"].dropna()
+    valid_R2_P = metrics_df["R2_P"].dropna()
+    valid_R2_CC = metrics_df["R2_CC"].dropna()
 
     medianprops = dict(color="red", linewidth=1.5)
 
@@ -216,11 +216,11 @@ def plot_metric_distributions(
         ax2.set_yscale("log")
 
     # Plot 3: R^2 Score (per component)
-    data_to_plot = [valid_r2_A, valid_r2_P, valid_r2_CC]
+    data_to_plot = [valid_R2_A, valid_R2_P, valid_R2_CC]
     labels = [
-        f"Area (Mean: {valid_r2_A.mean():.3f})",
-        f"Perim. (Mean: {valid_r2_P.mean():.3f})",
-        f"CC (Mean: {valid_r2_CC.mean():.3f})",
+        f"Area (Mean: {valid_R2_A.mean():.3f})",
+        f"Perim. (Mean: {valid_R2_P.mean():.3f})",
+        f"CC (Mean: {valid_R2_CC.mean():.3f})",
     ]
     ax3.boxplot(
         data_to_plot,
@@ -301,7 +301,7 @@ def plot_gamma_mean_std_by_quantile(
         # --- Use pre-computed metrics for title ---
         metric_str = (
             f"Mean Total Loss: {metrics['total_loss']:.4f} | "
-            f"Mean R² (A/P/CC): {metrics['r2_A']:.3f} / {metrics['r2_P']:.3f} / {metrics['r2_CC']:.3f}"
+            f"Mean R² (A/P/CC): {metrics['R2_A']:.3f} / {metrics['R2_P']:.3f} / {metrics['R2_CC']:.3f}"
         )
 
         fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=False)

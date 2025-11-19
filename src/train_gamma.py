@@ -18,8 +18,8 @@ from dataset import PreprocessedNpzDataset, StratifiedBatchSampler
 from gamma_predictors import (
     GammaPredictorSeparateHeadsSoft,
     GammaPredictorSeparateHeadsHard,
-    GammaPredictorResNetSoftHierarchical,
-    GammaPredictorResNetHardHierarchical,
+    GammaPredictorHierarchicalSoftGated,
+    GammaPredictorHierarchicalHardGated,
 )
 
 
@@ -61,13 +61,13 @@ WEIGHT_P = config.get("WEIGHT_P", 1.0)
 WEIGHT_CC = config.get("WEIGHT_CC", 1.0)
 LAMBDA_BOUND = config.get("LAMBDA_BOUND", 0.1)
 
-ARCHITECTURE = config.get("ARCHITECTURE", "CNN")
-if ARCHITECTURE == "CNN":
+ARCHITECTURE = config.get("ARCHITECTURE", "Vanilla")
+if ARCHITECTURE == "Vanilla":
     HARD_EMULATOR = GammaPredictorSeparateHeadsHard
     SOFT_EMULATOR = GammaPredictorSeparateHeadsSoft
-elif ARCHITECTURE == "RESNET":
-    HARD_EMULATOR = GammaPredictorResNetHardHierarchical
-    SOFT_EMULATOR = GammaPredictorResNetSoftHierarchical
+elif ARCHITECTURE == "Attention":
+    HARD_EMULATOR = GammaPredictorHierarchicalHardGated
+    SOFT_EMULATOR = GammaPredictorHierarchicalSoftGated
 
 
 def main():
@@ -186,19 +186,15 @@ def main():
     # Model selection now includes 'none'
     if CONSTRAINT_MODE == "soft" or CONSTRAINT_MODE == "none":
         if CONSTRAINT_MODE == "soft":
-            print(
-                "Using SOFT constraints model (GammaPredictorSeparateHeadsSoft) with soft penalties."
-            )
+            print("Using SOFT constraints model with soft penalties.")
         else:
-            print(
-                "Using NO constraints model (GammaPredictorSeparateHeadsSoft) with main loss only."
-            )
+            print("Using NO constraints model with main loss only.")
         model = SOFT_EMULATOR(
             input_shape=INPUT_SHAPE, n_quantiles=N_QUANTILES, activation_fn=nn.Mish()
         ).to(device)
 
     elif CONSTRAINT_MODE == "hybrid" or CONSTRAINT_MODE == "hard":
-        print("Using HYBRID constraints model (GammaPredictorResNetHardHierarchical).")
+        print("Using HYBRID constraints model.")
         model = HARD_EMULATOR(
             input_shape=INPUT_SHAPE,
             n_quantiles=N_QUANTILES,

@@ -100,7 +100,6 @@ def compute_gamma_matrix_for_image_optimized(
 
         # --- If Production: Compute Euler Characteristic (Gamma Component 3) ---
         if run_mode == "production":
-            # ... (Logic identical to your original script) ...
             pers_thresh_mask = is_significant[:, np.newaxis]
             births_broadcast = births[:, np.newaxis]
             deaths_broadcast = deaths[:, np.newaxis]

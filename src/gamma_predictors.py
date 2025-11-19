@@ -2,7 +2,6 @@ import yaml
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.models as models  # Required for ResNet
 import numpy as np
 import math
 
@@ -40,7 +39,7 @@ class InputNormalization(nn.Module):
         return x / (self.scale_factor + 1e-8)
 
 
-class GammaPredictorResNetHardHierarchical(nn.Module):
+class GammaPredictorHierarchicalHardGated(nn.Module):
     def __init__(
         self,
         input_shape,
@@ -48,9 +47,9 @@ class GammaPredictorResNetHardHierarchical(nn.Module):
         activation_fn=F.gelu,
         quantile_levels=[0.0],
         pixel_area_km2=1.0,
-        max_precip_value=150.0,  # Physical Normalization Constant
+        max_precip_value=150.0,
     ):
-        super(GammaPredictorResNetHardHierarchical, self).__init__()
+        super(GammaPredictorHierarchicalHardGated, self).__init__()
         self.n_quantiles = n_quantiles
         self.activation = activation_fn
         self.register_buffer(
@@ -61,77 +60,84 @@ class GammaPredictorResNetHardHierarchical(nn.Module):
         # --- 1. Internal Normalizer ---
         self.normalizer = InputNormalization(max_precip_value)
 
-        # --- ResNet-18 Trunk ---
-        resnet = models.resnet18(weights=None)
-        resnet.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.fc_input_size = 512
-        resnet.fc = nn.Identity()
-        self.resnet_trunk = resnet
+        # --- 2. CNN Trunk ---
+        self.conv1 = nn.Conv2d(1, 16, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(32)
+        self.conv3 = nn.Conv2d(32, 64, 3, padding=1)
+        self.bn3 = nn.BatchNorm2d(64)
+        self.pool = nn.AvgPool2d(2, 2)
 
-        # --- Hierarchical Regression Heads ---
-        self.head_A = nn.Sequential(
-            nn.Linear(self.fc_input_size, 256),
-            self.activation,
-            nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            self.activation,
-            nn.Dropout(0.3),
-            nn.Linear(128, self.n_quantiles),
-        )
-        self.head_P = nn.Sequential(
-            nn.Linear(self.fc_input_size + self.n_quantiles, 256),
-            self.activation,
-            nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            self.activation,
-            nn.Dropout(0.3),
-            nn.Linear(128, self.n_quantiles),
-        )
-        self.head_CC = nn.Sequential(
-            nn.Linear(self.fc_input_size + 2 * self.n_quantiles, 256),
-            self.activation,
-            nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            self.activation,
-            nn.Dropout(0.3),
-            nn.Linear(128, self.n_quantiles),
-        )
+        self.fc_input_size = self._get_conv_output_size(input_shape)
 
-    def _forward_resnet_trunk(self, x):
-        x = self.resnet_trunk.conv1(x)
-        x = self.resnet_trunk.bn1(x)
-        x = self.resnet_trunk.relu(x)
-        x = self.resnet_trunk.maxpool(x)
-        x = self.resnet_trunk.layer1(x)
-        x = self.resnet_trunk.layer2(x)
-        x = self.resnet_trunk.layer3(x)
-        x = self.resnet_trunk.layer4(x)
-        x = self.resnet_trunk.avgpool(x)
+        # --- 3. Gated Interaction Heads ---
+
+        # Shared latent representation
+        self.shared_fc = nn.Linear(self.fc_input_size, 256)
+
+        # Branch A (Independent)
+        self.fc_A = nn.Linear(256, 128)
+        self.out_A = nn.Linear(128, self.n_quantiles)
+
+        # Branch P (Dependent on A)
+        self.fc_P = nn.Linear(256, 128)
+        self.gate_A_to_P = nn.Linear(128, 128)  # Learns how A modifies P
+        self.out_P = nn.Linear(128, self.n_quantiles)
+
+        # Branch CC (Dependent on P)
+        self.fc_CC = nn.Linear(256, 128)
+        self.gate_P_to_CC = nn.Linear(128, 128)  # Learns how P modifies CC
+        self.out_CC = nn.Linear(128, self.n_quantiles)
+
+        self.dropout = nn.Dropout(0.3)
+
+    def _get_conv_output_size(self, shape):
+        with torch.no_grad():
+            input_tensor = torch.rand(1, *shape)
+            output = self._forward_conv(input_tensor)
+            return int(np.prod(output.size()[1:]))
+
+    def _forward_conv(self, x):
+        x = self.pool(self.activation(self.bn1(self.conv1(x))))
+        x = self.pool(self.activation(self.bn2(self.conv2(x))))
+        x = self.pool(self.activation(self.bn3(self.conv3(x))))
         return x
 
     def forward(self, x_phys):
-        """
-        x_phys: Input tensor in PHYSICAL units (mm/hr).
-        """
         epsilon = 1e-6
 
-        # --- A. Normalize for Neural Network Stability ---
-        x_norm = self.normalizer(x_phys)  # [0, 1] range
+        # --- A. Backbone ---
+        x_norm = self.normalizer(x_phys)
+        x_conv = self._forward_conv(x_norm)
+        x_flat = torch.flatten(x_conv, 1)
 
-        # --- B. Forward pass (Using Normalized Data) ---
-        x_pooled = self._forward_resnet_trunk(x_norm)
-        x_flat = torch.flatten(x_pooled, 1)
+        # Shared dense layer
+        shared = self.activation(self.shared_fc(x_flat))
+        shared = self.dropout(shared)
 
-        raw_A_logits = self.head_A(x_flat)
-        x_flat_A = torch.cat([x_flat, raw_A_logits.detach()], dim=1)
-        raw_P_logits = self.head_P(x_flat_A)
-        x_flat_A_P = torch.cat(
-            [x_flat, raw_A_logits.detach(), raw_P_logits.detach()], dim=1
-        )
-        raw_CC_logits = self.head_CC(x_flat_A_P)
+        # --- B. Gated Forward Pass ---
 
-        # --- C. Constraints (Using PHYSICAL Data) ---
-        # We use x_phys because 'threshold' and 'epsilon' are physical values
+        # 1. Path A
+        feat_A = self.activation(self.fc_A(shared))
+        raw_A_logits = self.out_A(self.dropout(feat_A))
+
+        # 2. Path P (Gated by A)
+        feat_P_raw = self.activation(self.fc_P(shared))
+        # Gate: sigmoidal map from A's features [0, 1]
+        gate_A = torch.sigmoid(self.gate_A_to_P(feat_A))
+        # Apply Gate: Element-wise multiplication (Attention)
+        feat_P_gated = feat_P_raw * gate_A
+        raw_P_logits = self.out_P(self.dropout(feat_P_gated))
+
+        # 3. Path CC (Gated by P)
+        feat_CC_raw = self.activation(self.fc_CC(shared))
+        # Gate: sigmoidal map from P's *gated* features
+        gate_P = torch.sigmoid(self.gate_P_to_CC(feat_P_gated))
+        feat_CC_gated = feat_CC_raw * gate_P
+        raw_CC_logits = self.out_CC(self.dropout(feat_CC_gated))
+
+        # --- C. Constraints (Same as before) ---
         with torch.no_grad():
             threshold = self.quantile_levels_tensor[0]
             mask = torch.nan_to_num(x_phys, nan=-1.0) >= threshold
@@ -154,16 +160,14 @@ class GammaPredictorResNetHardHierarchical(nn.Module):
 
         constrained_output = torch.stack([pred_A, pred_P, pred_CC], dim=1)
 
-        # Zero Constraint on Physical Input
         with torch.no_grad():
             is_dry_mask = x_phys.sum(dim=(1, 2, 3)) <= epsilon
             wet_factor = (~is_dry_mask).float().view(-1, 1, 1)
 
-        final_output = constrained_output * wet_factor
-        return final_output
+        return constrained_output * wet_factor
 
 
-class GammaPredictorResNetSoftHierarchical(nn.Module):
+class GammaPredictorHierarchicalSoftGated(nn.Module):
     def __init__(
         self,
         input_shape=(1, 128, 128),
@@ -171,73 +175,74 @@ class GammaPredictorResNetSoftHierarchical(nn.Module):
         activation_fn=F.gelu,
         max_precip_value=150.0,
     ):
-        super(GammaPredictorResNetSoftHierarchical, self).__init__()
+        super(GammaPredictorHierarchicalSoftGated, self).__init__()
         self.n_quantiles = n_quantiles
         self.activation = activation_fn
 
-        # --- 1. Internal Normalizer ---
         self.normalizer = InputNormalization(max_precip_value)
 
-        # --- ResNet Trunk ---
-        resnet = models.resnet18(weights=None)
-        resnet.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.fc_input_size = 512
-        resnet.fc = nn.Identity()
-        self.resnet_trunk = resnet
+        # CNN Trunk
+        self.conv1 = nn.Conv2d(1, 16, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(32)
+        self.conv3 = nn.Conv2d(32, 64, 3, padding=1)
+        self.bn3 = nn.BatchNorm2d(64)
+        self.pool = nn.AvgPool2d(2, 2)
 
-        # --- Hierarchical Regression Heads ---
-        self.head_A = nn.Sequential(
-            nn.Linear(self.fc_input_size, 256),
-            self.activation,
-            nn.Dropout(0.5),
-            nn.Linear(256, 128),
-            self.activation,
-            nn.Dropout(0.5),
-            nn.Linear(128, self.n_quantiles),
-        )
-        self.head_P = nn.Sequential(
-            nn.Linear(self.fc_input_size + self.n_quantiles, 256),
-            self.activation,
-            nn.Dropout(0.5),
-            nn.Linear(256, 128),
-            self.activation,
-            nn.Dropout(0.5),
-            nn.Linear(128, self.n_quantiles),
-        )
-        self.head_CC = nn.Sequential(
-            nn.Linear(self.fc_input_size + 2 * self.n_quantiles, 256),
-            self.activation,
-            nn.Dropout(0.5),
-            nn.Linear(256, 128),
-            self.activation,
-            nn.Dropout(0.5),
-            nn.Linear(128, self.n_quantiles),
-        )
+        self.fc_input_size = self._get_conv_output_size(input_shape)
 
-    def _forward_resnet_trunk(self, x):
-        x = self.resnet_trunk.conv1(x)
-        x = self.resnet_trunk.bn1(x)
-        x = self.resnet_trunk.relu(x)
-        x = self.resnet_trunk.maxpool(x)
-        x = self.resnet_trunk.layer1(x)
-        x = self.resnet_trunk.layer2(x)
-        x = self.resnet_trunk.layer3(x)
-        x = self.resnet_trunk.layer4(x)
-        x = self.resnet_trunk.avgpool(x)
+        # Gated Heads Setup
+        self.shared_fc = nn.Linear(self.fc_input_size, 256)
+
+        self.fc_A = nn.Linear(256, 128)
+        self.out_A = nn.Linear(128, self.n_quantiles)
+
+        self.fc_P = nn.Linear(256, 128)
+        self.gate_A_to_P = nn.Linear(128, 128)
+        self.out_P = nn.Linear(128, self.n_quantiles)
+
+        self.fc_CC = nn.Linear(256, 128)
+        self.gate_P_to_CC = nn.Linear(128, 128)
+        self.out_CC = nn.Linear(128, self.n_quantiles)
+
+        self.dropout = nn.Dropout(0.5)
+
+    def _get_conv_output_size(self, shape):
+        with torch.no_grad():
+            input_tensor = torch.rand(1, *shape)
+            output = self._forward_conv(input_tensor)
+            return int(np.prod(output.size()[1:]))
+
+    def _forward_conv(self, x):
+        x = self.pool(self.activation(self.bn1(self.conv1(x))))
+        x = self.pool(self.activation(self.bn2(self.conv2(x))))
+        x = self.pool(self.activation(self.bn3(self.conv3(x))))
         return x
 
     def forward(self, x_phys):
-        # Normalize internally
         x_norm = self.normalizer(x_phys)
+        x_conv = self._forward_conv(x_norm)
+        x_flat = torch.flatten(x_conv, 1)
 
-        x_pooled = self._forward_resnet_trunk(x_norm)
-        x_flat = torch.flatten(x_pooled, 1)
+        shared = self.activation(self.shared_fc(x_flat))
+        shared = self.dropout(shared)
 
-        raw_A = self.head_A(x_flat)
-        x_flat_A = torch.cat([x_flat, raw_A.detach()], dim=1)
-        raw_P = self.head_P(x_flat_A)
-        x_flat_A_P = torch.cat([x_flat, raw_A.detach(), raw_P.detach()], dim=1)
-        raw_CC = self.head_CC(x_flat_A_P)
+        # 1. Path A
+        feat_A = self.activation(self.fc_A(shared))
+        raw_A = self.out_A(self.dropout(feat_A))
+
+        # 2. Path P (Gated by A)
+        feat_P_raw = self.activation(self.fc_P(shared))
+        gate_A = torch.sigmoid(self.gate_A_to_P(feat_A))
+        feat_P_gated = feat_P_raw * gate_A
+        raw_P = self.out_P(self.dropout(feat_P_gated))
+
+        # 3. Path CC (Gated by P)
+        feat_CC_raw = self.activation(self.fc_CC(shared))
+        gate_P = torch.sigmoid(self.gate_P_to_CC(feat_P_gated))
+        feat_CC_gated = feat_CC_raw * gate_P
+        raw_CC = self.out_CC(self.dropout(feat_CC_gated))
 
         pred_A = F.softplus(raw_A)
         pred_P = F.softplus(raw_P)

@@ -8,8 +8,8 @@ from torch.utils.data import DataLoader
 from gamma_predictors import (
     GammaPredictorSeparateHeadsSoft,
     GammaPredictorSeparateHeadsHard,
-    GammaPredictorResNetSoftHierarchical,
-    GammaPredictorResNetHardHierarchical,
+    GammaPredictorHierarchicalSoftGated,
+    GammaPredictorHierarchicalHardGated,
 )
 from loss import estimate_s_inv_from_dataset
 from dataset import PreprocessedNpzDataset
@@ -36,17 +36,17 @@ def load_model(config, device, run_dir, constraint_mode_override=None):
     N_QUANTILES = len(config["QUANTILE_LEVELS"])
     PATCH_SIZE = config["PATCH_SIZE"]
     PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 1.0)
-    ARCHITECTURE = config.get("ARCHITECTURE", "CNN")
+    ARCHITECTURE = config.get("ARCHITECTURE", "Vanilla")
 
     # Default overrides for current experiments
-    ARCHITECTURE = "CNN"
+    ARCHITECTURE = "Vanilla"
 
-    if ARCHITECTURE == "CNN":
+    if ARCHITECTURE == "Vanilla":
         HARD_EMULATOR = GammaPredictorSeparateHeadsHard
         SOFT_EMULATOR = GammaPredictorSeparateHeadsSoft
-    elif ARCHITECTURE == "RESNET":
-        HARD_EMULATOR = GammaPredictorResNetHardHierarchical
-        SOFT_EMULATOR = GammaPredictorResNetSoftHierarchical
+    elif ARCHITECTURE == "Attention":
+        HARD_EMULATOR = GammaPredictorHierarchicalHardGated
+        SOFT_EMULATOR = GammaPredictorHierarchicalSoftGated
 
     CONSTRAINT_MODE = config.get("CONSTRAINT_MODE", "hybrid")
     if constraint_mode_override:

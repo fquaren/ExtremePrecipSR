@@ -43,7 +43,7 @@ BATCH_COMPOSITION:
 EXPERIMENT_NAME: "GammaEmulatorv2"
 
 # Training Gamma emulator
-ARCHITECTURE: "CNN"  # "RESNET"
+ARCHITECTURE: "Vanilla"  # "Attention"
 CONSTRAINT_MODE: "hybrid"  # 'soft', 'hard', 'hybrid', 'none'
 LOSS_LAMBDA: 0.25 # between 0 and 1 (Loss = lambda*zero_penalty + (1-lambda)*main_loss)
 WEIGHT_A: 1.0
