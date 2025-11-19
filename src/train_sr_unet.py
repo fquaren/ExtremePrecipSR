@@ -289,7 +289,7 @@ def main():
                         pred_gamma_phys = torch.from_numpy(
                             np.array(pred_gamma_list)
                         ).to(device)
-                    else:  # mode == "train"
+                    else:
                         pred_gamma_phys = emulator_model(F.relu(pred_X))
 
                     if METRIC_LOSS_TYPE == "cdf":

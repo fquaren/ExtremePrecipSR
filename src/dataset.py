@@ -59,7 +59,7 @@ class SRDataset(Dataset):
             self.metadata = [line.strip().split(",") for line in f]
 
         # Load data via memory-mapping
-        precip_path = os.path.join(preprocessed_data_dir, split, "original_precip.npz")
+        precip_path = os.path.join(preprocessed_data_dir, split, "physical_precip.npz")
         interp_path = os.path.join(
             preprocessed_data_dir, split, "interpolated_precip.npz"
         )
@@ -177,6 +177,7 @@ class SRDataset(Dataset):
         )
 
 
+# --- Emulator Training Dataset Class ---
 class PreprocessedNpzDataset(Dataset):
     def __init__(
         self, preprocessed_data_dir, metadata_file, augment=False, noise_std=0.01
@@ -184,11 +185,14 @@ class PreprocessedNpzDataset(Dataset):
         print(f"Loading data from {preprocessed_data_dir}...")
         with open(metadata_file, "r") as f:
             self.metadata = [line.strip().split(",") for line in f]
-        precip_path = os.path.join(preprocessed_data_dir, "original_precip.npz")
-        gamma_path = os.path.join(preprocessed_data_dir, "gamma_targets.npz")
+        precip_path = os.path.join(preprocessed_data_dir, "physical_precip.npz")
+        gamma_path = os.path.join(
+            preprocessed_data_dir, "gamma_targets_persistence.npz"
+        )
         self.original_patches = np.load(precip_path, mmap_mode="r")["data"]
         self.gamma_targets = np.load(gamma_path, mmap_mode="r")["data"]
         self.augment = augment
+
         if self.augment:
             rotations = T.RandomChoice(
                 [
@@ -225,8 +229,10 @@ class PreprocessedNpzDataset(Dataset):
         log_target_gamma_tensor = torch.log1p(
             target_gamma_phys_tensor
         )  # Apply log transform
+
         if self.augment:
             input_tensor = self.transform(input_tensor)
+
         return (
             input_tensor,
             log_target_gamma_tensor,

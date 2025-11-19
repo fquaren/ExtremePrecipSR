@@ -26,3 +26,23 @@ singularity exec --nv "$container_path" python /work/FAC/FGSE/IDYST/tbeucler/dow
 # source /users/fquareng/.bashrc
 # micromamba activate dl-torch
 # micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_gamma.py
+
+EMULATORS_TYPE=("hard" "hybrid" "soft" "none")
+
+N_EXPERIMENTS=${#EMULATORS_TYPE[@]}
+echo "Found ${N_EXPERIMENTS} experiments to evaluate."
+
+for (( i=0; i<${N_EXPERIMENTS}; i++ )); do
+    m=${EMULATORS_TYPE[i]}
+    echo "--- Starting training for constraint Mode: $m ---"
+
+    source /users/fquareng/.bashrc
+    micromamba activate dl-torch
+    micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_gamma.py \
+        --constraint_mode "$m"
+
+    echo "--- Finished evaluation for: $e ---"
+    echo ""
+done
+
+echo "All evaluations complete."

@@ -20,9 +20,9 @@
 
 source /users/fquareng/.bashrc
 micromamba activate dl-torch
-micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/eval_sr_unet.py --run_dir /scratch/fquareng/sr_experiment_runs/SR_UNet_Baseline_train_2025-11-08_10-52-42
+micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/eval_sr_unet.py --run_dir /scratch/fquareng/sr_experiment_runs/SR_UNet_Baseline_train_2025-11-12_10-25-32
 
 # export SINGULARITY_BINDPATH="/work,/scratch,/users"
 # export SINGULARITYENV_LD_PRELOAD="/opt/hpcx/ucc/lib/libucc.so.1:/opt/hpcx/ucx/lib/libucp.so.0:/opt/hpcx/ucx/lib/libucs.so.0" 
 # container_path="/users/fquareng/singularity/dl_gh200.sif"
-# singularity exec --nv "$container_path" python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/eval_sr_unet.py --run_dir /scratch/fquareng/sr_experiment_runs/SR_UNet_Baseline_train_2025-11-08_10-52-42
+# singularity exec --nv "$container_path" python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/eval_sr_unet.py --run_dir /scratch/fquareng/sr_experiment_runs/SR_UNet_Baseline_train_2025-11-12_10-25-32

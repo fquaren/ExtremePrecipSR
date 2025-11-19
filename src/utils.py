@@ -4,6 +4,8 @@ import torch.nn as nn
 from gamma_predictors import (
     GammaPredictorSeparateHeadsSoft,
     GammaPredictorSeparateHeadsHard,
+    GammaPredictorResNetSoftHierarchical,
+    GammaPredictorResNetHardHierarchical,
 )
 
 # --- Configuration Loading ---
@@ -21,6 +23,14 @@ QUANTILE_LEVELS = config["QUANTILE_LEVELS"]
 N_QUANTILES = len(QUANTILE_LEVELS)
 PATCH_SIZE = config["PATCH_SIZE"]
 PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 1.0)
+
+ARCHITECTURE = config.get("ARCHITECTURE", "CNN")
+if ARCHITECTURE == "CNN":
+    HARD_EMULATOR = GammaPredictorSeparateHeadsHard
+    SOFT_EMULATOR = GammaPredictorSeparateHeadsSoft
+elif ARCHITECTURE == "RESNET":
+    HARD_EMULATOR = GammaPredictorResNetHardHierarchical
+    SOFT_EMULATOR = GammaPredictorResNetSoftHierarchical
 
 
 # --- Helper to load the emulator ---

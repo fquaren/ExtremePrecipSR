@@ -1,19 +1,25 @@
+import argparse
 import yaml
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 import numpy as np
 import os
 from tqdm import tqdm
 from datetime import datetime
-import math
-
-from loss import ComponentWiseCDFLoss
+from loss import (
+    ComponentWiseCDFLoss,
+    calculate_monotonicity_penalty,
+    calculate_plausibility_penalty,
+    calculate_bound_penalty,
+    calculate_zero_penalty,
+)
 from dataset import PreprocessedNpzDataset, StratifiedBatchSampler
 from gamma_predictors import (
-    GammaPredictorSeparateHeadsHard,
     GammaPredictorSeparateHeadsSoft,
+    GammaPredictorSeparateHeadsHard,
+    GammaPredictorResNetSoftHierarchical,
+    GammaPredictorResNetHardHierarchical,
 )
 
 
@@ -25,6 +31,7 @@ config_path = (
 with open(config_path, "r") as file:
     config = yaml.safe_load(file)
 
+
 QUANTILE_LEVELS = config["QUANTILE_LEVELS"]
 N_QUANTILES = len(QUANTILE_LEVELS)
 N = N_QUANTILES * 3
@@ -35,12 +42,13 @@ VAL_METADATA_FILE = config["VAL_METADATA_FILE"]
 TEST_METADATA_FILE = config["TEST_METADATA_FILE"]
 BATCH_SIZE = config.get("BATCH_SIZE", 16)
 LEARNING_RATE = config.get("LEARNING_RATE", 1e-4)
-WEIGHT_DECAY = config.get("WEIGHT_DECAY", 1e-5)
+WEIGHT_DECAY = config.get("WEIGHT_DECAY", 1e-4)
 NUM_EPOCHS = config.get("NUM_EPOCHS", 10)
 EARLY_STOPPING_PATIENCE = config.get("EARLY_STOPPING_PATIENCE", 10)
 EARLY_STOPPING_DELTA = config.get("EARLY_STOPPING_DELTA", 0.001)
 EXPERIMENT_NAME = config.get("EXPERIMENT_NAME", "Debugging")
 PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 1.0)
+MAX_DATASET_PRECIP = np.load(config["MAX_PRECIP_FILE"])[0]
 
 # --- Constraint Configuration ---
 CONSTRAINT_MODE = config.get("CONSTRAINT_MODE", "hybrid")  # 'soft', 'hard', or 'hybrid'
@@ -53,42 +61,33 @@ WEIGHT_P = config.get("WEIGHT_P", 1.0)
 WEIGHT_CC = config.get("WEIGHT_CC", 1.0)
 LAMBDA_BOUND = config.get("LAMBDA_BOUND", 0.1)
 
-
-# --- Soft Constraint Penalty Functions ---
-# These are only used if CONSTRAINT_MODE == 'soft'
-def calculate_monotonicity_penalty(pred_A_phys):
-    diffs = pred_A_phys[:, :-1] - pred_A_phys[:, 1:]  # P(i) - P(i+1)
-    penalty = torch.mean(F.relu(-diffs))  # Penalize if P(i) < P(i+1)
-    return penalty
-
-
-def calculate_plausibility_penalty(pred_A_phys, pred_P_phys):
-    epsilon = 1e-6
-    P_min = torch.sqrt(4 * math.pi * (pred_A_phys + epsilon))
-    penalty = torch.mean(F.relu(P_min - pred_P_phys))  # Penalize if P_min > P_pred
-    return penalty
-
-
-def calculate_bound_penalty(pred_A_phys, pred_CC_phys, pixel_area_km2):
-    epsilon = 1e-6
-    CC_max = (pred_A_phys / pixel_area_km2) + epsilon
-    penalty = torch.mean(F.relu(pred_CC_phys - CC_max))  # Penalize if CC > CC_max
-    return penalty
-
-
-def calculate_zero_penalty(input_data, predicted_gamma_phys):
-    with torch.no_grad():
-        is_dry_mask = input_data.sum(dim=(1, 2, 3)) <= 1e-6
-    if not is_dry_mask.any():
-        return torch.tensor(0.0, device=input_data.device)
-
-    dry_predictions = predicted_gamma_phys[is_dry_mask]
-
-    penalty = torch.mean(torch.abs(dry_predictions))
-    return penalty
+ARCHITECTURE = config.get("ARCHITECTURE", "CNN")
+if ARCHITECTURE == "CNN":
+    HARD_EMULATOR = GammaPredictorSeparateHeadsHard
+    SOFT_EMULATOR = GammaPredictorSeparateHeadsSoft
+elif ARCHITECTURE == "RESNET":
+    HARD_EMULATOR = GammaPredictorResNetHardHierarchical
+    SOFT_EMULATOR = GammaPredictorResNetSoftHierarchical
 
 
 def main():
+
+    parser = argparse.ArgumentParser(
+        description="Evaluate a trained GammaPredictor model."
+    )
+    parser.add_argument(
+        "--constraint_mode",
+        type=str,
+        required=False,
+        default="hybrid",
+        help="(Optional) Override constraint mode (none, soft, hybrid, hard).",
+    )
+    args = parser.parse_args()
+
+    print("Overriding contraint mode ...")
+    CONSTRAINT_MODE = args.contraint_mode
+    print(f"Contraint mode: {CONSTRAINT_MODE}")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -194,18 +193,19 @@ def main():
             print(
                 "Using NO constraints model (GammaPredictorSeparateHeadsSoft) with main loss only."
             )
-        model = GammaPredictorSeparateHeadsSoft(
+        model = SOFT_EMULATOR(
             input_shape=INPUT_SHAPE, n_quantiles=N_QUANTILES, activation_fn=nn.Mish()
         ).to(device)
 
     elif CONSTRAINT_MODE == "hybrid" or CONSTRAINT_MODE == "hard":
-        print("Using HYBRID constraints model (GammaPredictorSeparateHeadsHybrid).")
-        model = GammaPredictorSeparateHeadsHard(
+        print("Using HYBRID constraints model (GammaPredictorResNetHardHierarchical).")
+        model = HARD_EMULATOR(
             input_shape=INPUT_SHAPE,
             n_quantiles=N_QUANTILES,
             activation_fn=nn.Mish(),
             quantile_levels=QUANTILE_LEVELS,
             pixel_area_km2=PIXEL_SIZE_KM**2,
+            max_precip_value=MAX_DATASET_PRECIP,
         ).to(device)
     else:
         raise ValueError(
@@ -269,14 +269,19 @@ def main():
 
             # --- Calculate Main Weighted Loss ---
             loss_A, loss_P, loss_CC = criterion(predicted_gamma_log, log_target_gamma)
-            # Apply manual weights
+            # loss_A, loss_P, loss_CC are per-sample, shape [B]
+
+            # Apply manual weights (per-sample)
             SUM_WEIGHTS = WEIGHT_A + WEIGHT_P + WEIGHT_CC
-            main_loss = (
+            main_loss_per_sample = (
                 (WEIGHT_A / SUM_WEIGHTS * loss_A)
                 + (WEIGHT_P / SUM_WEIGHTS * loss_P)
                 + (WEIGHT_CC / SUM_WEIGHTS * loss_CC)
             )
-            total_loss = main_loss
+
+            # --- REDUCE TO SCALAR (BATCH MEAN) ---
+            main_loss = torch.mean(main_loss_per_sample)
+            total_loss = main_loss  # total_loss is now a scalar
 
             # --- Initialize penalties ---
             penalty_zero = torch.tensor(0.0, device=device)
@@ -290,11 +295,15 @@ def main():
                 pred_P_phys = predicted_gamma_phys[:, 1, :]
                 pred_CC_phys = predicted_gamma_phys[:, 2, :]
 
-                penalty_zero = calculate_zero_penalty(input_data, predicted_gamma_phys)
-                penalty_mono = calculate_monotonicity_penalty(pred_A_phys)
-                penalty_plaus = calculate_plausibility_penalty(pred_A_phys, pred_P_phys)
-                penalty_bound = calculate_bound_penalty(
-                    pred_A_phys, pred_CC_phys, PIXEL_SIZE_KM**2
+                penalty_zero = torch.mean(
+                    calculate_zero_penalty(input_data, predicted_gamma_phys)
+                )
+                penalty_mono = torch.mean(calculate_monotonicity_penalty(pred_A_phys))
+                penalty_plaus = torch.mean(
+                    calculate_plausibility_penalty(pred_A_phys, pred_P_phys)
+                )
+                penalty_bound = torch.mean(
+                    calculate_bound_penalty(pred_A_phys, pred_CC_phys, PIXEL_SIZE_KM**2)
                 )
 
                 # Use simple weighted sum for loss
@@ -310,8 +319,8 @@ def main():
                 pred_A_phys = predicted_gamma_phys[:, 0, :]
                 pred_CC_phys = predicted_gamma_phys[:, 2, :]
 
-                penalty_bound = calculate_bound_penalty(
-                    pred_A_phys, pred_CC_phys, PIXEL_SIZE_KM**2
+                penalty_bound = torch.mean(
+                    calculate_bound_penalty(pred_A_phys, pred_CC_phys, PIXEL_SIZE_KM**2)
                 )
                 total_loss = main_loss + LAMBDA_BOUND * penalty_bound
 
@@ -324,9 +333,9 @@ def main():
             optimizer.step()
 
             # --- Accumulate losses for logging ---
-            running_loss_A += loss_A.item()
-            running_loss_P += loss_P.item()
-            running_loss_CC += loss_CC.item()
+            running_loss_A += torch.mean(loss_A).item()
+            running_loss_P += torch.mean(loss_P).item()
+            running_loss_CC += torch.mean(loss_CC).item()
             running_loss += total_loss.item()
             running_main += main_loss.item()
             running_pen_zero += penalty_zero.item()
@@ -381,10 +390,19 @@ def main():
                 loss_A, loss_P, loss_CC = criterion(
                     predicted_gamma_log, log_target_gamma
                 )
-                main_loss = (
-                    (WEIGHT_A * loss_A) + (WEIGHT_P * loss_P) + (WEIGHT_CC * loss_CC)
+                # loss_A, loss_P, loss_CC are per-sample, shape [B]
+
+                # Apply manual weights (per-sample)
+                SUM_WEIGHTS = WEIGHT_A + WEIGHT_P + WEIGHT_CC
+                main_loss_per_sample = (
+                    (WEIGHT_A / SUM_WEIGHTS * loss_A)
+                    + (WEIGHT_P / SUM_WEIGHTS * loss_P)
+                    + (WEIGHT_CC / SUM_WEIGHTS * loss_CC)
                 )
-                total_loss = main_loss
+
+                # --- REDUCE TO SCALAR (BATCH MEAN) ---
+                main_loss = torch.mean(main_loss_per_sample)
+                total_loss = main_loss  # total_loss is now a scalar
 
                 penalty_zero = torch.tensor(0.0, device=device)
                 penalty_mono = torch.tensor(0.0, device=device)
@@ -415,16 +433,21 @@ def main():
                     )
 
                 elif CONSTRAINT_MODE == "hybrid":
-                    penalty_bound = calculate_bound_penalty(
-                        pred_A_phys, pred_CC_phys, PIXEL_SIZE_KM**2
+                    pred_A_phys = predicted_gamma_phys[:, 0, :]
+                    pred_CC_phys = predicted_gamma_phys[:, 2, :]
+
+                    penalty_bound = torch.mean(
+                        calculate_bound_penalty(
+                            pred_A_phys, pred_CC_phys, PIXEL_SIZE_KM**2
+                        )
                     )
                     total_loss = main_loss + LAMBDA_BOUND * penalty_bound
 
                 # If 'none' or 'hard', total_loss remains main_loss
 
-                val_running_loss_A += loss_A.item()
-                val_running_loss_P += loss_P.item()
-                val_running_loss_CC += loss_CC.item()
+                val_running_loss_A += torch.mean(loss_A).item()
+                val_running_loss_P += torch.mean(loss_P).item()
+                val_running_loss_CC += torch.mean(loss_CC).item()
                 val_running_loss += total_loss.item()
                 val_running_main += main_loss.item()
                 val_running_pen_zero += penalty_zero.item()

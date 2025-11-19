@@ -9,11 +9,15 @@ import gudhi as gd
 import multiprocessing
 from functools import partial
 
+# --- USER SETTINGS ---
+# "diagnostic" = Extract ALL pairs (threshold=0), skip Gamma matrix calc. FAST. Use for plotting.
+# "production" = Calculate Gamma matrix using config threshold. SLOW. Use for final training data.
+MODE = "production"
+
 # Suppress specific warning from scikit-image
 warnings.filterwarnings("ignore", message="No contour found", category=UserWarning)
 
-# Prevent numpy/MKL/OpenBLAS from using internal threads,
-# which conflicts with multiprocessing.
+# Prevent numpy/MKL/OpenBLAS from using internal threads
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -22,207 +26,252 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 config_path = (
     "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/config.yaml"
 )
-# /home/fquareng/work/ExtremePrecipSR/config.yaml"
 with open(config_path, "r") as file:
     config = yaml.safe_load(file)
 
-QUANTILE_LEVELS = config["QUANTILE_LEVELS"]
+QUANTILE_LEVELS = np.array(config["QUANTILE_LEVELS"], dtype=np.float32)
 PREPROCESSED_DATA_DIR = config["PREPROCESSED_DATA_DIR"]
 PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 1.0)
-PERSISTENCE_THRESHOLD = config.get("PERSISTENCE_THRESHOLD", 0.05)
 NUM_WORKERS = config.get("NUM_WORKERS", os.cpu_count())
+WORKER_CHUNK_SIZE = config.get("WORKER_CHUNK_SIZE", 100)
+
+# If in diagnostic mode, we capture EVERYTHING (Threshold ~ 0)
+# If in production, we use the config threshold.
+if MODE == "diagnostic":
+    PERSISTENCE_THRESHOLD = 1e-9  # Effectively zero, avoids div by zero issues
+    print(f"!!! DIAGNOSTIC MODE !!! Extracting ALL pairs > {PERSISTENCE_THRESHOLD}")
+else:
+    PERSISTENCE_THRESHOLD = config.get("PERSISTENCE_THRESHOLD", 0.05)
+    print(
+        f"--- PRODUCTION MODE --- Computing Gamma with Threshold = {PERSISTENCE_THRESHOLD}"
+    )
 
 
-# Separated TDA calculation from threshold-dependent parts
+# --- Core TDA Function ---
 def compute_tda_persistence(prec_2d_np_clean):
     """Computes the persistence diagram once for a given image."""
     neg_prec_field = -prec_2d_np_clean.astype(np.float64)
     cubical_complex = gd.CubicalComplex(
         dimensions=neg_prec_field.shape, top_dimensional_cells=neg_prec_field.flatten()
     )
-    # Return pairs AND the complex itself if needed for other TDA features later
     return cubical_complex.persistence()
 
 
-def filter_persistence_for_cc(persistence_pairs, threshold, persistence_threshold):
-    """Filters pre-computed persistence pairs for CC count at a given threshold."""
-    num_features_tda = 0
-    for dim, (birth_val_neg, death_val_neg) in persistence_pairs:
-        if dim == 0:
-            birth_prec = -birth_val_neg
-            death_prec = -death_val_neg if death_val_neg != np.inf else np.inf
-            persistence = (
-                birth_prec - death_prec if death_prec != np.inf else np.inf
-            )  # Handle infinite persistence
-
-            # Count if significant and exists at or above the threshold
-            if persistence > persistence_threshold and birth_prec >= threshold:
-                # Exclude the background component unless threshold is very low
-                if death_val_neg != np.inf:
-                    num_features_tda += 1
-                elif threshold <= 0.01:  # Count background only at low thresholds
-                    num_features_tda += 1  # Ensure count is at least 1
-
-    # Optional: ensure count is 1 if there is area > 0 but TDA count is 0
-    # This depends on definition - keep raw TDA for now.
-    return num_features_tda
-
-
-# Function now only calculates Area and Perimeter (threshold-dependent)
-def compute_A_P_single_threshold_numpy(prec_2d_np_clean, threshold, pixel_size_km=1.0):
-    """Computes Area and Perimeter for a single threshold."""
-    mask = prec_2d_np_clean >= threshold
-    area_km2 = mask.sum() * (pixel_size_km**2)
-    contours = measure.find_contours(mask.astype(float), 0.5)
-    perimeter_pixels = sum(
-        np.linalg.norm(np.diff(contour, axis=0), axis=1).sum() for contour in contours
-    )
-    perimeter_km = perimeter_pixels * pixel_size_km
-    return area_km2, perimeter_km, mask  # Return mask for potential reuse
-
-
-# Optimized gamma matrix calculation
+# --- Fully Vectorized Gamma Matrix Calculation ---
 def compute_gamma_matrix_for_image_optimized(
     prec_2d_data,
-    thresholds,
+    thresholds_arr,
     pixel_size_km=1.0,
     persistence_threshold=PERSISTENCE_THRESHOLD,
+    run_mode="production",
 ):
-    """Computes the Gamma matrix, calculating TDA persistence only once."""
-    gamma_matrix = np.zeros((3, len(thresholds)), dtype=np.float32)
-    prec_2d_np_clean = np.nan_to_num(prec_2d_data, nan=-1.0)  # Clean once
+    """
+    Computes the Gamma matrix.
+    If run_mode == 'diagnostic': Skips Area/Perimeter, returns dummy matrix + ALL pairs.
+    """
+    gamma_matrix = np.zeros((3, len(thresholds_arr)), dtype=np.float32)
+    prec_2d_np_clean = np.nan_to_num(prec_2d_data, nan=-1.0)
 
-    # --- Compute TDA Persistence ONCE ---
+    # --- TDA Calculation (Needed for both modes) ---
     persistence_pairs = compute_tda_persistence(prec_2d_np_clean)
-    # ------------------------------------
+    pairs_d0 = np.array(
+        [p[1] for p in persistence_pairs if p[0] == 0], dtype=np.float64
+    )
 
-    for i, threshold_value in enumerate(thresholds):
-        # Calculate Area and Perimeter for this threshold
-        area_km2, perimeter_km, mask = compute_A_P_single_threshold_numpy(
-            prec_2d_np_clean, threshold_value, pixel_size_km
+    significant_pairs = np.empty((0, 2), dtype=np.float64)
+
+    if pairs_d0.shape[0] > 0:
+        # Convert pairs (birth_neg, death_neg) to (birth, death, persistence)
+        births = -pairs_d0[:, 0]
+        deaths = -pairs_d0[:, 1]
+        is_finite = deaths != -np.inf
+        is_background = ~is_finite
+        deaths[is_background] = np.inf
+        persistence = births - deaths
+        persistence[is_background] = np.inf
+
+        # Filter pairs based on current threshold (0 if diagnostic, T if production)
+        is_significant = persistence > persistence_threshold
+
+        # Collect pairs for output
+        significant_pairs = np.stack(
+            [births[is_significant], deaths[is_significant]], axis=1
         )
 
-        # Filter pre-computed persistence for CC count at this threshold
-        num_features_tda = filter_persistence_for_cc(
-            persistence_pairs, threshold_value, persistence_threshold
-        )
+        # --- If Production: Compute Euler Characteristic (Gamma Component 3) ---
+        if run_mode == "production":
+            # ... (Logic identical to your original script) ...
+            pers_thresh_mask = is_significant[:, np.newaxis]
+            births_broadcast = births[:, np.newaxis]
+            deaths_broadcast = deaths[:, np.newaxis]
+            thresholds_broadcast_1d = thresholds_arr[np.newaxis, :]
 
-        # Optional: Adjust CC count based on Area
-        # if area_km2 > 0 and num_features_tda == 0:
-        #    num_features_tda = 1
+            birth_thresh_mask = births_broadcast >= thresholds_broadcast_1d
+            death_thresh_mask = deaths_broadcast < thresholds_broadcast_1d
 
-        gamma_matrix[0, i] = area_km2
-        gamma_matrix[1, i] = perimeter_km
-        gamma_matrix[2, i] = num_features_tda
+            finite_pass_mask = (
+                pers_thresh_mask
+                & birth_thresh_mask
+                & death_thresh_mask
+                & is_finite[:, np.newaxis]
+            )
+            finite_counts = np.sum(finite_pass_mask, axis=0)
 
-    return gamma_matrix
+            background_low_thresh_mask = thresholds_broadcast_1d <= 0.01
+            background_pass_mask = (
+                pers_thresh_mask
+                & birth_thresh_mask
+                & is_background[:, np.newaxis]
+                & background_low_thresh_mask
+            )
+            background_counts = np.sum(background_pass_mask, axis=0)
+            gamma_matrix[2, :] = finite_counts + background_counts
+
+    # --- If Production: Compute Area and Perimeter ---
+    if run_mode == "production":
+        pixel_area_km2 = pixel_size_km**2
+        prec_broadcast = prec_2d_np_clean[..., np.newaxis]
+        thresholds_broadcast_3d = thresholds_arr[np.newaxis, np.newaxis, :]
+        masks_3d = prec_broadcast >= thresholds_broadcast_3d
+
+        # Area
+        area_counts = np.sum(masks_3d, axis=(0, 1))
+        gamma_matrix[0, :] = area_counts * pixel_area_km2
+
+        # Perimeter (Loop)
+        for i in range(len(thresholds_arr)):
+            mask_t = masks_3d[:, :, i]
+            contours = measure.find_contours(mask_t.astype(float), 0.5)
+            perimeter_pixels = sum(
+                np.linalg.norm(np.diff(contour, axis=0), axis=1).sum()
+                for contour in contours
+            )
+            gamma_matrix[1, i] = perimeter_pixels * pixel_size_km
+
+    return gamma_matrix, significant_pairs
 
 
-# Worker function for parallel processing
-def worker_compute_gamma(
-    index,
+# --- Worker function ---
+def worker_compute_gamma_chunk(
+    index_chunk,
     precip_path,
     output_mmap_path,
     output_shape,
     output_dtype,
-    thresholds,
+    thresholds_arr,
     pixel_size_km,
     persistence_threshold,
+    run_mode,
 ):
-    """Computes gamma for a single index and writes to memmap."""
-    # Load the full data inside the worker, but only access the needed slice
-    # This works efficiently with mmap_mode='r'
-    precip_data = np.load(precip_path, mmap_mode="r")["data"]
-    prec_field = precip_data[index]
-
-    gamma_matrix = compute_gamma_matrix_for_image_optimized(
-        prec_field, thresholds, pixel_size_km, persistence_threshold
-    )
-
-    # Re-open the memmap file in write mode within the worker
+    precip_data = np.load(precip_path, mmap_mode="r")
     gamma_targets_array_mmap = np.memmap(
         output_mmap_path, dtype=output_dtype, mode="r+", shape=output_shape
     )
-    gamma_targets_array_mmap[index] = gamma_matrix
-    gamma_targets_array_mmap.flush()  # Ensure write completes
+    chunk_persistence_pairs = []
+
+    for index in index_chunk:
+        prec_field = precip_data[index]
+        gamma_matrix, significant_pairs = compute_gamma_matrix_for_image_optimized(
+            prec_field, thresholds_arr, pixel_size_km, persistence_threshold, run_mode
+        )
+        gamma_targets_array_mmap[index] = gamma_matrix
+        if significant_pairs.shape[0] > 0:
+            chunk_persistence_pairs.append(significant_pairs)
+
+    gamma_targets_array_mmap.flush()
+    # Cleanup
+    del gamma_targets_array_mmap
+    del precip_data
+
+    if chunk_persistence_pairs:
+        return np.concatenate(chunk_persistence_pairs, axis=0)
+    else:
+        return np.empty((0, 2), dtype=np.float64)
 
 
-# --- Main Processing Function (Optimized + Parallelized) ---
+# --- Main Processing Function ---
 def process_and_save_gamma_targets(data_split):
-    print(f"--- Processing data split: {data_split} ---")
+    print(f"--- Processing data split: {data_split} | Mode: {MODE} ---")
     input_dir = os.path.join(PREPROCESSED_DATA_DIR, data_split)
-    precip_path = os.path.join(input_dir, "original_precip.npz")
+    precip_path = os.path.join(input_dir, "physical_precip.npy")
     output_path = os.path.join(input_dir, "gamma_targets_persistence.npz")
+
+    # Temp file for memmap
     temp_fd, temp_output_path = tempfile.mkstemp(suffix=".npy", dir=input_dir)
     os.close(temp_fd)
-    print(f"Using temporary memmap file at: {temp_output_path}")
 
     if not os.path.exists(precip_path):
-        print(f"Precipitation file not found: {precip_path}. Skipping.")
-        if os.path.exists(temp_output_path):
-            os.remove(temp_output_path)
+        print(f"Precipitation file not found: {precip_path}")
         return
 
-    print(f"Loading precipitation data structure from {precip_path}...")
-    # Load only shape initially
-    with np.load(precip_path) as loader:
-        num_samples = loader["data"].shape[0]
+    precip_data_mmap = np.load(precip_path, mmap_mode="r")
+    num_samples = precip_data_mmap.shape[0]
+    del precip_data_mmap
 
     output_shape = (num_samples, 3, len(QUANTILE_LEVELS))
     output_dtype = np.float32
 
-    # Create the memmap file (zero-initialized)
+    # Initialize memmap
     gamma_targets_array_mmap = np.memmap(
         temp_output_path, dtype=output_dtype, mode="w+", shape=output_shape
     )
-    # IMPORTANT: Close the memmap file here so workers can open it in r+ mode
     del gamma_targets_array_mmap
-    print("Memmap file initialized.")
 
-    print(
-        f"Computing Gamma matrices for {num_samples} samples using {NUM_WORKERS} workers..."
-    )
+    indices = range(num_samples)
+    index_chunks = [
+        indices[i : i + WORKER_CHUNK_SIZE]
+        for i in range(0, num_samples, WORKER_CHUNK_SIZE)
+    ]
 
-    # Create a partial function with fixed arguments for the worker
     worker_func = partial(
-        worker_compute_gamma,
+        worker_compute_gamma_chunk,
         precip_path=precip_path,
         output_mmap_path=temp_output_path,
         output_shape=output_shape,
         output_dtype=output_dtype,
-        thresholds=QUANTILE_LEVELS,
+        thresholds_arr=QUANTILE_LEVELS,
         pixel_size_km=PIXEL_SIZE_KM,
         persistence_threshold=PERSISTENCE_THRESHOLD,
+        run_mode=MODE,
     )
 
-    # Use multiprocessing Pool
-    indices = range(num_samples)
+    all_persistence_pairs = []
     with multiprocessing.Pool(processes=NUM_WORKERS) as pool:
-        # Use tqdm to show progress with imap_unordered for efficiency
-        list(
-            tqdm(
-                pool.imap_unordered(worker_func, indices),
-                total=num_samples,
-                desc=f"Calculating Gamma for {data_split}",
-            )
-        )
+        results_iterator = pool.imap_unordered(worker_func, index_chunks)
+        for chunk_pairs in tqdm(
+            results_iterator, total=len(index_chunks), desc=f"{MODE}: {data_split}"
+        ):
+            if chunk_pairs.shape[0] > 0:
+                all_persistence_pairs.append(chunk_pairs)
 
-    print("All workers finished. Reloading from memmap and compressing...")
-    final_data_mmap = np.load(temp_output_path, mmap_mode="r")
-    np.savez_compressed(output_path, data=final_data_mmap)
-    print(f"Saved compressed Gamma matrices to {output_path}")
+    if all_persistence_pairs:
+        final_pairs = np.concatenate(all_persistence_pairs, axis=0)
+    else:
+        final_pairs = np.empty((0, 2), dtype=np.float64)
 
-    print(f"Cleaning up temporary file: {temp_output_path}")
+    print(f"Aggregated {final_pairs.shape[0]} pairs.")
+
+    final_data_mmap = np.memmap(
+        temp_output_path, dtype=output_dtype, mode="r", shape=output_shape
+    )
+
+    np.savez_compressed(
+        output_path,
+        data=final_data_mmap,
+        persistence_pairs=final_pairs,
+    )
+
+    del final_data_mmap
     os.remove(temp_output_path)
-    print(f"Finished processing for {data_split}. Shape of saved data: {output_shape}")
+    print(f"Saved to {output_path}")
 
 
 if __name__ == "__main__":
-    # Set the start method to 'spawn' BEFORE any other
-    # multiprocessing code is called. 'force=True' is good practice.
     multiprocessing.set_start_method("spawn", force=True)
-
-    data_splits = ["train", "validation", "test"]
+    # Recommend running on validation first for threshold selection
+    if MODE == "diagnostic":
+        data_splits = ["validation"]
+    else:
+        data_splits = ["validation", "test", "train"]
     for split in data_splits:
         process_and_save_gamma_targets(split)
-    print("\nAll pre-computation is complete.")

@@ -21,13 +21,15 @@ with open(config_path, "r") as file:
 PREPROCESSED_DATA_DIR = config["PREPROCESSED_DATA_DIR"]
 PATCH_SIZE = config["PATCH_SIZE"]
 DOWNSCALING_FACTOR = config["DOWNSCALING_FACTOR"]
-NUM_WORKERS = config.get("NUM_WORKERS", os.cpu_count() - 1)
+# Increased workers slightly, but kept conservative to avoid memory overflow
+NUM_WORKERS = 1
 
 
 # --- Image Processing Functions ---
 def coarsen_image(img, factor):
     """
     Coarsens an image by a given factor using block averaging.
+    Mathematically equivalent to Average Pooling.
     """
     if factor == 1:
         return img
@@ -50,9 +52,7 @@ def coarsen_image(img, factor):
 
 def interpolate_image(img, target_shape):
     """
-    Interpolates an image to a target shape using bilinear interpolation (scipy).
-
-    target_shape is (height, width)
+    Interpolates an image to a target shape using bilinear interpolation.
     """
     if img.shape == target_shape:
         return img
@@ -61,7 +61,6 @@ def interpolate_image(img, target_shape):
     target_h, target_w = target_shape
 
     if in_h == 0 or in_w == 0:
-        # Handle case of empty or zero-dim array
         return np.zeros(target_shape, dtype=img.dtype)
 
     # Calculate zoom factors
@@ -74,10 +73,8 @@ def interpolate_image(img, target_shape):
     # --- Handle potential off-by-one pixel errors from zoom ---
     h, w = interp_img.shape
     if h > target_h or w > target_w:
-        # Crop
         interp_img = interp_img[:target_h, :target_w]
     elif h < target_h or w < target_w:
-        # Pad
         interp_img = np.pad(
             interp_img, ((0, target_h - h), (0, target_w - w)), mode="constant"
         )
@@ -86,8 +83,6 @@ def interpolate_image(img, target_shape):
 
 
 # --- Worker Function for Parallel Processing ---
-
-
 def process_chunk(
     indices,
     input_path,
@@ -99,8 +94,8 @@ def process_chunk(
     factor,
 ):
     """
-    Worker function to process a chunk of indices from the input NPZ
-    and write to the output memmap files.
+    Worker function to process a chunk of indices.
+    Reads from disk (memmap), processes, and writes to temp disk (memmap).
     """
     # Open the large input file in memory-map mode (read-only)
     input_data = np.load(input_path, mmap_mode="r")["data"]
@@ -115,18 +110,18 @@ def process_chunk(
 
     try:
         for idx in indices:
-            # 1. Read original high-res patch
-            original_precip = input_data[idx]
+            # 1. Read patch
+            patch = input_data[idx]
 
-            # 2. Coarsen
-            coarse_precip = coarsen_image(original_precip, factor)
+            # 2. Coarsen (Average Pooling)
+            coarse_patch = coarsen_image(patch, factor)
 
-            # 3. Interpolate
-            interpolated_precip = interpolate_image(coarse_precip, interp_shape[1:])
+            # 3. Interpolate (Bilinear Upsampling)
+            interpolated_patch = interpolate_image(coarse_patch, interp_shape[1:])
 
             # 4. Write to memmaps
-            coarse_mmap[idx] = coarse_precip
-            interp_mmap[idx] = interpolated_precip
+            coarse_mmap[idx] = coarse_patch
+            interp_mmap[idx] = interpolated_patch
 
         # Flush changes to disk
         coarse_mmap.flush()
@@ -136,137 +131,144 @@ def process_chunk(
         return f"Error processing chunk starting at index {indices[0]}: {e}"
 
 
-# --- Main Orchestration ---
+# --- Core Processing Logic (Encapsulated) ---
+def process_dataset_variant(data_split, variant_name, input_dir):
+    """
+    Handles the processing for a specific variant (e.g., 'original' or 'physical')
+    within a specific data split (e.g., 'train').
+    """
+    input_filename = f"{variant_name}_precip.npz"
+    input_path = os.path.join(input_dir, input_filename)
+
+    # Define output names based on the variant
+    # e.g., coarse_original_precip.npz OR coarse_physical_precip.npz
+    coarse_output_path = os.path.join(input_dir, f"coarse_{variant_name}_precip.npz")
+    interp_output_path = os.path.join(
+        input_dir, f"interpolated_{variant_name}_precip.npz"
+    )
+
+    if not os.path.exists(input_path):
+        print(f"Warning: {input_filename} not found in {input_dir}. Skipping.")
+        return
+
+    print(f"\nProcessing {variant_name.upper()} data for {data_split}...")
+
+    # Load metadata
+    with np.load(input_path) as loader:
+        num_samples = loader["data"].shape[0]
+        input_shape = loader["data"].shape[1:]
+        dtype = loader["data"].dtype
+
+    if input_shape[0] != PATCH_SIZE or input_shape[1] != PATCH_SIZE:
+        print(
+            f"Warning: Patch size mismatch! Config: {PATCH_SIZE}, Data: {input_shape}"
+        )
+
+    # Define Output Shapes
+    coarse_patch_h = input_shape[0] // DOWNSCALING_FACTOR
+    coarse_patch_w = input_shape[1] // DOWNSCALING_FACTOR
+
+    coarse_shape = (num_samples, coarse_patch_h, coarse_patch_w)
+    interp_shape = (num_samples, input_shape[0], input_shape[1])
+
+    # Create Temporary Memmap Files
+    fd_c, temp_coarse_path = tempfile.mkstemp(
+        suffix=f"_{variant_name}_coarse.npy", dir=input_dir
+    )
+    fd_i, temp_interp_path = tempfile.mkstemp(
+        suffix=f"_{variant_name}_interp.npy", dir=input_dir
+    )
+    os.close(fd_c)
+    os.close(fd_i)
+
+    # Initialize Memmaps
+    coarse_mmap = np.memmap(
+        temp_coarse_path, dtype=dtype, mode="w+", shape=coarse_shape
+    )
+    interp_mmap = np.memmap(
+        temp_interp_path, dtype=dtype, mode="w+", shape=interp_shape
+    )
+    del coarse_mmap, interp_mmap  # Release lock
+
+    # Prepare Parallel Tasks
+    all_indices = np.arange(num_samples)
+    index_chunks = np.array_split(all_indices, NUM_WORKERS)
+
+    worker_func = partial(
+        process_chunk,
+        input_path=input_path,
+        temp_coarse_path=temp_coarse_path,
+        temp_interp_path=temp_interp_path,
+        coarse_shape=coarse_shape,
+        interp_shape=interp_shape,
+        dtype=dtype,
+        factor=DOWNSCALING_FACTOR,
+    )
+
+    # Execute Parallel Processing
+    with multiprocessing.Pool(processes=NUM_WORKERS) as pool:
+        results = list(
+            tqdm(
+                pool.imap_unordered(worker_func, index_chunks),
+                total=len(index_chunks),
+                desc=f"{variant_name} -> Coarse/Interp",
+            )
+        )
+        for res in results:
+            if res is not None:
+                print(f"Worker Error: {res}")
+
+    # Finalize: Save to Compressed NPZ
+    print(f"Saving {variant_name} outputs...")
+
+    # Read from memmap
+    final_coarse_data = np.memmap(
+        temp_coarse_path, dtype=dtype, mode="r", shape=coarse_shape
+    )
+    final_interp_data = np.memmap(
+        temp_interp_path, dtype=dtype, mode="r", shape=interp_shape
+    )
+
+    np.savez_compressed(coarse_output_path, data=final_coarse_data)
+    np.savez_compressed(interp_output_path, data=final_interp_data)
+
+    # Cleanup
+    os.remove(temp_coarse_path)
+    os.remove(temp_interp_path)
+    print(f"Finished {variant_name} for {data_split}.")
 
 
 def main():
     """
-    Main script to create coarse and interpolated inputs for SR task.
+    Main orchestration script.
+    Iterates over splits and data variants (original/physical).
     """
+    # The two types of files we saved in the previous step
+    VARIANTS = ["original", "physical"]
 
     for data_split in ["train", "validation", "test"]:
-        print(f"\n--- Processing data split: {data_split} ---")
+        print(f"\n{'='*40}")
+        print(f"--- DATA SPLIT: {data_split.upper()} ---")
+        print(f"{'='*40}")
 
         input_dir = os.path.join(PREPROCESSED_DATA_DIR, data_split)
 
-        # Define file paths
-        input_path = os.path.join(input_dir, "original_precip.npz")
-        coarse_output_path = os.path.join(input_dir, "coarse_precip.npz")
-        interp_output_path = os.path.join(input_dir, "interpolated_precip.npz")
-
-        if not os.path.exists(input_path):
-            print(f"Input file not found: {input_path}. Skipping.")
+        if not os.path.exists(input_dir):
+            print(f"Directory not found: {input_dir}")
             continue
 
-        print(f"Loading input data structure from {input_path}...")
-        with np.load(input_path) as loader:
-            num_samples = loader["data"].shape[0]
-            input_shape = loader["data"].shape[1:]
-            dtype = loader["data"].dtype
-
-        if input_shape[0] != PATCH_SIZE or input_shape[1] != PATCH_SIZE:
-            print(
-                f"Warning: Patch size mismatch! Config: {PATCH_SIZE}, Data: {input_shape}"
-            )
-
-        # --- 1. Define Output Shapes ---
-        coarse_patch_h = input_shape[0] // DOWNSCALING_FACTOR
-        coarse_patch_w = input_shape[1] // DOWNSCALING_FACTOR
-
-        coarse_shape = (num_samples, coarse_patch_h, coarse_patch_w)
-        interp_shape = (num_samples, input_shape[0], input_shape[1])
-
-        print(f"Input shape: {(num_samples, *input_shape)}")
-        print(f"Coarse output shape: {coarse_shape}")
-        print(f"Interpolated output shape: {interp_shape}")
-
-        # --- 2. Create Temporary Memmap Files ---
-        # We use tempfiles to ensure safe writes before finalizing
-        fd_c, temp_coarse_path = tempfile.mkstemp(suffix=".npy", dir=input_dir)
-        fd_i, temp_interp_path = tempfile.mkstemp(suffix=".npy", dir=input_dir)
-        os.close(fd_c)
-        os.close(fd_i)
-
-        print(f"Using temp coarse file: {temp_coarse_path}")
-        print(f"Using temp interp file: {temp_interp_path}")
-
-        coarse_mmap = np.memmap(
-            temp_coarse_path, dtype=dtype, mode="w+", shape=coarse_shape
-        )
-        interp_mmap = np.memmap(
-            temp_interp_path, dtype=dtype, mode="w+", shape=interp_shape
-        )
-        # IMPORTANT: Close memmaps so workers can open them
-        del coarse_mmap
-        del interp_mmap
-        print("Memmap file initialized.")
-
-        # --- 3. Set up Parallel Processing ---
-        print(f"Starting parallel processing with {NUM_WORKERS} workers...")
-
-        # Split all indices into chunks for each worker
-        all_indices = np.arange(num_samples)
-        index_chunks = np.array_split(all_indices, NUM_WORKERS)
-
-        # Create a partial function with fixed arguments
-        worker_func = partial(
-            process_chunk,
-            input_path=input_path,
-            temp_coarse_path=temp_coarse_path,
-            temp_interp_path=temp_interp_path,
-            coarse_shape=coarse_shape,
-            interp_shape=interp_shape,
-            dtype=dtype,
-            factor=DOWNSCALING_FACTOR,
-        )
-
-        with multiprocessing.Pool(processes=NUM_WORKERS) as pool:
-            results = list(
-                tqdm(
-                    pool.imap_unordered(worker_func, index_chunks),
-                    total=len(index_chunks),
-                    desc=f"Processing {data_split}",
-                )
-            )
-
-            # Print any errors returned by workers
-            for res in results:
-                if res is not None:
-                    print(f"Worker Error: {res}")
-
-        # --- 4. Finalize: Save Memmaps to NPZ ---
-        print("All workers finished. Compressing results to NPZ...")
-
-        # Load from temp memmaps
-        final_coarse_data = np.memmap(
-            temp_coarse_path, dtype=dtype, mode="r", shape=coarse_shape
-        )
-        final_interp_data = np.memmap(
-            temp_interp_path, dtype=dtype, mode="r", shape=interp_shape
-        )
-
-        # Save to compressed NPZ
-        np.savez_compressed(coarse_output_path, data=final_coarse_data)
-        np.savez_compressed(interp_output_path, data=final_interp_data)
-
-        print(f"Saved coarse data to: {coarse_output_path}")
-        print(f"Saved interpolated data to: {interp_output_path}")
-
-        # --- 5. Cleanup ---
-        print("Cleaning up temporary files...")
-        os.remove(temp_coarse_path)
-        os.remove(temp_interp_path)
-        print(f"Finished processing for {data_split}.")
+        # Process both 'original' (ML-ready) and 'physical' (Raw units)
+        for variant in VARIANTS:
+            process_dataset_variant(data_split, variant, input_dir)
 
 
 if __name__ == "__main__":
-    # Ensure numpy/cv2 are not multi-threading in the background
+    # Optimization flags for numpy/scipy
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
-    # Set the multiprocessing start method to 'spawn' for safety
-    # with C-extension libraries like scipy and numpy
+    # Safety for multiprocessing with C-extensions
     multiprocessing.set_start_method("spawn", force=True)
 
     main()

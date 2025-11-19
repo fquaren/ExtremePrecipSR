@@ -18,8 +18,12 @@
 #SBATCH --time 5:00:00
 
 
-EMULATORS_TO_EVAL=("GammaEmulatorv2_2025-11-03_09-22-21" "GammaEmulatorv2_2025-11-03_16-53-36" "GammaEmulatorv2_2025-11-02_01-55-24" "GammaEmulatorv2_2025-11-05_00-43-26")
-EMULATORS_TYPE=("hard" "hybrid" "soft" "none")
+# EMULATORS_TO_EVAL=("GammaEmulatorv2_2025-11-03_09-22-21" "GammaEmulatorv2_2025-11-14_10-45-56" "GammaEmulatorv2_2025-11-02_01-55-24" "GammaEmulatorv2_2025-11-05_00-43-26")
+# EMULATORS_TYPE=("hard" "hybrid" "soft" "none")
+
+EMULATORS_TO_EVAL=("GammaEmulatorv2_2025-11-19_11-33-05")
+EMULATORS_TYPE=("hybrid")
+
 
 N_EXPERIMENTS=${#EMULATORS_TO_EVAL[@]}
 echo "Found ${N_EXPERIMENTS} experiments to evaluate."
