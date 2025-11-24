@@ -46,14 +46,19 @@ def _plot_single_gamma_comparison(
 
     # Plot 1: Target Image
     ax_img = fig.add_subplot(gs[0, 0])
-    # 1. Create a copy of the colormap to avoid global side effects
+    # 1. Mask the zeros (replace 0 with NaN)
+    # We use copy to avoid modifying the original dataframe in place (side effects are bad)
+    plot_data = target_image.copy()
+    plot_data[plot_data <= 0] = np.nan
+
+    # 2. Prepare the Colormap
+    # We use 'Blues' for the rain, but copy it to modify the 'bad' value safely
     cmap = copy.copy(plt.get_cmap("Blues"))
-    # 2. Set the color for values below vmin (the 'under' values)
-    # RGBA tuple: Red=1, Green=1, Blue=0 (Yellow), Alpha=0.5
-    cmap.set_under(color=(1, 1, 0, 0.5))
-    # 3. Plot strictly positive vmin is required to trigger the 'under' color for exact zeros.
-    # 1e-5 is usually safe for precipitation mm/hr data.
-    im = ax_img.imshow(target_image, cmap=cmap, origin="lower", vmin=1e-5)
+    cmap.set_bad(color="lightgrey", alpha=1.0)  # Or 'silver', 'gainsboro'
+
+    # 3. Plot
+    # No vmin/vmax hacking needed. NaNs are automatically rendered as 'set_bad' color.
+    im = ax_img.imshow(plot_data, cmap=cmap, origin="lower")
     ax_img.set_title(f"Target Image (Mean: {mean_precip:.2f})")
     fig.colorbar(im, ax=ax_img, shrink=0.7, label="Precipitation (mm/hr)")
 
@@ -363,77 +368,6 @@ def plot_gamma_mean_std_by_quantile(
     print(f"Saved mean/std plots to: {plot_save_dir}")
 
 
-def plot_per_feature_matrices(per_feature_metrics, output_dir):
-    """
-    Generates heatmaps for R2, MSE, and Variance matrices.
-
-    Args:
-        per_feature_metrics (dict): Dictionary containing 'r2_matrix',
-                                    'mse_matrix', 'var_matrix' DataFrames.
-        output_dir (str): Path to save the plots.
-    """
-    print("\nGenerating per-feature matrix heatmaps...")
-
-    # Extract DataFrames
-    r2_df = per_feature_metrics["r2_matrix"]
-    mse_df = per_feature_metrics["mse_matrix"]
-    var_df = per_feature_metrics["var_matrix"]
-
-    # Setup figure
-    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
-    fig.suptitle(
-        "Per-Feature Metric Matrices (Component vs Quantile)", fontsize=16, y=1.05
-    )
-
-    # 1. R2 Heatmap
-    # We use a diverging colormap centered generally around good values.
-    # vmin=0 to visually distinguish negative/low R2 from good R2.
-    sns.heatmap(
-        r2_df,
-        ax=axes[0],
-        cmap="RdYlGn",
-        vmin=0,
-        vmax=1,
-        annot=True,
-        fmt=".2f",
-        cbar_kws={"label": "R² Score"},
-    )
-    axes[0].set_title("R² Score (Higher is Better)")
-    axes[0].set_xlabel("Quantile (mm/hr)")
-
-    # 2. MSE Heatmap
-    # diverse magnitudes across rows, so we rely on annotations for exact values
-    sns.heatmap(
-        mse_df,
-        ax=axes[1],
-        cmap="viridis",
-        annot=True,
-        fmt=".2e",
-        cbar_kws={"label": "Mean Squared Error"},
-    )
-    axes[1].set_title("MSE (Lower is Better)")
-    axes[1].set_xlabel("Quantile (mm/hr)")
-
-    # 3. Variance Heatmap
-    sns.heatmap(
-        var_df,
-        ax=axes[2],
-        cmap="magma",
-        annot=True,
-        fmt=".2e",
-        cbar_kws={"label": "Target Variance"},
-    )
-    axes[2].set_title("Target Variance (Data Spread)")
-    axes[2].set_xlabel("Quantile (mm/hr)")
-
-    plt.tight_layout()
-
-    save_path = os.path.join(output_dir, "evaluation_matrices.png")
-    plt.savefig(save_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved matrix heatmaps to: {save_path}")
-
-
 # --- 4. Training Log Plot ---
 
 
@@ -624,3 +558,170 @@ def plot_training_log(log_path, output_dir):
     plt.savefig(save_path, dpi=300)
     plt.close(fig)
     print(f"Saved training history plot to: {save_path}")
+
+
+def plot_per_feature_matrices(per_feature_metrics, output_dir):
+    """
+    Generates vertically stacked heatmaps for R2, MSE, and Variance matrices.
+    Cells are allowed to be rectangular (wider) to accommodate large value annotations.
+
+    Args:
+        per_feature_metrics (dict): Dictionary containing 'r2_matrix',
+                                    'mse_matrix', 'var_matrix' DataFrames.
+        output_dir (str): Path to save the plots.
+    """
+    print("\nGenerating per-feature matrix heatmaps (Vertical Stack)...")
+
+    # Extract DataFrames
+    r2_df = per_feature_metrics["r2_matrix"]
+    mse_df = per_feature_metrics["mse_matrix"]
+    var_df = per_feature_metrics["var_matrix"]
+    quantiles = per_feature_metrics["quantiles"]
+
+    # Setup figure: 3 Rows, 1 Column.
+    # figsize=(16, 24) gives a very wide aspect ratio for each subplot (approx 16:8)
+    # giving plenty of horizontal room for scientific notation.
+    fig, axes = plt.subplots(3, 1, figsize=(16, 24))
+    fig.suptitle(
+        "Per-Feature Metric Matrices (Component vs Quantile)", fontsize=20, y=0.92
+    )
+
+    # --- 1. R2 Heatmap ---
+    sns.heatmap(
+        r2_df,
+        ax=axes[0],
+        cmap="RdBu",
+        center=0.5,
+        vmin=0,
+        vmax=1,
+        annot=True,
+        fmt=".2f",
+        cbar_kws={"label": "R² Score"},
+        square=False,  # Allow rectangular cells to fit text
+        linewidths=1.0,
+        linecolor="white",
+        annot_kws={"size": 12},  # Larger font for readability
+    )
+    axes[0].set_title("R² Score (Blue > 0.5, Red < 0.5)", fontsize=16)
+    axes[0].set_xlabel("")  # Remove x-label for top plots to reduce clutter
+
+    # --- 2. MSE Heatmap ---
+    sns.heatmap(
+        mse_df,
+        ax=axes[1],
+        cmap="viridis",
+        annot=True,
+        fmt=".2e",  # Scientific notation for large values
+        cbar_kws={"label": "Mean Squared Error"},
+        square=False,
+        linewidths=1.0,
+        linecolor="white",
+        annot_kws={"size": 12},
+    )
+    axes[1].set_title("MSE (Lower is Better)", fontsize=16)
+    axes[1].set_xlabel("")
+
+    # --- 3. Variance Heatmap ---
+    sns.heatmap(
+        var_df,
+        ax=axes[2],
+        cmap="magma",
+        annot=True,
+        fmt=".2e",
+        cbar_kws={"label": "Target Variance"},
+        square=False,
+        linewidths=1.0,
+        linecolor="white",
+        annot_kws={"size": 12},
+    )
+    axes[2].set_title("Target Variance (Data Spread)", fontsize=16)
+    axes[2].set_xlabel("Quantile (mm/hr)", fontsize=14)
+
+    # Adjust formatting for all axes
+    for ax in axes:
+        ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=12)
+        ax.set_xticklabels([f"{q:.1f}" for q in quantiles], rotation=0, fontsize=12)
+        ax.tick_params(axis="both", which="both", length=0)  # Clean look
+
+    # Increase vertical spacing between subplots
+    plt.subplots_adjust(hspace=0.3)
+
+    save_path = os.path.join(output_dir, "evaluation_matrices.png")
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved matrix heatmaps to: {save_path}")
+
+
+# --- 5. QQ Plots (New Addition) ---
+
+
+def plot_qq_summary(metrics_df, output_dir):
+    """
+    Generates Quantile-Quantile (QQ) plots comparing the distribution of
+    Predicted vs Target values for A, P, and CC across the entire dataset.
+    """
+    print("\nGenerating QQ plots for A, P, and CC distributions...")
+
+    # Extract flattened arrays from the dataframe series
+    # Each row contains an array of shape (3, N_Quantiles).
+    # We stack them to get (N_Samples, 3, N_Quantiles), then flatten per component.
+
+    all_preds = np.stack(metrics_df["pred_gamma"].values)  # [N, 3, Q]
+    all_targets = np.stack(metrics_df["target_gamma"].values)  # [N, 3, Q]
+
+    components = ["Area (A)", "Perimeter (P)", "Concentration (CC)"]
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+    # Percentiles to compute (0% to 100%)
+    eval_percentiles = np.linspace(0, 100, 101)
+
+    for i in range(3):
+        ax = axes[i]
+        comp_name = components[i]
+
+        # Flatten all quantile thresholds into one massive distribution of values
+        # This answers: "Does the model predict the full range of Areas correctly?"
+        flat_pred = all_preds[:, i, :].flatten()
+        flat_target = all_targets[:, i, :].flatten()
+
+        # Remove NaNs if any (e.g., from masked arrays)
+        flat_pred = flat_pred[~np.isnan(flat_pred)]
+        flat_target = flat_target[~np.isnan(flat_target)]
+
+        # Compute Percentiles
+        q_pred = np.percentile(flat_pred, eval_percentiles)
+        q_target = np.percentile(flat_target, eval_percentiles)
+
+        # Plot
+        ax.plot(
+            q_target,
+            q_pred,
+            "o-",
+            color="royalblue",
+            markersize=4,
+            label="Model vs Target",
+        )
+
+        # 1:1 Reference Line
+        min_val = min(q_target.min(), q_pred.min())
+        max_val = max(q_target.max(), q_pred.max())
+        ax.plot([min_val, max_val], [min_val, max_val], "k--", label="1:1 Ideal")
+
+        ax.set_title(f"QQ Plot: {comp_name}")
+        ax.set_xlabel("Target Quantiles")
+        ax.set_ylabel("Predicted Quantiles")
+        ax.grid(True, linestyle="--", alpha=0.6)
+        ax.legend()
+
+        # Log scale is often useful for A and P which span orders of magnitude
+        if i < 2:  # A and P
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+
+    fig.suptitle("Global Quantile-Quantile (QQ) Plots", fontsize=16)
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+    save_path = os.path.join(output_dir, "evaluation_qq_plots.png")
+    plt.savefig(save_path, dpi=300)
+    plt.close(fig)
+    print(f"Saved QQ plots to: {save_path}")

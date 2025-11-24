@@ -137,7 +137,7 @@ class GammaPredictorHierarchicalHardGated(nn.Module):
         feat_CC_gated = feat_CC_raw * gate_P
         raw_CC_logits = self.out_CC(self.dropout(feat_CC_gated))
 
-        # --- C. Constraints (Same as before) ---
+        # --- C. Constraints ---
         with torch.no_grad():
             threshold = self.quantile_levels_tensor[0]
             mask = torch.nan_to_num(x_phys, nan=-1.0) >= threshold
@@ -179,9 +179,10 @@ class GammaPredictorHierarchicalSoftGated(nn.Module):
         self.n_quantiles = n_quantiles
         self.activation = activation_fn
 
+        # --- 1. Internal Normalizer ---
         self.normalizer = InputNormalization(max_precip_value)
 
-        # CNN Trunk
+        # --- CNN Trunk ---
         self.conv1 = nn.Conv2d(1, 16, 3, padding=1)
         self.bn1 = nn.BatchNorm2d(16)
         self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
@@ -192,16 +193,19 @@ class GammaPredictorHierarchicalSoftGated(nn.Module):
 
         self.fc_input_size = self._get_conv_output_size(input_shape)
 
-        # Gated Heads Setup
+        # --- Gated Heads Setup ---
         self.shared_fc = nn.Linear(self.fc_input_size, 256)
 
+        # 1. Head A
         self.fc_A = nn.Linear(256, 128)
         self.out_A = nn.Linear(128, self.n_quantiles)
 
+        # 2. Head P (Gated by A)
         self.fc_P = nn.Linear(256, 128)
         self.gate_A_to_P = nn.Linear(128, 128)
         self.out_P = nn.Linear(128, self.n_quantiles)
 
+        # 3. Head CC (Gated by P)
         self.fc_CC = nn.Linear(256, 128)
         self.gate_P_to_CC = nn.Linear(128, 128)
         self.out_CC = nn.Linear(128, self.n_quantiles)
@@ -221,6 +225,7 @@ class GammaPredictorHierarchicalSoftGated(nn.Module):
         return x
 
     def forward(self, x_phys):
+        # 1. Backbone
         x_norm = self.normalizer(x_phys)
         x_conv = self._forward_conv(x_norm)
         x_flat = torch.flatten(x_conv, 1)
@@ -228,28 +233,46 @@ class GammaPredictorHierarchicalSoftGated(nn.Module):
         shared = self.activation(self.shared_fc(x_flat))
         shared = self.dropout(shared)
 
-        # 1. Path A
+        # 2. Path A
         feat_A = self.activation(self.fc_A(shared))
         raw_A = self.out_A(self.dropout(feat_A))
 
-        # 2. Path P (Gated by A)
+        # 3. Path P (Gated by A)
         feat_P_raw = self.activation(self.fc_P(shared))
         gate_A = torch.sigmoid(self.gate_A_to_P(feat_A))
         feat_P_gated = feat_P_raw * gate_A
         raw_P = self.out_P(self.dropout(feat_P_gated))
 
-        # 3. Path CC (Gated by P)
+        # 4. Path CC (Gated by P)
         feat_CC_raw = self.activation(self.fc_CC(shared))
         gate_P = torch.sigmoid(self.gate_P_to_CC(feat_P_gated))
         feat_CC_gated = feat_CC_raw * gate_P
         raw_CC = self.out_CC(self.dropout(feat_CC_gated))
 
+        # 5. Activations & Constraints
         pred_A = F.softplus(raw_A)
         pred_P = F.softplus(raw_P)
-        pred_CC = F.softplus(raw_CC)
+
+        # Scientific Fix for CC:
+        # Training -> Differentiable Float (can approach 0)
+        # Validation -> Integer Rounding
+        pred_CC_continuous = F.softplus(raw_CC)
+
+        if self.training:
+            pred_CC = pred_CC_continuous
+        else:
+            pred_CC = torch.round(pred_CC_continuous)
 
         final_output = torch.stack([pred_A, pred_P, pred_CC], dim=1)
-        return final_output
+
+        # 6. Global Dry Mask
+        # Analytical constraint: If input is dry, output is zero.
+        with torch.no_grad():
+            epsilon = 1e-6
+            is_dry_mask = x_phys.sum(dim=(1, 2, 3)) <= epsilon
+            wet_factor = (~is_dry_mask).float().view(-1, 1, 1)
+
+        return final_output * wet_factor
 
 
 class GammaPredictorSeparateHeadsHard(nn.Module):
@@ -355,7 +378,14 @@ class GammaPredictorSeparateHeadsHard(nn.Module):
         R_P = 1.0 + F.softplus(raw_P_logits)
         pred_P = P_min * R_P
 
-        pred_CC = F.softplus(raw_CC_logits)
+        pred_CC_continuous = F.softplus(raw_CC_logits)
+
+        if self.training:
+            # TRAIN: Pure float. Can go down to 0.0.
+            pred_CC = pred_CC_continuous
+        else:
+            # EVAL: Round to nearest integer.
+            pred_CC = torch.round(pred_CC_continuous)
 
         constrained_output = torch.stack([pred_A, pred_P, pred_CC], dim=1)
 
@@ -370,10 +400,10 @@ class GammaPredictorSeparateHeadsHard(nn.Module):
 class GammaPredictorSeparateHeadsSoft(nn.Module):
     def __init__(
         self,
-        input_shape=(1, PATCH_SIZE, PATCH_SIZE),
-        n_quantiles=N_QUANTILES,
+        input_shape=(1, 128, 128),
+        n_quantiles=9,
         activation_fn=F.gelu,
-        max_precip_value=150.0,  # <--- NEW
+        max_precip_value=150.0,
     ):
         super(GammaPredictorSeparateHeadsSoft, self).__init__()
         self.n_quantiles = n_quantiles
@@ -392,6 +422,7 @@ class GammaPredictorSeparateHeadsSoft(nn.Module):
 
         self.fc_input_size = self._get_conv_output_size(input_shape)
 
+        # --- Separate Heads (Unchanged) ---
         self.head_A = nn.Sequential(
             nn.Linear(self.fc_input_size, 256),
             self.activation,
@@ -434,17 +465,40 @@ class GammaPredictorSeparateHeadsSoft(nn.Module):
         return x
 
     def forward(self, x_phys):
+        # 1. Backbone
         x_norm = self.normalizer(x_phys)
         x_conv = self._forward_conv(x_norm)
         x_flat = x_conv.view(-1, self.fc_input_size)
 
+        # 2. Raw Logits
         raw_A = self.head_A(x_flat)
         raw_P = self.head_P(x_flat)
         raw_CC = self.head_CC(x_flat)
 
+        # 3. Activations
         pred_A = F.softplus(raw_A)
         pred_P = F.softplus(raw_P)
-        pred_CC = F.softplus(raw_CC)
 
+        # --- CC Handling (Scientific Logic) ---
+        pred_CC_continuous = F.softplus(raw_CC)
+
+        if self.training:
+            # Differentiable: [0, inf)
+            pred_CC = pred_CC_continuous
+        else:
+            # Interpretable: Integers {0, 1, 2...}
+            pred_CC = torch.round(pred_CC_continuous)
+
+        # 4. Stack
         final_output = torch.stack([pred_A, pred_P, pred_CC], dim=1)
-        return final_output
+
+        # 5. Apply Global Dry Mask
+        # Even in "Soft" mode, if the input is empty, output MUST be zero.
+        # This helps the Zero Penalty converge instantly.
+        with torch.no_grad():
+            epsilon = 1e-6
+            # Sum pixels to see if patch is empty
+            is_dry_mask = x_phys.sum(dim=(1, 2, 3)) <= epsilon
+            wet_factor = (~is_dry_mask).float().view(-1, 1, 1)
+
+        return final_output * wet_factor

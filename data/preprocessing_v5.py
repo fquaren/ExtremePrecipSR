@@ -162,15 +162,7 @@ def parallel_preprocess_and_save_data(
     np.savez_compressed(output_file_phys, data=data_array)
     print(f"Saved PHYSICAL data {data_array.shape} to {output_file_phys}")
 
-    # --- TRANSFORMATION PIPELINE ---
-
-    # 1. Log Transformation (In-place to save RAM)
-    # Mathematical formulation: x' = ln(1 + x)
-    if transform_input_precip:
-        print("Applying Log-Transform (log1p) to data...")
-        np.log1p(data_array, out=data_array)
-
-    # 2. Min-Max Scaling Logic
+    # Min-Max Scaling Logic
     if global_max is None:
         # Training Mode: Calculate Max from the (possibly logged) data
         current_max = np.max(data_array)
@@ -183,11 +175,35 @@ def parallel_preprocess_and_save_data(
         print(f"Using provided global max for scaling: {global_max}")
         current_max = global_max
 
+    # --- TRANSFORMATION PIPELINE ---
+
+    # 1. Log Transformation (In-place to save RAM)
+    # Mathematical formulation: x' = ln(1 + x)
+    if transform_input_precip:
+        print("Applying Log-Transform (log1p) to data...")
+        np.log1p(data_array, out=data_array)
+
+    # 2. Min-Max Scaling Logic (For the "original_precip.npz")
+    # This calculates the max of the LOGGED data (e.g., 5.0)
+    # We usually keep this for Super-Resolution models that work in log-space
+    if global_max is None:
+        log_space_max = np.max(data_array)
+        if log_space_max == 0:
+            log_space_max = 1.0
+        current_max_for_scaling = log_space_max
+
+        # Save the Log-Space scalar too (optional, if needed for other models)
+        scaler_log_path = os.path.join(preprocessed_data_dir, "scaler_max_log.npy")
+        np.save(scaler_log_path, np.array([log_space_max]))
+    else:
+        # IMPORTANT: If global_max is passed, it must be the LOG space max
+        # if we are normalizing log data!
+        current_max_for_scaling = global_max
+
     # 3. Apply Scaling (In-place)
-    # Mathematical formulation: x'' = x' / max(x'_train)
-    # Note: We perform division in place.
+    # Mathematical formulation: x'' = x' / max(x'_train)    # Note: We perform division in place.
     # We must cast to float32 explicitely if not already, though it should be.
-    data_array /= current_max
+    data_array /= current_max_for_scaling
 
     # 4. Clip to ensure [0, 1] bounds (numerical stability)
     np.clip(data_array, 0.0, 1.0, out=data_array)

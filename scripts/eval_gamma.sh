@@ -21,9 +21,11 @@
 # EMULATORS_TO_EVAL=("GammaEmulatorv2_2025-11-03_09-22-21" "GammaEmulatorv2_2025-11-14_10-45-56" "GammaEmulatorv2_2025-11-02_01-55-24" "GammaEmulatorv2_2025-11-05_00-43-26")
 # EMULATORS_TYPE=("hard" "hybrid" "soft" "none")
 
-EMULATORS_TO_EVAL=("GammaEmulatorv2_2025-11-19_11-33-05")
-EMULATORS_TYPE=("hybrid")
+# EMULATORS_TO_EVAL=("GammaEmulatorv2_2025-11-19_22-59-25" "GammaEmulatorv2_2025-11-20_01-54-13" "GammaEmulatorv2_2025-11-20_02-59-31")
+# EMULATORS_TYPE=("hybrid" "hard" "soft")
 
+EMULATORS_TO_EVAL=("GammaEmulatorv2_2025-11-21_13-52-52")
+EMULATORS_TYPE=("none")
 
 N_EXPERIMENTS=${#EMULATORS_TO_EVAL[@]}
 echo "Found ${N_EXPERIMENTS} experiments to evaluate."

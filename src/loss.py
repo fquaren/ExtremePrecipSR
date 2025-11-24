@@ -85,7 +85,8 @@ def estimate_s_inv_from_dataset(dataset, num_samples, device):
     indices = torch.randperm(len(dataset))[:num_samples].tolist()
     all_gamma_A, all_gamma_P, all_gamma_CC = [], [], []
     for idx in tqdm(indices, desc="Collecting gamma targets"):
-        _, _, _, Y_gamma = dataset[idx]
+        out_dataset = dataset[idx]
+        Y_gamma = out_dataset[-1]
         all_gamma_A.append(Y_gamma[0, :].numpy())
         all_gamma_P.append(Y_gamma[1, :].numpy())
         all_gamma_CC.append(Y_gamma[2, :].numpy())

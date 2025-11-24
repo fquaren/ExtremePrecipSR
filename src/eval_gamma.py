@@ -148,6 +148,9 @@ def main(run_dir, constraint_mode):
     # Plot metric distributions
     plotting_lib.plot_metric_distributions(metrics_df=metrics_df, output_dir=run_dir)
 
+    # --- Plot QQ Summary ---
+    plotting_lib.plot_qq_summary(metrics_df=metrics_df, output_dir=run_dir)
+
     # Plot mean/std by group
     plotting_lib.plot_gamma_mean_std_by_quantile(
         metrics_df=metrics_df,

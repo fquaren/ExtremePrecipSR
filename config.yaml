@@ -1,86 +1,80 @@
-# Paths
+# Paths (Unchanged)
 RAW_OPERA_DATA_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data/OPERA"
 METADATA_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA"
 PREPROCESSED_DATA_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/precip"
 DEM_DATA_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/dem"
 DEM_STATS: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/dem/dem_stats.json"
 
-TRAIN_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/train_patches_metadata.txt"
-# TRAIN_METADATA_FILE: "/home/fquareng/work/data/train_patches_metadata.txt"
-VAL_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/val_patches_metadata.txt"
-# VAL_METADATA_FILE: "/home/fquareng/work/data/val_patches_metadata.txt"
-TEST_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/test_patches_metadata.txt"
-# TEST_METADATA_FILE: "/home/fquareng/work/data/test_patches_metadata.txt"
-
+TRAIN_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/train_patches_metadata_with_stats.txt"
+VAL_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/val_patches_metadata_with_stats.txt"
+TEST_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/test_patches_metadata_with_stats.txt"
 MAX_PRECIP_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/precip/scaler_max_val.npy"
-
 
 # Precipitation patches
 PRECIP_VAR_NAME: "TOT_PREC"
 DRIZZLE_THRESHOLD: 0.1
-MAX_DATASET_PRECIP: 
 PATCH_SIZE: 128
 DOWNSCALING_FACTOR: 6
-PIXEL_SIZE_KM: 2.0 # Size of one high-res pixel in km
-PERSISTENCE_THRESHOLD: 1.0 # Persistence threshold for topological simplification
+PIXEL_SIZE_KM: 2.0
+PERSISTENCE_THRESHOLD: 1.0
 
-ANALYSIS_DATA_PERCENTAGE: 100 # Use 100% of the data. Change to 50 for 50%, etc.
+ANALYSIS_DATA_PERCENTAGE: 100
 
-# Ratios for splitting the dataset. Must sum to 1.0.
+# Ratios
 SPLIT_RATIOS:
   train: 0.8
   validation: 0.1
   test: 0.1
 
 # DataLoaders
-NUM_WORKERS: 16
-BATCH_SIZE: 32
-BATCH_COMPOSITION:
-  "dry": 0.33
-  "normal": 0.33
-  "extreme": 0.33
+NUM_WORKERS: 24
+BATCH_SIZE: 256
+SAMPLE_WEIGHTS:
+  "dry": 1.0
+  "normal": 1.0
+  "extreme": 1.0
 
 EXPERIMENT_NAME: "GammaEmulatorv2"
 
-# Training Gamma emulator
-ARCHITECTURE: "Vanilla"  # "Attention"
-CONSTRAINT_MODE: "hybrid"  # 'soft', 'hard', 'hybrid', 'none'
-LOSS_LAMBDA: 0.25 # between 0 and 1 (Loss = lambda*zero_penalty + (1-lambda)*main_loss)
+# Gamma emulator settings
+ARCHITECTURE: "Attention" 
+CONSTRAINT_MODE: "hard"
+CONSTRAINT_WARMUP_EPOCHS: 10
+LOSS_LAMBDA: 0.25 
+
+# Weights loss
 WEIGHT_A: 1.0
 WEIGHT_P: 1.0
-WEIGHT_CC: 1.0
-LAMBDA_BOUND: 1.0 # Soft constraint for CC
+WEIGHT_CC: 0.5
+
+LAMBDA_MONOTONICITY: 0.1
+LAMBDA_PLAUSIBILITY: 0.1
+LAMBDA_BOUND: 0.1
+
 SUBSAMPLE_FRACTION: 1
 device: "cuda"
-NUM_EPOCHS: 100
+NUM_EPOCHS: 50
 PATIENCE: 10
 EARLY_STOPPING: true
-EARLY_STOPPING_PATIENCE: 10
+EARLY_STOPPING_PATIENCE: 15
 EARLY_STOPPING_DELTA: 0.001
-LEARNING_RATE: 0.00001
-WEIGHT_DECAY: 0.0001
-QUANTILE_LEVELS: [
-  0.01,
-  0.05,
-  0.1,
-  0.25,
-  0.5,
-  0.75,
-  0.9,
-  0.95,
-  0.99,
-]
 
-# Evaluation emulator
-EMULATOR_CHECKPOINT_PATH: "/scratch/fquareng/experiment_runs/GammaEmulatorv2_2025-11-03_09-22-21/best_model_checkpoint.pth"
+LEARNING_RATE: 0.00005
+WEIGHT_DECAY: 0.00001
+
+QUANTILE_LEVELS: [0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]
+
+# Evaluation emulator (Using the best Hard+Attention model)
+EMULATOR_CHECKPOINT_PATH: "experiment_runs/GammaEmulatorv2_2025-11-21_04-39-13/best_model_checkpoint.pth"
 
 # Training super resolution
-METRIC_LOSS_MODE: 'train'  # 'none', 'train', 'validate'
-METRIC_LOSS_TYPE: 'geometric'  # 'cdf', 'geometric'
-METRIC_WARMUP_EPOCHS: 10 # Number of epochs with no METRIC loss
-METRIC_RAMP_EPOCHS: 50 # Number of epochs to ramp up the METRIC loss
-METRIC_LOSS_WEIGHT: 5 # Weight of the METRIC loss when METRIC_LOSS_MODE is not 'none' (between 0 and 1)
-S_ESTIMATION_SAMPLES: 10000 # Number of samples to estimate METRIC loss
+METRIC_LOSS_MODE: 'train'
+METRIC_LOSS_TYPE: 'geometric'
+METRIC_WARMUP_EPOCHS: 10
+METRIC_RAMP_EPOCHS: 10
+METRIC_LOSS_WEIGHT: 0.1
+S_ESTIMATION_SAMPLES: 10000
 
 # Evaluation
-EVAL_MODE: 'train'  # 'none', 'train', 'validate'
+EVAL_MODE: 'train'
+TRUST_TAU: 0.045

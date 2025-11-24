@@ -36,10 +36,8 @@ def load_model(config, device, run_dir, constraint_mode_override=None):
     N_QUANTILES = len(config["QUANTILE_LEVELS"])
     PATCH_SIZE = config["PATCH_SIZE"]
     PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 1.0)
-    ARCHITECTURE = config.get("ARCHITECTURE", "Vanilla")
-
-    # Default overrides for current experiments
-    ARCHITECTURE = "Vanilla"
+    ARCHITECTURE = "Attention"  # config["ARCHITECTURE"]
+    print(ARCHITECTURE)
 
     if ARCHITECTURE == "Vanilla":
         HARD_EMULATOR = GammaPredictorSeparateHeadsHard
@@ -47,6 +45,8 @@ def load_model(config, device, run_dir, constraint_mode_override=None):
     elif ARCHITECTURE == "Attention":
         HARD_EMULATOR = GammaPredictorHierarchicalHardGated
         SOFT_EMULATOR = GammaPredictorHierarchicalSoftGated
+    else:
+        print("Architecture type not valid.")
 
     CONSTRAINT_MODE = config.get("CONSTRAINT_MODE", "hybrid")
     if constraint_mode_override:
@@ -56,12 +56,13 @@ def load_model(config, device, run_dir, constraint_mode_override=None):
     INPUT_SHAPE = (1, PATCH_SIZE, PATCH_SIZE)
 
     if CONSTRAINT_MODE == "soft" or CONSTRAINT_MODE == "none":
-        print("Using SOFT constraints model (GammaPredictorSeparateHeadsSoft).")
+        print("Using SOFT constrained model.")
         model = SOFT_EMULATOR(
             input_shape=INPUT_SHAPE, n_quantiles=N_QUANTILES, activation_fn=nn.Mish()
         ).to(device)
     elif CONSTRAINT_MODE == "hybrid" or CONSTRAINT_MODE == "hard":
-        print("Using HYBRID constraints model (GammaPredictorSeparateHeadsHard).")
+        print("Using HARD constrained model.")
+        print(f"Architecture: {ARCHITECTURE}.")
         model = HARD_EMULATOR(
             input_shape=INPUT_SHAPE,
             n_quantiles=N_QUANTILES,
