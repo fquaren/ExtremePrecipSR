@@ -13,42 +13,48 @@
 #SBATCH --gres-flags enforce-binding
 #SBATCH --nodes 1
 #SBATCH --ntasks 1
-#SBATCH --cpus-per-task 16
-#SBATCH --mem 250G
+#SBATCH --cpus-per-task 24
+#SBATCH --mem 350G
 #SBATCH --time 72:00:00
 
+# --- Environment Setup ---
+source /users/fquareng/.bashrc
+micromamba activate dl-torch
 
-# export SINGULARITY_BINDPATH="/work,/scratch,/users"
-# export SINGULARITYENV_LD_PRELOAD="/opt/hpcx/ucc/lib/libucc.so.1:/opt/hpcx/ucx/lib/libucp.so.0:/opt/hpcx/ucx/lib/libucs.so.0" 
-# container_path="/users/fquareng/singularity/dl_gh200.sif"
-# singularity exec --nv "$container_path" python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_gamma.py
+# --- 1. Data Generation Step ---
+# Only runs once before the training loop starts
+echo "--- Running Offline Data Generation (MixUp) ---"
+micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/data/mixup_dataset.py
 
-# source /users/fquareng/.bashrc
-# micromamba activate dl-torch
-# micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_gamma.py
+# --- 2. Define Experiment Configurations ---
+# We use parallel arrays to define specific pairs of (Architecture, Constraint Mode)
+# 1. Attention with hard constraints
+# 2. Attention with soft constraints
+# 3. Attention no constraints
+# 4. Vanilla no constraints
 
-EMULATORS_TYPE=("hybrid" "hard" "soft" "none")
-ARCHITECTURE_TYPE=("Vanilla" "Attention")
+ARCHS=("Attention" "Attention" "Attention" "Vanilla")
+MODES=("hard"      "soft"      "none"      "none")
 
-N_EXPERIMENTS=${#EMULATORS_TYPE[@]}
-N_ARCHS=${#ARCHITECTURE_TYPE[@]}
-echo "Found ${N_EXPERIMENTS} X ${N_ARCHS} experiments to train."
+# Get number of experiments (should be 4)
+N_EXPS=${#ARCHS[@]}
 
-for (( i=0; i<${N_EXPERIMENTS}; i++ )); do
-    m=${EMULATORS_TYPE[i]}
-    for a in "${ARCHITECTURE_TYPE[@]}"; do
-        echo "--- Starting training for constraint Mode: $m, Architecture: $a ---"
+echo "Found ${N_EXPS} specific experiments to train."
 
-        source /users/fquareng/.bashrc
-        micromamba activate dl-torch
-        micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_gamma.py \
-            --constraint_mode "$m" --arch "$a"
-        # singularity exec --nv "$container_path" python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_gamma.py \
-        #     --constraint_mode "$m" --arch "$a"
+# --- 3. Training Loop ---
+for (( i=0; i<${N_EXPS}; i++ )); do
+    curr_arch=${ARCHS[i]}
+    curr_mode=${MODES[i]}
 
-        echo "--- Finished training for: $m, $a ---"
-        echo ""
-    done
+    echo "=========================================================="
+    echo "Experiment $((i+1))/${N_EXPS}: Architecture=${curr_arch}, Mode=${curr_mode}"
+    echo "=========================================================="
+
+    micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_gamma.py \
+        --constraint_mode "$curr_mode" --arch "$curr_arch"
+
+    echo "--- Finished Experiment $((i+1)) ---"
+    echo ""
 done
 
 echo "All training complete."

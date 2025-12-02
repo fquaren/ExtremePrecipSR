@@ -179,24 +179,16 @@ class AddGaussianNoise(object):
         return self.__class__.__name__ + f"(mean={self.mean}, std={self.std})"
 
 
-class PairedInterpolationDataset(Dataset):
+class PrecomputedMixupDataset(Dataset):
     def __init__(
         self,
         preprocessed_data_dir,
         metadata_file,
-        quantile_levels,
-        pixel_size_km,
-        augment=False,
-        noise_std=0.05,
-        mixup_alpha=0.4,
-        mixup_prob=0.8,
-        use_physics_consistent_mixup=True,
+        augment=True,
+        include_original=True,  # Set True to train on Real + MixUp
+        include_mixup=True,  # Set True to train on Real + MixUp
     ):
-        self.quantile_levels = quantile_levels
-        self.pixel_size_km = pixel_size_km
-        self.use_physics_consistent_mixup = use_physics_consistent_mixup
-
-        # --- Metadata Loading ---
+        # Metadata loading (assumes metadata aligns with 'physical_precip.npz')
         with open(metadata_file, "r") as f:
             lines = f.readlines()
         try:
@@ -204,35 +196,52 @@ class PairedInterpolationDataset(Dataset):
             start_idx = 0
         except ValueError:
             start_idx = 1
-        self.metadata = [line.strip().split() for line in lines[start_idx:]]
+        self.metadata_raw = [line.strip().split() for line in lines[start_idx:]]
 
-        # --- Load Data (Memory Mapped) ---
-        self.real_patches = np.load(
-            os.path.join(preprocessed_data_dir, "physical_precip.npz"), mmap_mode="r"
-        )["data"]
-        self.real_targets = np.load(
-            os.path.join(preprocessed_data_dir, "gamma_targets.npz"), mmap_mode="r"
-        )["data"]
-        self.interp_patches = np.load(
-            os.path.join(preprocessed_data_dir, "interpolated_physical_precip.npz"),
-            mmap_mode="r",
-        )["data"]
+        self.data_sources = []
+        self.target_sources = []
 
-        # Only load interpolated targets if we rely on linear approximation (Option B)
-        if not self.use_physics_consistent_mixup:
-            self.interp_targets = np.load(
-                os.path.join(preprocessed_data_dir, "gamma_targets_interpolated.npz"),
-                mmap_mode="r",
-            )["data"]
+        # 1. Load Original Real Data
+        if include_original:
+            print("Loading Original Real Data...")
+            self.data_sources.append(
+                np.load(
+                    os.path.join(preprocessed_data_dir, "physical_precip.npz"),
+                    mmap_mode="r",
+                )["data"]
+            )
+            self.target_sources.append(
+                np.load(
+                    os.path.join(preprocessed_data_dir, "gamma_targets.npz"),
+                    mmap_mode="r",
+                )["data"]
+            )
+
+        # 2. Load Pre-computed MixUp Data
+        if include_mixup:
+            print("Loading Pre-computed MixUp Data...")
+            mix_p_path = os.path.join(
+                preprocessed_data_dir, "mixup_augmented_precip.npz"
+            )
+            mix_t_path = os.path.join(
+                preprocessed_data_dir, "mixup_augmented_targets.npz"
+            )
+
+            if os.path.exists(mix_p_path) and os.path.exists(mix_t_path):
+                self.data_sources.append(np.load(mix_p_path, mmap_mode="r")["data"])
+                self.target_sources.append(np.load(mix_t_path, mmap_mode="r")["data"])
+            else:
+                print(
+                    f"Warning: MixUp files not found at {mix_p_path}. Training without them."
+                )
+
+        # Create indexing map
+        self.cumulative_sizes = np.cumsum([len(d) for d in self.data_sources])
+        self.total_len = self.cumulative_sizes[-1]
 
         self.augment = augment
-        self.noise_std = noise_std
-        self.mixup_alpha = mixup_alpha
-        self.mixup_prob = mixup_prob
-
-        # Augmentation Pipeline
         if self.augment:
-            self.spatial_transform = T.Compose(
+            self.transform = T.Compose(
                 [
                     T.RandomHorizontalFlip(p=0.5),
                     T.RandomVerticalFlip(p=0.5),
@@ -242,58 +251,32 @@ class PairedInterpolationDataset(Dataset):
                 ]
             )
 
+        print(f"Total Dataset Size: {self.total_len} samples.")
+
     def __len__(self):
-        return len(self.metadata)
+        return self.total_len
 
     def __getitem__(self, idx):
-        # 1. Load Data
-        real_img = torch.from_numpy(self.real_patches[idx]).float().unsqueeze(0)
-        interp_img = torch.from_numpy(self.interp_patches[idx]).float().unsqueeze(0)
+        # Resolve Index to Source
+        source_idx = np.searchsorted(self.cumulative_sizes, idx, side="right")
+        if source_idx == 0:
+            local_idx = idx
+        else:
+            local_idx = idx - self.cumulative_sizes[source_idx - 1]
 
-        # 2. Augmentations (Spatial + Noise)
+        patch = self.data_sources[source_idx][local_idx]
+        target_phys = self.target_sources[source_idx][local_idx]
+
+        # To Tensor
+        input_tensor = torch.from_numpy(patch).float().unsqueeze(0)
+        target_phys_tensor = torch.from_numpy(target_phys).float()
+
+        # Augmentation (Spatial Only - No MixUp here)
         if self.augment:
-            # Spatial: Transform both identically
-            combined = torch.cat([real_img, interp_img], dim=0)
-            combined = self.spatial_transform(combined)
-            real_img = combined[0:1]
-            interp_img = combined[1:2]
+            input_tensor = self.transform(input_tensor)
 
-            # Noise: Only on Interpolated
-            noise = torch.randn_like(interp_img) * self.noise_std
-            interp_img_noisy = torch.clamp(interp_img + noise, min=0.0)
-        else:
-            interp_img_noisy = interp_img
+        # Log Transform for training
+        log_target_gamma = torch.log1p(target_phys_tensor)
 
-        # 3. MixUp Logic
-        mixed_input = real_img
-        mixed_target_phys = None
-
-        if self.augment and (torch.rand(1).item() < self.mixup_prob):
-            lambda_val = np.random.beta(self.mixup_alpha, self.mixup_alpha)
-            mixed_input = lambda_val * real_img + (1 - lambda_val) * interp_img_noisy
-
-            # --- CRITICAL BRANCH ---
-            if self.use_physics_consistent_mixup:
-                # OPTION A: Compute TRUE topology of the mixed mess
-                # Using the imported function from loss.py
-                img_np = mixed_input.squeeze(0).numpy()
-
-                gamma_matrix = compute_gamma_matrix_for_image(
-                    img_np, self.quantile_levels, self.pixel_size_km
-                )
-                mixed_target_phys = torch.from_numpy(gamma_matrix).float()
-            else:
-                # OPTION B: Linear Approximation
-                real_t = torch.from_numpy(self.real_targets[idx]).float()
-                interp_t = torch.from_numpy(self.interp_targets[idx]).float()
-                mixed_target_phys = lambda_val * real_t + (1 - lambda_val) * interp_t
-
-        else:
-            # No Mixup -> Just Real Data
-            mixed_input = real_img
-            mixed_target_phys = torch.from_numpy(self.real_targets[idx]).float()
-
-        # Final Log Transform
-        log_target_gamma = torch.log1p(mixed_target_phys)
-
-        return mixed_input, log_target_gamma, real_img, mixed_target_phys
+        # Return same signature as before
+        return input_tensor, log_target_gamma, input_tensor, target_phys_tensor

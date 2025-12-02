@@ -15,7 +15,6 @@
 #SBATCH --mem 0
 #SBATCH --time 12:00:00
 
-
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
@@ -27,5 +26,5 @@ export OPENBLAS_NUM_THREADS=1
 
 source /users/fquareng/.bashrc
 micromamba activate dl-torch
-micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/data/generate_stats.py
+micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/data/mixup_dataset.py
 
