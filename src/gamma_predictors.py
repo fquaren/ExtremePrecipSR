@@ -4,11 +4,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
+import os
 
-# Load configuration
-config_path = (
-    "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/config.yaml"
-)
+# --- Config ---
+parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+config_path = os.path.join(parent_path, "config.yaml")
 with open(config_path, "r") as file:
     config = yaml.safe_load(file)
 
@@ -48,6 +48,7 @@ class GammaPredictorHierarchicalHardGated(nn.Module):
         quantile_levels=[0.0],
         pixel_area_km2=1.0,
         max_precip_value=150.0,
+        q_embedding_dim=32,
     ):
         super(GammaPredictorHierarchicalHardGated, self).__init__()
         self.n_quantiles = n_quantiles
@@ -56,6 +57,7 @@ class GammaPredictorHierarchicalHardGated(nn.Module):
             "quantile_levels_tensor", torch.tensor(quantile_levels, dtype=torch.float32)
         )
         self.pixel_area_km2 = pixel_area_km2
+        self.q_emb = q_embedding_dim
 
         # --- 1. Internal Normalizer ---
         self.normalizer = InputNormalization(max_precip_value)
@@ -71,26 +73,36 @@ class GammaPredictorHierarchicalHardGated(nn.Module):
 
         self.fc_input_size = self._get_conv_output_size(input_shape)
 
-        # --- 3. Gated Interaction Heads ---
-
-        # Shared latent representation
+        # --- 3. Shared Latent ---
         self.shared_fc = nn.Linear(self.fc_input_size, 256)
-
-        # Branch A (Independent)
-        self.fc_A = nn.Linear(256, 128)
-        self.out_A = nn.Linear(128, self.n_quantiles)
-
-        # Branch P (Dependent on A)
-        self.fc_P = nn.Linear(256, 128)
-        self.gate_A_to_P = nn.Linear(128, 128)  # Learns how A modifies P
-        self.out_P = nn.Linear(128, self.n_quantiles)
-
-        # Branch CC (Dependent on P)
-        self.fc_CC = nn.Linear(256, 128)
-        self.gate_P_to_CC = nn.Linear(128, 128)  # Learns how P modifies CC
-        self.out_CC = nn.Linear(128, self.n_quantiles)
-
         self.dropout = nn.Dropout(0.3)
+
+        # --- 4. Convolutional Heads (IQ-CGN) ---
+        total_latent_size = self.n_quantiles * self.q_emb
+
+        # Expansion
+        self.expand_A = nn.Linear(256, total_latent_size)
+        self.expand_P = nn.Linear(256, total_latent_size)
+        self.expand_CC = nn.Linear(256, total_latent_size)
+
+        # Mixing (Spectral Smoothing)
+        self.mix_A = nn.Conv1d(self.q_emb, self.q_emb, kernel_size=3, padding=1)
+        self.mix_P = nn.Conv1d(self.q_emb, self.q_emb, kernel_size=3, padding=1)
+        self.mix_CC = nn.Conv1d(self.q_emb, self.q_emb, kernel_size=3, padding=1)
+
+        # Output Heads
+        self.head_A = nn.Conv1d(self.q_emb, 1, kernel_size=1)
+        self.head_P = nn.Conv1d(self.q_emb, 1, kernel_size=1)
+        self.head_CC = nn.Conv1d(self.q_emb, 1, kernel_size=1)
+
+        # --- Gating Mechanisms ---
+
+        # Gate A -> P
+        self.gate_A_to_P = nn.Conv1d(self.q_emb, self.q_emb, kernel_size=1)
+
+        # Gate (A + P) -> CC (MODIFIED)
+        # Concatenates A and P features to inform CC
+        self.gate_AP_to_CC = nn.Conv1d(self.q_emb * 2, self.q_emb, kernel_size=1)
 
     def _get_conv_output_size(self, shape):
         with torch.no_grad():
@@ -106,38 +118,62 @@ class GammaPredictorHierarchicalHardGated(nn.Module):
 
     def forward(self, x_phys):
         epsilon = 1e-6
+        batch_size = x_phys.size(0)
 
         # --- A. Backbone ---
         x_norm = self.normalizer(x_phys)
         x_conv = self._forward_conv(x_norm)
         x_flat = torch.flatten(x_conv, 1)
 
-        # Shared dense layer
         shared = self.activation(self.shared_fc(x_flat))
         shared = self.dropout(shared)
 
-        # --- B. Gated Forward Pass ---
+        # Helper: Reshape to (Batch, Channels, Length)
+        def to_sequence(tensor):
+            return tensor.view(batch_size, self.n_quantiles, self.q_emb).permute(
+                0, 2, 1
+            )
+
+        # --- B. Gated Convolutional Pass ---
 
         # 1. Path A
-        feat_A = self.activation(self.fc_A(shared))
-        raw_A_logits = self.out_A(self.dropout(feat_A))
+        raw_A_flat = self.expand_A(shared)
+        feat_A_seq = to_sequence(raw_A_flat)
+        feat_A_mixed = self.activation(self.mix_A(feat_A_seq))  # [B, q_emb, n_q]
+
+        raw_A_logits = self.head_A(self.dropout(feat_A_mixed)).squeeze(1)
 
         # 2. Path P (Gated by A)
-        feat_P_raw = self.activation(self.fc_P(shared))
-        # Gate: sigmoidal map from A's features [0, 1]
-        gate_A = torch.sigmoid(self.gate_A_to_P(feat_A))
-        # Apply Gate: Element-wise multiplication (Attention)
-        feat_P_gated = feat_P_raw * gate_A
-        raw_P_logits = self.out_P(self.dropout(feat_P_gated))
+        raw_P_flat = self.expand_P(shared)
+        feat_P_seq = to_sequence(raw_P_flat)
+        feat_P_mixed = self.activation(self.mix_P(feat_P_seq))
 
-        # 3. Path CC (Gated by P)
-        feat_CC_raw = self.activation(self.fc_CC(shared))
-        # Gate: sigmoidal map from P's *gated* features
-        gate_P = torch.sigmoid(self.gate_P_to_CC(feat_P_gated))
-        feat_CC_gated = feat_CC_raw * gate_P
-        raw_CC_logits = self.out_CC(self.dropout(feat_CC_gated))
+        # Gate Calculation (A -> P)
+        gate_A = torch.sigmoid(self.gate_A_to_P(feat_A_mixed))
+        feat_P_gated = feat_P_mixed * gate_A
 
-        # --- C. Constraints ---
+        raw_P_logits = self.head_P(self.dropout(feat_P_gated)).squeeze(1)
+
+        # 3. Path CC (Gated by A + P)
+        raw_CC_flat = self.expand_CC(shared)
+        feat_CC_seq = to_sequence(raw_CC_flat)
+        feat_CC_mixed = self.activation(self.mix_CC(feat_CC_seq))
+
+        # --- FUSED GATING LOGIC ---
+        # Concatenate A features and Gated P features
+        feat_combined = torch.cat(
+            [feat_A_mixed, feat_P_gated], dim=1
+        )  # [B, 2*q_emb, n_q]
+
+        # Calculate Gate
+        gate_AP = torch.sigmoid(self.gate_AP_to_CC(feat_combined))
+
+        feat_CC_gated = feat_CC_mixed * gate_AP
+        raw_CC_logits = self.head_CC(self.dropout(feat_CC_gated)).squeeze(1)
+
+        # --- C. Hard Constraints ---
+
+        # 1. Area: Softmax + Cumsum (Monotonicity)
         with torch.no_grad():
             threshold = self.quantile_levels_tensor[0]
             mask = torch.nan_to_num(x_phys, nan=-1.0) >= threshold
@@ -145,14 +181,20 @@ class GammaPredictorHierarchicalHardGated(nn.Module):
 
         probs_A = torch.softmax(raw_A_logits, dim=1)
         scaled_probs_A = probs_A * A_total
+
+        # Enforce monotonicity: A(q_i) >= A(q_{i+1})
         pred_A = torch.flip(
             torch.cumsum(torch.flip(scaled_probs_A, dims=[1]), dim=1), dims=[1]
         )
 
+        # 2. Perimeter: Geometric Lower Bound
+        # P must be at least the perimeter of a circle with Area A
         P_min = torch.sqrt(4 * math.pi * (pred_A + epsilon))
+        # Network predicts deviation factor (R_P >= 1.0)
         R_P = 1.0 + F.softplus(raw_P_logits)
         pred_P = P_min * R_P
 
+        # 3. CC: Rounding for inference
         pred_CC_continuous = F.softplus(raw_CC_logits)
         pred_CC = (
             pred_CC_continuous if self.training else torch.round(pred_CC_continuous)
@@ -174,15 +216,17 @@ class GammaPredictorHierarchicalSoftGated(nn.Module):
         n_quantiles=9,
         activation_fn=F.gelu,
         max_precip_value=150.0,
+        q_embedding_dim=32,
     ):
         super(GammaPredictorHierarchicalSoftGated, self).__init__()
         self.n_quantiles = n_quantiles
         self.activation = activation_fn
+        self.q_emb = q_embedding_dim
 
         # --- 1. Internal Normalizer ---
         self.normalizer = InputNormalization(max_precip_value)
 
-        # --- CNN Trunk ---
+        # --- 2. CNN Trunk ---
         self.conv1 = nn.Conv2d(1, 16, 3, padding=1)
         self.bn1 = nn.BatchNorm2d(16)
         self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
@@ -193,24 +237,38 @@ class GammaPredictorHierarchicalSoftGated(nn.Module):
 
         self.fc_input_size = self._get_conv_output_size(input_shape)
 
-        # --- Gated Heads Setup ---
+        # --- 3. Shared Latent ---
         self.shared_fc = nn.Linear(self.fc_input_size, 256)
-
-        # 1. Head A
-        self.fc_A = nn.Linear(256, 128)
-        self.out_A = nn.Linear(128, self.n_quantiles)
-
-        # 2. Head P (Gated by A)
-        self.fc_P = nn.Linear(256, 128)
-        self.gate_A_to_P = nn.Linear(128, 128)
-        self.out_P = nn.Linear(128, self.n_quantiles)
-
-        # 3. Head CC (Gated by P)
-        self.fc_CC = nn.Linear(256, 128)
-        self.gate_P_to_CC = nn.Linear(128, 128)
-        self.out_CC = nn.Linear(128, self.n_quantiles)
-
         self.dropout = nn.Dropout(0.5)
+
+        # --- 4. Convolutional Heads (IQ-CGN) ---
+        total_latent_size = self.n_quantiles * self.q_emb
+
+        # Expansion
+        self.expand_A = nn.Linear(256, total_latent_size)
+        self.expand_P = nn.Linear(256, total_latent_size)
+        self.expand_CC = nn.Linear(256, total_latent_size)
+
+        # Mixing (Spectral Smoothing)
+        self.mix_A = nn.Conv1d(self.q_emb, self.q_emb, kernel_size=3, padding=1)
+        self.mix_P = nn.Conv1d(self.q_emb, self.q_emb, kernel_size=3, padding=1)
+        self.mix_CC = nn.Conv1d(self.q_emb, self.q_emb, kernel_size=3, padding=1)
+
+        # Output Projection
+        self.head_A = nn.Conv1d(self.q_emb, 1, kernel_size=1)
+        self.head_P = nn.Conv1d(self.q_emb, 1, kernel_size=1)
+        self.head_CC = nn.Conv1d(self.q_emb, 1, kernel_size=1)
+
+        # --- Gating Mechanisms ---
+
+        # Gate A -> P (Unchanged)
+        # Input: Features of A (dim: q_emb) -> Output: Gate for P (dim: q_emb)
+        self.gate_A_to_P = nn.Conv1d(self.q_emb, self.q_emb, kernel_size=1)
+
+        # Gate (A + P) -> CC (MODIFIED)
+        # We concatenate features of A and P, so input dim is 2 * q_emb.
+        # The network learns how to weight A vs P for the CC gate.
+        self.gate_AP_to_CC = nn.Conv1d(self.q_emb * 2, self.q_emb, kernel_size=1)
 
     def _get_conv_output_size(self, shape):
         with torch.no_grad():
@@ -225,6 +283,8 @@ class GammaPredictorHierarchicalSoftGated(nn.Module):
         return x
 
     def forward(self, x_phys):
+        batch_size = x_phys.size(0)
+
         # 1. Backbone
         x_norm = self.normalizer(x_phys)
         x_conv = self._forward_conv(x_norm)
@@ -233,31 +293,54 @@ class GammaPredictorHierarchicalSoftGated(nn.Module):
         shared = self.activation(self.shared_fc(x_flat))
         shared = self.dropout(shared)
 
+        # Helper: Reshape to (Batch, Channels, Length)
+        def to_sequence(tensor):
+            return tensor.view(batch_size, self.n_quantiles, self.q_emb).permute(
+                0, 2, 1
+            )
+
         # 2. Path A
-        feat_A = self.activation(self.fc_A(shared))
-        raw_A = self.out_A(self.dropout(feat_A))
+        raw_A_flat = self.expand_A(shared)
+        feat_A_seq = to_sequence(raw_A_flat)
+        feat_A_mixed = self.activation(self.mix_A(feat_A_seq))  # [B, q_emb, n_q]
+
+        raw_A_logits = self.head_A(self.dropout(feat_A_mixed)).squeeze(1)
 
         # 3. Path P (Gated by A)
-        feat_P_raw = self.activation(self.fc_P(shared))
-        gate_A = torch.sigmoid(self.gate_A_to_P(feat_A))
-        feat_P_gated = feat_P_raw * gate_A
-        raw_P = self.out_P(self.dropout(feat_P_gated))
+        raw_P_flat = self.expand_P(shared)
+        feat_P_seq = to_sequence(raw_P_flat)
+        feat_P_mixed = self.activation(self.mix_P(feat_P_seq))
 
-        # 4. Path CC (Gated by P)
-        feat_CC_raw = self.activation(self.fc_CC(shared))
-        gate_P = torch.sigmoid(self.gate_P_to_CC(feat_P_gated))
-        feat_CC_gated = feat_CC_raw * gate_P
-        raw_CC = self.out_CC(self.dropout(feat_CC_gated))
+        # Gate Calculation (A -> P)
+        gate_A = torch.sigmoid(self.gate_A_to_P(feat_A_mixed))
+        feat_P_gated = feat_P_mixed * gate_A
+
+        raw_P_logits = self.head_P(self.dropout(feat_P_gated)).squeeze(1)
+
+        # 4. Path CC (Gated by A AND P)
+        raw_CC_flat = self.expand_CC(shared)
+        feat_CC_seq = to_sequence(raw_CC_flat)
+        feat_CC_mixed = self.activation(self.mix_CC(feat_CC_seq))
+
+        # --- FUSED GATING LOGIC ---
+        # Concatenate features along the channel dimension (dim=1)
+        # feat_A_mixed: [B, q_emb, n_q]
+        # feat_P_gated: [B, q_emb, n_q] (Using the gated P features passes the 'refined' info)
+        feat_combined = torch.cat(
+            [feat_A_mixed, feat_P_gated], dim=1
+        )  # [B, 2*q_emb, n_q]
+
+        # Generate Gate from combined info
+        gate_AP = torch.sigmoid(self.gate_AP_to_CC(feat_combined))
+
+        feat_CC_gated = feat_CC_mixed * gate_AP
+        raw_CC_logits = self.head_CC(self.dropout(feat_CC_gated)).squeeze(1)
 
         # 5. Activations & Constraints
-        pred_A = F.softplus(raw_A)
-        pred_P = F.softplus(raw_P)
+        pred_A = F.softplus(raw_A_logits)
+        pred_P = F.softplus(raw_P_logits)
 
-        # Scientific Fix for CC:
-        # Training -> Differentiable Float (can approach 0)
-        # Validation -> Integer Rounding
-        pred_CC_continuous = F.softplus(raw_CC)
-
+        pred_CC_continuous = F.softplus(raw_CC_logits)
         if self.training:
             pred_CC = pred_CC_continuous
         else:
@@ -266,7 +349,6 @@ class GammaPredictorHierarchicalSoftGated(nn.Module):
         final_output = torch.stack([pred_A, pred_P, pred_CC], dim=1)
 
         # 6. Global Dry Mask
-        # Analytical constraint: If input is dry, output is zero.
         with torch.no_grad():
             epsilon = 1e-6
             is_dry_mask = x_phys.sum(dim=(1, 2, 3)) <= epsilon

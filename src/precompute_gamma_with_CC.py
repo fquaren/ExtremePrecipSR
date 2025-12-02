@@ -10,11 +10,9 @@ import tempfile
 # Suppress specific warning from scikit-image
 warnings.filterwarnings("ignore", message="No contour found", category=UserWarning)
 
-# --- Configuration Loading ---
-config_path = (
-    "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/config.yaml"
-    # "/home/fquareng/work/ExtremePrecipSR/config.yaml"
-)
+# --- Config ---
+parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+config_path = os.path.join(parent_path, "config.yaml")
 with open(config_path, "r") as file:
     config = yaml.safe_load(file)
 
@@ -62,35 +60,30 @@ def compute_gamma_matrix_for_image(prec_2d_data, thresholds, pixel_size_km):
     return gamma_matrix
 
 
-# --- Main Processing Function (Optimized) ---
-def process_and_save_gamma_targets(data_split):
+# --- Main Processing Function (Generic) ---
+def process_single_file_topology(data_split, input_filename, output_filename):
     """
-    Loads precipitation data for a split (e.g., 'train'),
-    computes all gamma matrices, and saves them to a new file
-    using a memory-efficient memmap approach.
+    Generic function to compute topology for a specific input file within a data split.
     """
-    print(f"--- Processing data split: {data_split} ---")
-
-    # Define paths
     input_dir = os.path.join(PREPROCESSED_DATA_DIR, data_split)
-    precip_path = os.path.join(input_dir, "original_precip.npz")
-    output_path = os.path.join(input_dir, "gamma_targets.npz")
+    input_path = os.path.join(input_dir, input_filename)
+    output_path = os.path.join(input_dir, output_filename)
+
+    if not os.path.exists(input_path):
+        print(f"Warning: Input file not found at {input_path}. Skipping.")
+        return
+
+    print(f"Processing {input_filename} for split: {data_split}...")
 
     # Create a temporary file path for the memmap
-    # This file will hold the uncompressed results.
     temp_fd, temp_output_path = tempfile.mkstemp(suffix=".npy", dir=input_dir)
-    os.close(temp_fd)  # Close the file handle, we just need the path
+    os.close(temp_fd)
 
     print(f"Using temporary memmap file at: {temp_output_path}")
 
-    if not os.path.exists(precip_path):
-        print(f"Precipitation file not found at {precip_path}. Skipping.")
-        if os.path.exists(temp_output_path):
-            os.remove(temp_output_path)
-        return
-
-    print(f"Loading precipitation data from {precip_path}...")
-    precip_data = np.load(precip_path, mmap_mode="r")["data"]
+    print(f"Loading data from {input_path}...")
+    # Load input data (using mmap to save RAM)
+    precip_data = np.load(input_path, mmap_mode="r")["data"]
     num_samples = precip_data.shape[0]
 
     # 1. Define the shape of the final array
@@ -98,32 +91,24 @@ def process_and_save_gamma_targets(data_split):
     output_dtype = np.float32
 
     # 2. Create a memory-mapped array on disk in 'write' mode
-    # This does NOT load into RAM.
     gamma_targets_array_mmap = np.memmap(
         temp_output_path, dtype=output_dtype, mode="w+", shape=output_shape
     )
 
-    print("Computing Gamma matrices for all samples (writing to memmap)...")
-    for i in tqdm(range(num_samples), desc=f"Calculating Gamma for {data_split}"):
+    print(f"Computing Gamma matrices for {input_filename}...")
+    for i in tqdm(range(num_samples), desc=f"Calculating Topology ({input_filename})"):
         prec_field = precip_data[i]
         gamma_matrix = compute_gamma_matrix_for_image(
             prec_field, QUANTILE_LEVELS, PIXEL_SIZE_KM
         )
-
-        # 3. Write the result for this slice directly to the file
         gamma_targets_array_mmap[i] = gamma_matrix
 
-    # 4. Flush changes to disk and close the memmap file
+    # 3. Flush changes to disk
     print("Flushing computed data to disk...")
     gamma_targets_array_mmap.flush()
-    del gamma_targets_array_mmap  # This closes the file mapping
+    del gamma_targets_array_mmap  # Closes the file mapping
 
     # --- Step 2: Compress the file ---
-    # Now, load the temporary file (which is on disk) in read-only
-    # mmap mode and save it using savez_compressed.
-    # This streams the data from disk to the compressed file
-    # without loading the whole thing into RAM.
-
     print(f"Reloading from memmap and compressing to {output_path}...")
     final_data_mmap = np.memmap(
         temp_output_path, dtype=output_dtype, mode="r", shape=output_shape
@@ -134,12 +119,31 @@ def process_and_save_gamma_targets(data_split):
     # 5. Clean up the temporary file
     print(f"Cleaning up temporary file: {temp_output_path}")
     os.remove(temp_output_path)
+    print(f"Saved {output_path}. Shape: {output_shape}")
 
-    print(f"Finished processing for {data_split}. Shape of saved data: {output_shape}")
+
+def main():
+    data_splits = ["train", "validation", "test"]
+
+    # Define the pairs of (Input Filename, Output Filename)
+    processing_tasks = [
+        # ("physical_precip.npz", "gamma_targets.npz"),
+        (
+            "interpolated_physical_precip.npz",
+            "gamma_targets_persistence_interpolated.npz",
+        ),
+    ]
+
+    for split in data_splits:
+        print(f"\n{'='*40}")
+        print(f"--- DATA SPLIT: {split.upper()} ---")
+        print(f"{'='*40}")
+
+        for input_name, output_name in processing_tasks:
+            process_single_file_topology(split, input_name, output_name)
+
+    print("\nAll pre-computation is complete.")
 
 
 if __name__ == "__main__":
-    data_splits = ["train", "validation", "test"]
-    for split in data_splits:
-        process_and_save_gamma_targets(split)
-    print("\nAll pre-computation is complete.")
+    main()

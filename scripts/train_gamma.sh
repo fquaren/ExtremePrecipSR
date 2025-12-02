@@ -15,7 +15,7 @@
 #SBATCH --ntasks 1
 #SBATCH --cpus-per-task 16
 #SBATCH --mem 250G
-#SBATCH --time 24:00:00
+#SBATCH --time 72:00:00
 
 
 # export SINGULARITY_BINDPATH="/work,/scratch,/users"

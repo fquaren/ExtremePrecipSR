@@ -9,9 +9,9 @@ import multiprocessing
 import sys
 
 # Load configuration
-config_path = (
-    "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/config.yaml"
-)
+# --- Config ---
+parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+config_path = os.path.join(parent_path, "config.yaml")
 with open(config_path, "r") as file:
     config = yaml.safe_load(file)
 
@@ -193,7 +193,9 @@ def parallel_preprocess_and_save_data(
         current_max_for_scaling = log_space_max
 
         # Save the Log-Space scalar too (optional, if needed for other models)
-        scaler_log_path = os.path.join(preprocessed_data_dir, "scaler_max_log.npy")
+        scaler_log_path = os.path.join(
+            preprocessed_data_dir, "log_transformed_precip_max_val.npy"
+        )
         np.save(scaler_log_path, np.array([log_space_max]))
     else:
         # IMPORTANT: If global_max is passed, it must be the LOG space max
@@ -271,7 +273,10 @@ def main():
         return
 
     # Save the scaler
-    np.save(os.path.join(base_dir, "scaler_max_val.npy"), np.array([train_max]))
+    np.save(
+        os.path.join(base_dir, "precip_max_val.npy"),
+        np.array([train_max]),
+    )
 
     # 2. Process Validation Data
     print("\n--- Validation Data ---")

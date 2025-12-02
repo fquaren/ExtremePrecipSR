@@ -22,10 +22,9 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
-# --- Configuration Loading ---
-config_path = (
-    "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/config.yaml"
-)
+# --- Config ---
+parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+config_path = os.path.join(parent_path, "config.yaml")
 with open(config_path, "r") as file:
     config = yaml.safe_load(file)
 

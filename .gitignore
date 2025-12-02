@@ -1,3 +1,5 @@
 *.txt
 *cache*
 src/__pycache__
+*experiment*
+*logs*

@@ -4,10 +4,9 @@ from matplotlib.colors import LogNorm
 import os
 import yaml
 
-# --- Configuration Loading ---
-config_path = (
-    "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/config.yaml"
-)
+# --- Config ---
+parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+config_path = os.path.join(parent_path, "config.yaml")
 with open(config_path, "r") as file:
     config = yaml.safe_load(file)
 
