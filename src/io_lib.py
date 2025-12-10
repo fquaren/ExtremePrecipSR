@@ -12,7 +12,7 @@ from gamma_predictors import (
     GammaPredictorHierarchicalHardGated,
 )
 from loss import estimate_s_inv_from_dataset
-from dataset import PreprocessedNpzDataset
+from dataset import PrecomputedMixupDataset
 
 
 def setup_evaluation(run_dir):
@@ -31,18 +31,18 @@ def setup_evaluation(run_dir):
     return config, device
 
 
-def load_model(config, device, run_dir, constraint_mode_override=None):
+def load_model(
+    config, device, run_dir, constraint_mode_override=None, architecture_type=None
+):
     """Loads the specified model and checkpoint."""
     N_QUANTILES = len(config["QUANTILE_LEVELS"])
     PATCH_SIZE = config["PATCH_SIZE"]
-    PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 1.0)
-    ARCHITECTURE = "Attention"  # config["ARCHITECTURE"]
-    print(ARCHITECTURE)
+    PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 2.0)
 
-    if ARCHITECTURE == "Vanilla":
+    if architecture_type == "Vanilla":
         HARD_EMULATOR = GammaPredictorSeparateHeadsHard
         SOFT_EMULATOR = GammaPredictorSeparateHeadsSoft
-    elif ARCHITECTURE == "Attention":
+    elif architecture_type == "Attention":
         HARD_EMULATOR = GammaPredictorHierarchicalHardGated
         SOFT_EMULATOR = GammaPredictorHierarchicalSoftGated
     else:
@@ -62,7 +62,7 @@ def load_model(config, device, run_dir, constraint_mode_override=None):
         ).to(device)
     elif CONSTRAINT_MODE == "hybrid" or CONSTRAINT_MODE == "hard":
         print("Using HARD constrained model.")
-        print(f"Architecture: {ARCHITECTURE}.")
+        print(f"Architecture: {architecture_type}.")
         model = HARD_EMULATOR(
             input_shape=INPUT_SHAPE,
             n_quantiles=N_QUANTILES,
@@ -89,9 +89,13 @@ def load_model(config, device, run_dir, constraint_mode_override=None):
 
 def load_data(config):
     """Loads test data loader."""
-    test_dataset = PreprocessedNpzDataset(
+    # Validation: Real Data + Precomputed MixUp Data
+    test_dataset = PrecomputedMixupDataset(
         preprocessed_data_dir=os.path.join(config["PREPROCESSED_DATA_DIR"], "test"),
         metadata_file=config["TEST_METADATA_FILE"],
+        augment=False,
+        include_original=True,  # Load physical_precip.npz
+        include_mixup=False,  # Don't load mixup_augmented_precip.npz
     )
     test_loader = DataLoader(
         test_dataset,
@@ -107,10 +111,12 @@ def load_data(config):
 def load_s_inv(config, device):
     """Loads train dataset to compute S_inv for geometric loss."""
     print("Loading train dataset to compute S_inv...")
-    train_dataset_for_s_inv = PreprocessedNpzDataset(
+    train_dataset_for_s_inv = PrecomputedMixupDataset(
         preprocessed_data_dir=os.path.join(config["PREPROCESSED_DATA_DIR"], "train"),
         metadata_file=config["TRAIN_METADATA_FILE"],
-        augment=False,
+        augment=True,
+        include_original=True,  # Load physical_precip.npz
+        include_mixup=True,  # Load mixup_augmented_precip.npz
     )
     S_inv_tensors = estimate_s_inv_from_dataset(
         train_dataset_for_s_inv, config.get("S_ESTIMATION_SAMPLES", 1000), device

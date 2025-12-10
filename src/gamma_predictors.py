@@ -46,7 +46,7 @@ class GammaPredictorHierarchicalHardGated(nn.Module):
         n_quantiles,
         activation_fn=F.gelu,
         quantile_levels=[0.0],
-        pixel_area_km2=1.0,
+        pixel_area_km2=4.0,
         max_precip_value=150.0,
         q_embedding_dim=32,
     ):
@@ -364,7 +364,7 @@ class GammaPredictorSeparateHeadsHard(nn.Module):
         n_quantiles,
         activation_fn=F.gelu,
         quantile_levels=[0.0],
-        pixel_area_km2=1.0,
+        pixel_area_km2=4.0,
         max_precip_value=150.0,
     ):
         super(GammaPredictorSeparateHeadsHard, self).__init__()

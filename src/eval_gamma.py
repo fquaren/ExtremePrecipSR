@@ -67,11 +67,13 @@ def run_prediction_loop(model, loader, eval_metric, geom_metric_per_sample, devi
     )
 
 
-def main(run_dir, constraint_mode):
+def main(run_dir, constraint_mode, architecture_type):
 
     # --- 1. Setup ---
     config, device = io_lib.setup_evaluation(run_dir)
-    model = io_lib.load_model(config, device, run_dir, constraint_mode)
+    model = io_lib.load_model(
+        config, device, run_dir, constraint_mode, architecture_type
+    )
     test_loader = io_lib.load_data(config)
     S_inv_tensors = io_lib.load_s_inv(config, device)
 
@@ -183,6 +185,13 @@ if __name__ == "__main__":
         default=None,
         help="(Optional) Override constraint mode (none, soft, hybrid, hard).",
     )
+    parser.add_argument(
+        "--architecture_type",
+        type=str,
+        required=False,
+        default=None,
+        help="(Optional) Override architecture type (Vanilla, Attention).",
+    )
     args = parser.parse_args()
 
-    main(args.run_dir, args.constraint_mode)
+    main(args.run_dir, args.constraint_mode, args.architecture_type)

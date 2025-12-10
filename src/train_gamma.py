@@ -38,12 +38,12 @@ PREPROCESSED_DATA_DIR = config["PREPROCESSED_DATA_DIR"]
 TRAIN_METADATA_FILE = config["TRAIN_METADATA_FILE"]
 VAL_METADATA_FILE = config["VAL_METADATA_FILE"]
 BATCH_SIZE = config.get("BATCH_SIZE", 128)
-LEARNING_RATE = config.get("LEARNING_RATE", 1e-4)
+LEARNING_RATE = 0.00005
 WEIGHT_DECAY = config.get("WEIGHT_DECAY", 1e-4)
 NUM_EPOCHS = config.get("NUM_EPOCHS", 10)
 EARLY_STOPPING_PATIENCE = config.get("EARLY_STOPPING_PATIENCE", 10)
 EARLY_STOPPING_DELTA = config.get("EARLY_STOPPING_DELTA", 0.001)
-PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 1.0)
+PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 2.0)
 MAX_DATASET_PRECIP = float(np.load(config["MAX_PRECIP_FILE"]))
 
 # --- Constraint Configuration ---
@@ -84,7 +84,7 @@ def main():
 
     # --- Setup Experiment Directory ---
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_name = f"{EXPERIMENT_NAME}_{timestamp}"
+    run_name = f"{EXPERIMENT_NAME}_{CONSTRAINT_MODE}_{current_arch}_{timestamp}"
     output_dir = os.path.join("experiment_runs", run_name)
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, "config.yaml"), "w") as f:
@@ -102,13 +102,13 @@ def main():
         include_mixup=True,  # Load mixup_augmented_precip.npz
     )
 
-    # Validation: Real Data ONLY (Strict Physics Check)
+    # Validation: Real Data + Precomputed MixUp Data
     val_dataset_full = PrecomputedMixupDataset(
         preprocessed_data_dir=os.path.join(PREPROCESSED_DATA_DIR, "validation"),
         metadata_file=VAL_METADATA_FILE,
-        augment=False,  # No rotation/flips for fixed validation set
-        include_original=True,
-        include_mixup=False,  # Do not load synthetic data for validation
+        augment=False,
+        include_original=True,  # Load physical_precip.npz
+        include_mixup=False,  # Don't load mixup_augmented_precip.npz
     )
 
     indices = torch.randperm(len(val_dataset_full))[

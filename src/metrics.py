@@ -25,7 +25,7 @@ def compute_fss(pred_np, target_np, window_size, threshold):
 
 
 # --- Analytical SAL (Structure, Amplitude, Location) Function ---
-def compute_sal(pred_np, target_np, threshold, pixel_area_km2=1.0):
+def compute_sal(pred_np, target_np, threshold, pixel_area_km2=4.0):
     """Calculates the Wernli et al. (2008) SAL metric."""
 
     # --- Amplitude (A) ---

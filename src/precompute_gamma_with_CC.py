@@ -25,7 +25,7 @@ PIXEL_SIZE_KM = config["PIXEL_SIZE_KM"]
 def compute_A_P_CC_single_threshold_numpy(
     prec_2d_np,
     threshold,
-    pixel_size_km=1.0,
+    pixel_size_km=2.0,
 ):
     """Computes Area, Perimeter using skimage, and Connected Components using TDA."""
     prec_2d_np_clean = np.nan_to_num(prec_2d_np, nan=-1.0)

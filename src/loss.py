@@ -138,7 +138,7 @@ class TotalErrorMetric(nn.Module):
         super(TotalErrorMetric, self).__init__()
         self.component_criterion = ComponentWiseCDFLoss(quantile_levels)
         self.config = config
-        self.pixel_area_km2 = config.get("PIXEL_SIZE_KM", 1.0) ** 2
+        self.pixel_area_km2 = config.get("PIXEL_SIZE_KM", 2.0) ** 2
 
     def forward(self, input_data, predicted_gamma_phys, log_target_gamma):
         # 1. Calculate main loss in log space

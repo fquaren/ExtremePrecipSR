@@ -30,7 +30,7 @@ with open(config_path, "r") as file:
 
 QUANTILE_LEVELS = np.array(config["QUANTILE_LEVELS"], dtype=np.float32)
 PREPROCESSED_DATA_DIR = config["PREPROCESSED_DATA_DIR"]
-PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 1.0)
+PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 2.0)
 NUM_WORKERS = config.get("NUM_WORKERS", os.cpu_count())
 WORKER_CHUNK_SIZE = config.get("WORKER_CHUNK_SIZE", 100)
 

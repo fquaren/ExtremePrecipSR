@@ -35,26 +35,22 @@ def run_prediction_loop(
     quantile_levels,
     pixel_size_km,
     trust_tau,
+    physical_max_val,  # <--- CRITICAL ARG: The scaler value (~5.0)
+    drizzle_threshold=0.1,  # <--- CRITICAL ARG: To remove background noise
 ):
     model.eval()
     if emulator:
         emulator.eval()
 
-    # Storage for Analytic Gammas (True Validation)
+    # Storage... (same as before)
     all_preds_gamma_analytic = []
     all_targets_gamma_analytic = []
-
-    # Storage for Physical Images and Inputs
     all_preds_phys = []
     all_targets_phys = []
     all_inputs_phys = []
     all_dems = []
-
-    # Storage for Losses and Scores
     all_total_losses, all_mse_losses, all_surrogate_losses = [], [], []
-    all_trust_scores = []  # New: Store Trust Score per sample
-
-    # Emulator Audit Metrics
+    all_trust_scores = []
     audit_results = {
         "L1_phys_err": [],
         "L2_perc_err": [],
@@ -62,29 +58,41 @@ def run_prediction_loop(
         "consistency_gap": [],
     }
 
+    print("\n--- Starting SR Inference ---")
+
     with torch.no_grad():
-        for X, Y_true_phys, Y_gamma_phys_analytic in tqdm(loader, desc="Inference"):
-            X, Y_true_phys, Y_gamma_phys_analytic = (
+        for X, Y_true, Y_gamma_log_target in tqdm(loader, desc="Inference"):
+            X, Y_true, Y_gamma_log_target = (
                 X.to(device),
-                Y_true_phys.to(device),
-                Y_gamma_phys_analytic.to(device),
+                Y_true.to(device),
+                Y_gamma_log_target.to(device),
             )
 
-            # Forward Pass
+            # --- 1. RECONSTRUCT PHYSICAL PRECIPITATION ---
             pred_X_raw = model(X)
-            # Standard Physics Clamp (ReLU) for metrics
-            pred_X_phys = F.relu(pred_X_raw)
-            # Note: In training we used Softplus for the emulator branch to keep gradients alive.
-            # For evaluation/metrics, we use ReLU as negative rain is physically impossible.
+
+            # A. Inverse Transform (Log Norm -> Physical)
+            # Use Softplus -> Scale -> Expm1 chain from training
+            pred_X_pos = F.softplus(pred_X_raw, beta=5.0)
+            pred_X_phys = torch.expm1(pred_X_pos * physical_max_val)
+
+            # Apply same transform to Ground Truth (which is normalized log in dataset)
+            Y_true_phys = torch.expm1(Y_true * physical_max_val)
+
+            # B. Apply Sparsity / Drizzle Threshold
+            # Crucial for TDA and Emulator consistency.
+            # This prevents 0.01 mm/h background noise from being counted as a 65,000 km^2 storm.
+            pred_X_phys = pred_X_phys * (pred_X_phys > drizzle_threshold).float()
+            Y_true_phys = Y_true_phys * (Y_true_phys > drizzle_threshold).float()
 
             # --- Data Extraction ---
             input_precip_batch = X[:, 0, :, :].cpu().numpy()
             dem_batch = X[:, 1, :, :].cpu().numpy()
-
             all_inputs_phys.append(input_precip_batch)
             all_dems.append(dem_batch)
 
-            # --- 1. Compute Analytic Gamma for Predictions (CPU TDA) ---
+            # --- 2. Compute Analytic Gamma (CPU TDA) ---
+            # Now inputs are physically correct (mm/h), so TDA will work
             pred_X_np = pred_X_phys.cpu().numpy()
             batch_gammas = []
             for i in range(pred_X_np.shape[0]):
@@ -92,60 +100,67 @@ def run_prediction_loop(
                     pred_X_np[i, 0], quantile_levels, pixel_size_km
                 )
                 batch_gammas.append(g)
-            batch_gammas = np.array(batch_gammas)
 
-            all_preds_gamma_analytic.append(batch_gammas)
-            all_targets_gamma_analytic.append(Y_gamma_phys_analytic.cpu().numpy())
+            all_preds_gamma_analytic.append(np.array(batch_gammas))
 
-            # --- 2. Calculate Standard Losses ---
+            # --- FIX: INVERSE TRANSFORM TARGETS FOR ANALYTIC COMPARISON ---
+            # The dataloader gives Log-Space targets (Y_gamma_log_target).
+            # We must inverse them to Physical Space (Area in km^2) so the MSE tables make sense.
+            Y_gamma_phys_target = np.expm1(Y_gamma_log_target.cpu().numpy())
+            all_targets_gamma_analytic.append(Y_gamma_phys_target)
+
+            # --- 3. Calculate Losses ---
+            # Standard metrics on Physical Values (MAE/MSE)
             loss_mse = mse_criterion(pred_X_phys, Y_true_phys).mean(dim=(1, 2, 3))
             loss_surr = torch.zeros_like(loss_mse)
-            trust_vec = torch.ones_like(loss_mse)  # Default trust 1.0
+            trust_vec = torch.ones_like(loss_mse)
 
             if emulator:
                 # --- Trust Calculation ---
-                # How well does the emulator see the Ground Truth?
-                gamma_true_emu = emulator(Y_true_phys)
+                gamma_true_phys = emulator(Y_true_phys)  # Physical Output
+                gamma_true_log_rec = torch.log1p(gamma_true_phys)  # Manifold Alignment
 
-                # Calculate MSE between Emu(Truth) and Analytic(Truth)
-                # Y_gamma_phys_analytic is (B, 3, Q)
+                # Compare Log vs Log
                 emu_error_matrix = F.mse_loss(
-                    gamma_true_emu, Y_gamma_phys_analytic, reduction="none"
+                    gamma_true_log_rec, Y_gamma_log_target, reduction="none"
                 )
-                # Collapse (B, 3, Q) -> (B) scalar error per image
                 emu_error = emu_error_matrix.view(emu_error_matrix.size(0), -1).mean(
                     dim=1
                 )
-
-                # Compute Trust
                 trust_vec = torch.exp(-trust_tau * emu_error)
 
-                # Surrogate Loss calc (if needed for logging "Total Loss" as per training definition)
+                # --- Surrogate Loss ---
                 if eval_mode != "none" and surrogate_criterion:
-                    # We assume Softplus for emulator consistency during loss calc if strictly replicating train
-                    # But using ReLU here is fine for "Physical" evaluation
-                    pred_gamma_emu = emulator(pred_X_phys)
-                    loss_surr = surrogate_criterion(
-                        pred_gamma_emu, Y_gamma_phys_analytic
-                    )
+                    pred_gamma_phys = emulator(pred_X_phys)
+                    pred_gamma_log = torch.log1p(pred_gamma_phys)  # Manifold Alignment
 
-            # Replicate Training Loss Definition for Reference
+                    # Loss is calculated in Log Space (stable gradients)
+                    loss_surr = surrogate_criterion(pred_gamma_log, Y_gamma_log_target)
+
             if eval_mode == "train":
-                # Additive formulation from training
-                # We assume a scalar approx 1.0 for evaluation view, or use the trust
-                # For pure evaluation, we usually care about MSE, but let's log the composite
                 total_loss = loss_mse + (surrogate_weight * trust_vec * loss_surr)
             else:
                 total_loss = loss_mse
 
-            # --- 3. Emulator Consistency Audit ---
+            # --- 4. Emulator Consistency Audit ---
             if emulator and audit_criterion:
-                gamma_pred_emu = emulator(pred_X_phys)
-                gamma_true_emu = emulator(Y_true_phys)
+                # Forward passes (Physical Inputs)
+                gamma_pred_phys = emulator(pred_X_phys)
+                gamma_true_phys = emulator(Y_true_phys)
 
-                l1 = audit_criterion(gamma_pred_emu, Y_gamma_phys_analytic)
-                l2 = audit_criterion(gamma_pred_emu, gamma_true_emu)
-                l3 = audit_criterion(gamma_true_emu, Y_gamma_phys_analytic)
+                # Align to Log Space for Comparison
+                gamma_pred_log = torch.log1p(gamma_pred_phys)
+                gamma_true_log = torch.log1p(gamma_true_phys)
+
+                # L1: Pred (Log) vs Target (Log)
+                l1 = audit_criterion(gamma_pred_log, Y_gamma_log_target)
+
+                # L2: Pred (Log) vs Emu_on_True (Log) -> "Perceptual"
+                l2 = audit_criterion(gamma_pred_log, gamma_true_log)
+
+                # L3: Emu_on_True (Log) vs Target (Log) -> "Intrinsic"
+                l3 = audit_criterion(gamma_true_log, Y_gamma_log_target)
+
                 gap = torch.abs(l1 - l2)
 
                 audit_results["L1_phys_err"].append(l1.cpu().numpy())
@@ -157,10 +172,9 @@ def run_prediction_loop(
                 for k in audit_results:
                     audit_results[k].append(nan_vec)
 
-            # Collect Standard Results
+            # Collect Results
             all_preds_phys.append(pred_X_phys.squeeze(1).cpu().numpy())
             all_targets_phys.append(Y_true_phys.squeeze(1).cpu().numpy())
-
             all_total_losses.append(total_loss.cpu().numpy())
             all_mse_losses.append(loss_mse.cpu().numpy())
             all_surrogate_losses.append(loss_surr.cpu().numpy())
@@ -195,7 +209,7 @@ def run_prediction_loop(
         all_total_losses,
         all_mse_losses,
         all_surrogate_losses,
-        all_trust_scores,  # <--- Return Trust
+        all_trust_scores,
         audit_results,
     )
 
@@ -207,11 +221,29 @@ def main(run_dir):
     test_loader = io_lib.load_data(config, dem_stats)
 
     QUANTILE_LEVELS = config["QUANTILE_LEVELS"]
-    PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 1.0)
+    PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 2.0)
     EVAL_MODE = config.get("EVAL_MODE", "none")
-    SURROGATE_LOSS_WEIGHT = config.get("METRIC_LOSS_WEIGHT", 0.1)  # Updated key name
+    SURROGATE_LOSS_WEIGHT = config.get("METRIC_LOSS_WEIGHT", 0.1)
     EMULATOR_CHECKPOINT_PATH = config.get("EMULATOR_CHECKPOINT_PATH", None)
     TRUST_TAU = config.get("TRUST_TAU", 2.0)
+
+    # --- LOAD SCALER ---
+    # We need the exact scaler used during training to invert the normalization correctly.
+    scaler_path = os.path.join(
+        config["PREPROCESSED_DATA_DIR"], "log_transformed_precip_max_val.npy"
+    )
+    # Fallback check
+    if not os.path.exists(scaler_path):
+        scaler_path = os.path.join(
+            config["PREPROCESSED_DATA_DIR"], "train", "precip_max_val.npy"
+        )
+
+    if os.path.exists(scaler_path):
+        PHYSICAL_MAX_VAL = float(np.load(scaler_path))
+        print(f"Loaded Physical Max Scaler: {PHYSICAL_MAX_VAL:.4f}")
+    else:
+        print("Warning: Scaler not found. Defaulting to 1.0")
+        PHYSICAL_MAX_VAL = 1.0
 
     mse_criterion = nn.L1Loss(reduction="none")
 
@@ -260,6 +292,8 @@ def main(run_dir):
         QUANTILE_LEVELS,
         PIXEL_SIZE_KM,
         TRUST_TAU,
+        physical_max_val=PHYSICAL_MAX_VAL,
+        drizzle_threshold=config.get("DRIZZLE_THRESHOLD", 0.1),
     )
 
     # --- Create DataFrame ---

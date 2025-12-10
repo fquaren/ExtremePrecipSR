@@ -32,43 +32,66 @@ def _plot_comprehensive_sample(
     sample_idx = sample_row.name
 
     loss = sample_row.get("total_loss", np.nan)
-    trust = sample_row.get("Trust_Score", np.nan)  # Added Trust to title
+    trust = sample_row.get("Trust_Score", np.nan)
 
     fig = plt.figure(figsize=(24, 12))
     gs = gridspec.GridSpec(2, 4, height_ratios=[1, 0.7], hspace=0.25, wspace=0.2)
 
     # --- ROW 1: SPATIAL FIELDS ---
-    precip_max = max(np.nanmax(target_image), np.nanmax(pred_image))
-    precip_norm = mcolors.Normalize(vmin=0, vmax=precip_max)
-    precip_cmap = copy.copy(plt.get_cmap("YlGnBu"))
-    precip_cmap.set_bad("lightgrey")
 
-    # A. DEM
+    # 1. Determine Global Max for Precipitation Colorbar (Input, Pred, Target)
+    # We want them to share the exact same scale for visual comparison.
+    # Handle NaNs just in case.
+    vmax = np.nanmax(
+        [np.nanmax(target_image), np.nanmax(pred_image), np.nanmax(input_image)]
+    )
+    if vmax <= 0:
+        vmax = 1.0  # Safety
+
+    precip_norm = mcolors.Normalize(vmin=0, vmax=vmax)
+
+    # 2. Prepare Colormap with Grey for Zeros (NaNs)
+    # We copy 'Blues' and set the 'bad' (masked) color to lightgrey
+    precip_cmap = copy.copy(plt.get_cmap("Blues"))
+    precip_cmap.set_bad(color="lightgrey", alpha=1.0)  # Grey background for dry areas
+
+    # Helper to mask zeros for plotting
+    def mask_zeros(img):
+        masked = img.copy()
+        # Use a small epsilon or the drizzle threshold logic (e.g. 0.05)
+        masked[masked <= 0.05] = np.nan
+        return masked
+
+    # A. DEM (Terrain)
     ax_dem = fig.add_subplot(gs[0, 0])
     im_dem = ax_dem.imshow(dem_image, cmap="terrain", origin="lower")
     ax_dem.set_title("Digital Elevation Model (DEM)")
     fig.colorbar(im_dem, ax=ax_dem, shrink=0.6, label="Elevation")
 
-    # B. Input
+    # B. Input (Low Res)
     ax_in = fig.add_subplot(gs[0, 1])
-    im_in = ax_in.imshow(input_image, cmap="Blues", origin="lower")
+    # Apply masking and shared cmap/norm
+    im_in = ax_in.imshow(
+        mask_zeros(input_image), cmap=precip_cmap, norm=precip_norm, origin="lower"
+    )
     ax_in.set_title("Input (Low Res)")
-    fig.colorbar(im_in, ax=ax_in, shrink=0.6, label="Norm. Intensity")
+    fig.colorbar(im_in, ax=ax_in, shrink=0.6, label="mm/hr")
 
-    # C. Prediction
+    # C. Prediction (SR)
     ax_pred = fig.add_subplot(gs[0, 2])
     im_pred = ax_pred.imshow(
-        pred_image, cmap=precip_cmap, norm=precip_norm, origin="lower"
+        mask_zeros(pred_image), cmap=precip_cmap, norm=precip_norm, origin="lower"
     )
     ax_pred.set_title("Prediction (SR)")
     fig.colorbar(im_pred, ax=ax_pred, shrink=0.6, label="mm/hr")
 
-    # D. Target
+    # D. Target (HR)
     ax_targ = fig.add_subplot(gs[0, 3])
     im_targ = ax_targ.imshow(
-        target_image, cmap=precip_cmap, norm=precip_norm, origin="lower"
+        mask_zeros(target_image), cmap=precip_cmap, norm=precip_norm, origin="lower"
     )
     ax_targ.set_title(f"Target (High Res) | Mean: {mean_precip:.2f}")
+    # Key: This colorbar now applies to B, C, and D equally
     fig.colorbar(im_targ, ax=ax_targ, shrink=0.6, label="mm/hr")
 
     # --- ROW 2: TOPOLOGY (GAMMA) ---
@@ -93,13 +116,19 @@ def _plot_comprehensive_sample(
         ax.set_title(gamma_types[j], fontsize=14)
         ax.set_xlabel("Threshold (mm/hr)", fontsize=12)
         ax.grid(True, linestyle="--", alpha=0.6)
+
+        # Log scale for Area/Perim if values are large
         if j < 2 and np.max(target_gamma[j]) > 100:
             ax.set_yscale("log")
+
         if j == 0:
             ax.legend(fontsize=12)
 
     # --- Title ---
-    metrics_str = f"Loss: {loss:.4f} | Trust: {trust:.3f}"
+    metrics_str = f"Loss: {loss:.4f}"
+    if not np.isnan(trust):
+        metrics_str += f" | Trust: {trust:.3f}"
+
     fig.suptitle(f"{title} | Sample {sample_idx}\n{metrics_str}", fontsize=18, y=0.96)
 
     plot_save_dir = os.path.join(output_dir, "evaluation_plots", sub_folder)
@@ -318,7 +347,9 @@ def plot_per_feature_matrices(per_feature_metrics, output_dir):
 
 def plot_training_log(log_path, output_dir, config):
     if not os.path.exists(log_path):
+        print(f"Log file not found at {log_path}")
         return
+
     print("\nGenerating training log plot...")
     try:
         df = pd.read_csv(log_path)
@@ -329,7 +360,11 @@ def plot_training_log(log_path, output_dir, config):
             axes[0].plot(df["epoch"], df["train_loss_total"], label="Train Total")
         if "val_loss_total" in df:
             axes[0].plot(df["epoch"], df["val_loss_total"], label="Val Total")
-        axes[0].set_yscale("log")
+
+        # Check if values are valid for log scale
+        if df["train_loss_total"].min() > 0:
+            axes[0].set_yscale("log")
+
         axes[0].legend()
         axes[0].set_title("Loss History")
         axes[0].grid(True, alpha=0.3)
@@ -349,20 +384,34 @@ def plot_training_log(log_path, output_dir, config):
                 color="orange",
                 label="Intrinsic Emu Error",
             )
-        axes[1].set_yscale("log")
+
+        # Check for valid log scale values
+        if "val_consistency_gap" in df and df["val_consistency_gap"].max() > 0:
+            axes[1].set_yscale("log")
+
         axes[1].legend()
         axes[1].set_title("Emulator Audit")
         axes[1].grid(True, alpha=0.3)
 
         # 3. Trust & Weights
-        if "avg_train_trust" in df:
+        # --- FIX: Check for the correct column name 'avg_trust_weight' ---
+        trust_col = "avg_trust_weight"
+        if trust_col not in df.columns and "avg_train_trust" in df.columns:
+            trust_col = "avg_train_trust"  # Backwards compatibility
+
+        if trust_col in df:
             axes[2].plot(
                 df["epoch"],
-                df["avg_train_trust"],
+                df[trust_col],
                 color="green",
                 label="Avg Trust (Train)",
                 linewidth=2,
             )
+        else:
+            print(
+                f"Warning: Trust column not found. Available columns: {df.columns.tolist()}"
+            )
+
         if "current_metric_weight" in df:
             ax2_twin = axes[2].twinx()
             ax2_twin.plot(
@@ -383,6 +432,11 @@ def plot_training_log(log_path, output_dir, config):
 
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, "training_history.png"))
+        print(f"Plot saved to {os.path.join(output_dir, 'training_history.png')}")
         plt.close(fig)
+
     except Exception as e:
         print(f"Log plot failed: {e}")
+        import traceback
+
+        traceback.print_exc()

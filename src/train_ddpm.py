@@ -30,7 +30,7 @@ METADATA_VAL = config["VAL_METADATA_FILE"]
 BATCH_SIZE = 128
 LR = 1e-4
 EPOCHS = 100
-PATIENCE = 20
+PATIENCE = 10
 NUM_WORKERS = 4
 EXPERIMENT_NAME = "DDPM_SR"
 
@@ -108,15 +108,22 @@ class EarlyStopping:
             return True
 
 
-def compute_physical_metrics(real_batch, gen_batch):
+def compute_physical_metrics(real_batch, gen_batch, drizzle_threshold=0.1):
     """
     Computes physical metrics.
     Expects INPUTS to be in PHYSICAL UNITS (mm/h).
     """
+    # --- Apply Threshold ---
+    # Zero out background noise < 0.1 mm/h to match SR evaluation standards
+    real_batch = real_batch * (real_batch > drizzle_threshold).astype(float)
+    gen_batch = gen_batch * (gen_batch > drizzle_threshold).astype(float)
+
     real_flat = real_batch.flatten()
     gen_flat = gen_batch.flatten()
 
-    # 1. Wasserstein Distance
+    # 1. Wasserstein Distance (Earth Mover's Distance between intensity histograms)
+    # Using a subset for speed if arrays are massive is often wise,
+    # but for batch-level validation, full calculation is fine.
     wd = wasserstein_distance(real_flat, gen_flat)
 
     # 2. Max Intensity Error
@@ -136,7 +143,7 @@ def save_sample_images(model, diffusion, loader, device, out_dir, epoch, denorma
 
     X, Y = X.to(device, non_blocking=True), Y.to(device, non_blocking=True)
 
-    n_samples = min(10, X.shape[0])
+    n_samples = min(50, X.shape[0])
     X_sample = X[:n_samples]
     Y_sample = Y[:n_samples]
 
@@ -233,11 +240,11 @@ def main():
         PREPROCESSED_DATA_DIR, METADATA_VAL, DEM_DATA_DIR, dem_stats, split="validation"
     )
 
-    # --- Loaders (Fixed Shuffling) ---
+    # --- Loaders ---
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
-        shuffle=True,  # ENABLED: Random shuffle for training
+        shuffle=True,
         num_workers=NUM_WORKERS,
         pin_memory=True,
         prefetch_factor=2,
@@ -246,7 +253,7 @@ def main():
     val_loader = DataLoader(
         val_dataset,
         batch_size=BATCH_SIZE,
-        shuffle=False,  # DISABLED: Deterministic order for validation
+        shuffle=False,
         num_workers=NUM_WORKERS,
         pin_memory=True,
         prefetch_factor=2,
@@ -257,7 +264,7 @@ def main():
     diffusion = Diffusion(img_size=128, device=device)
 
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
-    mae = nn.L1Loss()
+    mse = nn.MSELoss()
     scaler = torch.amp.GradScaler("cuda")
     early_stopper = EarlyStopping(patience=PATIENCE, verbose=True)
 
@@ -280,17 +287,17 @@ def main():
             optimizer.zero_grad()
             with torch.amp.autocast("cuda"):
                 predicted_noise = model(x_t, t, X)
-                loss = mae(noise, predicted_noise)
+                loss = mse(noise, predicted_noise)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
             running_loss += loss.item()
-            pbar.set_postfix(MAE=loss.item())
+            pbar.set_postfix(MSE=loss.item())
 
         avg_loss = running_loss / len(train_loader)
-        print(f"Epoch {epoch+1} Train MAE: {avg_loss:.6f}")
+        print(f"Epoch {epoch+1} Train MSE: {avg_loss:.6f}")
 
         # --- Validation ---
         model.eval()
@@ -305,12 +312,12 @@ def main():
 
                 with torch.amp.autocast("cuda"):
                     predicted_noise = model(x_t, t, X)
-                    loss = mae(noise, predicted_noise)
+                    loss = mse(noise, predicted_noise)
 
                 val_loss += loss.item()
 
         avg_val_loss = val_loss / len(val_loader)
-        print(f"Epoch {epoch+1} Val MAE: {avg_val_loss:.6f}")
+        print(f"Epoch {epoch+1} Val MSE: {avg_val_loss:.6f}")
 
         # --- Logging ---
         history["epoch"].append(epoch + 1)
@@ -332,44 +339,70 @@ def main():
 
         # --- Physical Validation ---
         if (epoch + 1) % 5 == 0:
-            print("Running Physical Validation (Sampling)...")
+            print(f"Running Physical Validation (Sampling over {10} batches)...")
             model.eval()
 
-            X_val, Y_val, _ = next(iter(val_loader))
-            X_val, Y_val = X_val.to(device), Y_val.to(device)
+            # Storage for aggregating metrics
+            val_metrics = {"wd": [], "max_err": []}
 
-            # --- APPLY INFERENCE GATE TO METRICS ---
-            # To get accurate metrics, we should only assess the model on wet inputs
-            # Otherwise, the "Perfect Zeros" from dry inputs will skew the Wasserstein distance
-            input_precip = X_val[:, 0, :, :]
-            is_wet = input_precip.amax(dim=(1, 2)) > 1e-6
-            wet_indices = torch.where(is_wet)[0]
-
-            if len(wet_indices) == 0:
-                print("No wet samples in validation probe batch. Skipping metrics.")
-                continue
-
-            X_wet = X_val[wet_indices]
-            Y_wet = Y_val[wet_indices]
+            # Limit validation to N batches to prevent excessive training downtime
+            NUM_PHYS_BATCHES = 10
 
             with torch.no_grad():
-                gen_wet = diffusion.sample(model, n=len(wet_indices), conditions=X_wet)
+                for i, (X_val, Y_val, _) in enumerate(val_loader):
+                    if i >= NUM_PHYS_BATCHES:
+                        break
 
-            # --- PHYSICAL TRANSFORMATION ---
-            # Unnormalize to mm/h
-            Y_cpu = Y_wet.cpu().numpy().squeeze()
-            Gen_cpu = gen_wet.cpu().numpy().squeeze()
+                    X_val, Y_val = X_val.to(device), Y_val.to(device)
 
-            Y_phys = denormalizer.unnormalize(Y_cpu)
-            Gen_phys = denormalizer.unnormalize(Gen_cpu)
+                    # --- FILTER WET SAMPLES ---
+                    # We only care about performance on rainy patches
+                    input_precip = X_val[:, 0, :, :]
+                    is_wet = input_precip.amax(dim=(1, 2)) > 1e-6
+                    wet_indices = torch.where(is_wet)[0]
 
-            metrics = compute_physical_metrics(Y_phys, Gen_phys)
+                    if len(wet_indices) == 0:
+                        continue
 
-            print(f"Epoch {epoch+1} Physical Metrics:")
-            print(f"  > Wasserstein Dist: {metrics['wasserstein_dist']:.4f}")
-            print(f"  > Max Intensity Err: {metrics['max_intensity_err']:.4f}")
+                    X_wet = X_val[wet_indices]
+                    Y_wet = Y_val[wet_indices]
 
-            early_stopper(metrics["wasserstein_dist"])
+                    # Sample from model
+                    gen_wet = diffusion.sample(
+                        model, n=len(wet_indices), conditions=X_wet
+                    )
+
+                    # --- PHYSICAL TRANSFORMATION ---
+                    # Move to CPU and Denormalize
+                    Y_cpu = Y_wet.cpu().numpy().squeeze()
+                    Gen_cpu = gen_wet.cpu().numpy().squeeze()
+
+                    Y_phys = denormalizer.unnormalize(Y_cpu)
+                    Gen_phys = denormalizer.unnormalize(Gen_cpu)
+
+                    # Compute metrics for this batch
+                    batch_metrics = compute_physical_metrics(Y_phys, Gen_phys)
+
+                    val_metrics["wd"].append(batch_metrics["wasserstein_dist"])
+                    val_metrics["max_err"].append(batch_metrics["max_intensity_err"])
+
+            # --- AGGREGATE RESULTS ---
+            if len(val_metrics["wd"]) > 0:
+                mean_wd = np.mean(val_metrics["wd"])
+                mean_max_err = np.mean(val_metrics["max_err"])
+
+                print(
+                    f"Epoch {epoch+1} Physical Metrics (Avg over {NUM_PHYS_BATCHES} batches):"
+                )
+                print(f"  > Wasserstein Dist: {mean_wd:.4f}")
+                print(f"  > Max Intensity Err: {mean_max_err:.4f}")
+
+                # Pass the meaningful average to early stopper
+                early_stopper(mean_wd)
+            else:
+                print(
+                    "Warning: No wet samples found in validation subset. Skipping metrics."
+                )
 
 
 if __name__ == "__main__":

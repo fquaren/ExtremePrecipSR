@@ -4,6 +4,7 @@ import numpy as np
 import argparse
 import os
 import warnings
+from tqdm import tqdm
 
 # Import shared libraries (Alignment with SR)
 import io_lib_sr as io_lib
@@ -30,13 +31,18 @@ def load_ddpm_model(config, device, run_dir):
     """
     checkpoint_path = os.path.join(run_dir, "ddpm_latest.pth")
     if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"DDPM checkpoint not found at {checkpoint_path}")
+        # Fallback to best if latest doesn't exist
+        checkpoint_path = os.path.join(run_dir, "ddpm_best.pth")
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"DDPM checkpoint not found at {checkpoint_path}")
 
     print(f"Loading DDPM model from: {checkpoint_path}")
 
     # Initialize Model (Parameters must match training config)
-    # Assuming standard setup: 1 channel in, 1 channel condition
-    model = ContextUnet(in_channels=1, c_in_condition=1, device=device).to(device)
+    # Assuming standard setup: 1 channel in, 2 channels condition (LR + DEM)
+    # CHECK: Your training script uses c_in_condition=2. Eval must match.
+    # Defaulting to 2 based on training script provided earlier.
+    model = ContextUnet(in_channels=1, c_in_condition=2, device=device).to(device)
 
     # Load Weights
     state_dict = torch.load(checkpoint_path, map_location=device)
@@ -49,11 +55,91 @@ def load_ddpm_model(config, device, run_dir):
         noise_steps=1000,
         beta_start=1e-4,
         beta_end=0.02,
-        img_size=config["PATCH_SIZE"],
+        img_size=config.get("PATCH_SIZE", 128),
         device=device,
     )
 
     return model, diffusion
+
+
+def compute_crps_ensemble(pred_ensemble, target):
+    """
+    Computes Empirical CRPS (Energy Score) for an ensemble.
+    pred_ensemble: [B, K, H, W]  (K = number of samples)
+    target:        [B, 1, H, W]
+    """
+    # 1. Term 1: Expected distance to Truth (Accuracy)
+    # Average MAE across all ensemble members
+    # Shape: [B, K, H, W] -> [B, H, W]
+    term_1 = torch.mean(torch.abs(pred_ensemble - target), dim=1)
+
+    # 2. Term 2: Expected distance between members (Diversity/Spread)
+    # This measures how "confident" (tight) the ensemble is.
+
+    # Expand dims for pairwise subtraction:
+    # [B, K, 1, H, W] vs [B, 1, K, H, W]
+    diffs = torch.abs(pred_ensemble.unsqueeze(2) - pred_ensemble.unsqueeze(1))
+    term_2 = torch.mean(diffs, dim=(1, 2))  # Average over K x K
+
+    # CRPS = Accuracy - 0.5 * Spread
+    crps_map = term_1 - 0.5 * term_2
+
+    # Return mean CRPS over spatial dims
+    return crps_map.mean(dim=(1, 2))
+
+
+def run_ddpm_crps_audit(
+    model,
+    diffusion,
+    loader,
+    device,
+    denormalizer_max_val,
+    drizzle_threshold,
+    n_ensemble=16,
+    n_batches=10,  # Only run on 10 batches to save time
+):
+    print(f"\n--- Running CRPS Audit (N={n_ensemble} samples per image) ---")
+    crps_scores = []
+
+    with torch.no_grad():
+        for i, (X, Y_true, _) in enumerate(tqdm(loader, desc="CRPS Ensemble")):
+            if i >= n_batches:
+                break
+
+            X, Y_true = X.to(device), Y_true.to(device)
+            B, _, H, W = X.shape
+
+            # --- 1. Generate Ensemble ---
+            # We need to repeat conditions K times
+            # X_repeated shape: [B*K, C, H, W]
+            X_repeated = X.repeat_interleave(n_ensemble, dim=0)
+
+            # Sample (This is the slow part)
+            samples_norm = diffusion.sample(
+                model, n=B * n_ensemble, conditions=X_repeated
+            )
+            samples_norm = samples_norm.clamp(0.0, 1.0)
+
+            # --- 2. Denormalize & Reshape ---
+            samples_log = samples_norm * denormalizer_max_val
+            samples_phys = torch.expm1(samples_log)
+            samples_phys = samples_phys * (samples_phys > drizzle_threshold).float()
+
+            # Reshape back to [B, K, H, W]
+            samples_ensemble = samples_phys.view(B, n_ensemble, H, W)
+
+            # Process Ground Truth
+            Y_log = Y_true * denormalizer_max_val
+            Y_phys = torch.expm1(Y_log)
+            Y_phys = Y_phys * (Y_phys > drizzle_threshold).float()
+
+            # --- 3. Compute CRPS ---
+            batch_crps = compute_crps_ensemble(samples_ensemble, Y_phys)
+            crps_scores.extend(batch_crps.cpu().numpy())
+
+    avg_crps = np.mean(crps_scores)
+    print(f"Average CRPS (Ensemble={n_ensemble}): {avg_crps:.4f}")
+    return avg_crps
 
 
 def run_ddpm_prediction_loop(
@@ -65,21 +151,21 @@ def run_ddpm_prediction_loop(
     device,
     quantile_levels,
     pixel_size_km,
+    denormalizer_max_val,  # <--- CRITICAL ARG: The scaler value (~5.0)
+    drizzle_threshold=0.1,  # <--- CRITICAL ARG: To remove background noise
 ):
     """
     Iterates through the test set, sampling from the DDPM for each batch.
-    Computes Analytic Topology and performs Emulator Audit.
+    Performs inverse transformation to Physical Space before computing metrics.
     """
     model.eval()
     if emulator:
         emulator.eval()
 
-    # Storage
+    # --- Storage ---
     all_preds_gamma_analytic = []
     all_targets_gamma_analytic = []
-
     all_preds_phys, all_targets_phys, all_inputs_phys = [], [], []
-    # For DDPM, "Total Loss" in this context is treated as MAE for ranking
     all_total_losses, all_mse_losses, all_surrogate_losses = [], [], []
 
     audit_results = {
@@ -93,31 +179,43 @@ def run_ddpm_prediction_loop(
     mae_criterion = nn.L1Loss(reduction="none")
     mse_criterion = nn.MSELoss(reduction="none")
 
-    print("\n--- Starting DDPM Inference ---")
-    print(
-        "Note: Sampling is iterative (1000 steps). This will be slower than UNet inference."
-    )
+    print("\n--- Starting DDPM Inference (Single Sample per Image) ---")
+    print("Note: Sampling is iterative. This may take time.")
 
     with torch.no_grad():
-        # We enumerate to show progress clearly as DDPM batches are slow
-        for batch_idx, (X, Y_true_phys, Y_gamma_phys_analytic) in enumerate(loader):
+        # Using Y_gamma_log_target to explicitly indicate it's from the dataset (Log Space)
+        for batch_idx, (X, Y_true_norm, Y_gamma_log_target) in enumerate(loader):
             X = X.to(device)
-            Y_true_phys = Y_true_phys.to(device)
-            Y_gamma_phys_analytic = Y_gamma_phys_analytic.to(device)
+            Y_true_norm = Y_true_norm.to(device)
+            Y_gamma_log_target = Y_gamma_log_target.to(device)
 
-            # --- 1. DDPM Sampling (The Generative Step) ---
-            # X is the condition (Low Res / Upsamled Input)
-            # diffusion.sample returns [B, 1, H, W]
-            # We create a nested progress bar for the sampling steps if desired,
-            # or let diffusion.sample handle it.
-            pred_X_phys = diffusion.sample(model, n=X.shape[0], conditions=X)
+            # --- 1. DDPM Sampling (Output is Normalized Log-Space) ---
+            # X is the condition (Low Res / Upsampled Input)
+            # diffusion.sample returns [B, 1, H, W] in Model Space [0, 1]
+            pred_X_norm = diffusion.sample(model, n=X.shape[0], conditions=X)
 
-            # Ensure Physics (Non-negative)
-            # Diffusion usually clamps to [-1, 1] or [0, 1] depending on implementation.
-            # Our data is [0, 1].
-            pred_X_phys = pred_X_phys.clamp(0.0, 1.0)
+            # Clamp to ensure valid range for inversion
+            pred_X_norm = pred_X_norm.clamp(0.0, 1.0)
 
-            # --- 2. Compute Analytic Gamma for Predictions (CPU TDA) ---
+            # --- 2. DENORMALIZE TO PHYSICAL UNITS (mm/h) ---
+            # The model predicts normalized log-space values. We must invert this.
+
+            # Step A: Scale Up (e.g., 0.8 * 5.0 = 4.0)
+            pred_X_log_scaled = pred_X_norm * denormalizer_max_val
+            Y_true_log_scaled = Y_true_norm * denormalizer_max_val
+
+            # Step B: Inverse Log Transform (expm1) -> Physical Space
+            pred_X_phys = torch.expm1(pred_X_log_scaled)
+            Y_true_phys = torch.expm1(Y_true_log_scaled)
+
+            # Step C: Apply Sparsity / Drizzle Threshold
+            # Crucial: DDPM generates tiny noise in empty areas.
+            # We must zero this out, or TDA/Emulator will see "infinite" connected components.
+            pred_X_phys = pred_X_phys * (pred_X_phys > drizzle_threshold).float()
+            Y_true_phys = Y_true_phys * (Y_true_phys > drizzle_threshold).float()
+
+            # --- 3. Compute Analytic Gamma for Predictions (CPU TDA) ---
+            # Now pred_X_phys is in mm/h, so TDA will be correct
             pred_X_np = pred_X_phys.cpu().numpy()
             batch_gammas = []
             for i in range(pred_X_np.shape[0]):
@@ -128,10 +226,11 @@ def run_ddpm_prediction_loop(
             batch_gammas = np.array(batch_gammas)
 
             all_preds_gamma_analytic.append(batch_gammas)
-            all_targets_gamma_analytic.append(Y_gamma_phys_analytic.cpu().numpy())
+            # Store the dataset's log-space targets for reference tables
+            all_targets_gamma_analytic.append(Y_gamma_log_target.cpu().numpy())
 
-            # --- 3. Calculate Pixel Losses ---
-            # MAE is the deterministic equivalent of CRPS
+            # --- 4. Calculate Pixel Losses (Physical Space) ---
+            # We calculate MAE/MSE on the PHYSICAL values for scientific relevance
             loss_mae_sample = mae_criterion(pred_X_phys, Y_true_phys).mean(
                 dim=(1, 2, 3)
             )
@@ -139,24 +238,32 @@ def run_ddpm_prediction_loop(
                 dim=(1, 2, 3)
             )
 
-            # Surrogate loss placeholder (we don't optimize this in DDPM inference usually)
             loss_surr_sample = torch.zeros_like(loss_mae_sample)
 
+            # --- 5. Emulator Consistency Audit ---
             if emulator and audit_criterion:
-                # If we want to rank samples by topological fidelity
-                pred_gamma_emu = emulator(pred_X_phys)
-                loss_surr_sample = audit_criterion(
-                    pred_gamma_emu, Y_gamma_phys_analytic
-                )
+                # Forward Pass: Emulator takes Physical Inputs
+                # Outputs: Area (km²), Perimeter (km), Count
+                gamma_pred_phys = emulator(pred_X_phys)
+                gamma_true_phys = emulator(Y_true_phys)
 
-            # --- 4. Emulator Consistency Audit ---
-            if emulator and audit_criterion:
-                gamma_pred_emu = emulator(pred_X_phys)
-                gamma_true_emu = emulator(Y_true_phys)
+                # Manifold Alignment: Convert Physical Emulator Output -> Log Space
+                # This matches the S_inv scaling and Dataset Targets
+                gamma_pred_log = torch.log1p(gamma_pred_phys)
+                gamma_true_log = torch.log1p(gamma_true_phys)
 
-                l1 = audit_criterion(gamma_pred_emu, Y_gamma_phys_analytic)
-                l2 = audit_criterion(gamma_pred_emu, gamma_true_emu)
-                l3 = audit_criterion(gamma_true_emu, Y_gamma_phys_analytic)
+                # Compute Distances (All in Log Space)
+
+                # L1: Prediction vs Dataset Ground Truth (Surrogate Loss)
+                l1 = audit_criterion(gamma_pred_log, Y_gamma_log_target)
+                loss_surr_sample = l1  # Store for logging
+
+                # L2: Prediction vs Emulator(Ground Truth) -> "Perceptual Consistency"
+                l2 = audit_criterion(gamma_pred_log, gamma_true_log)
+
+                # L3: Emulator(Ground Truth) vs Dataset Ground Truth -> "Intrinsic Error"
+                l3 = audit_criterion(gamma_true_log, Y_gamma_log_target)
+
                 gap = torch.abs(l1 - l2)
 
                 audit_results["L1_phys_err"].append(l1.cpu().numpy())
@@ -168,20 +275,25 @@ def run_ddpm_prediction_loop(
                 for k in audit_results:
                     audit_results[k].append(nan_vec)
 
-            # Collect Results
+            # --- 6. Collect Results ---
+            # X (Input) needs to be denormalized only if you want to visualize it in physical units.
+            # For now we save raw input for plotting lib to handle or just raw.
+            # Better to store physical input for consistency.
+            X_phys = torch.expm1(X[:, 0:1, :, :] * denormalizer_max_val)
+
             all_preds_phys.append(pred_X_phys.squeeze(1).cpu().numpy())
             all_targets_phys.append(Y_true_phys.squeeze(1).cpu().numpy())
-            all_inputs_phys.append(X.cpu().numpy())
+            all_inputs_phys.append(X_phys.squeeze(1).cpu().numpy())
 
-            all_total_losses.append(
-                loss_mae_sample.cpu().numpy()
-            )  # Using MAE as "Total" for ranking
+            all_total_losses.append(loss_mae_sample.cpu().numpy())
             all_mse_losses.append(loss_mse_sample.cpu().numpy())
             all_surrogate_losses.append(loss_surr_sample.cpu().numpy())
 
-            print(f"Batch {batch_idx+1} Processed. MAE: {loss_mae_sample.mean():.4f}")
+            print(
+                f"Batch {batch_idx+1} Processed. Phys MAE: {loss_mae_sample.mean():.4f}"
+            )
 
-    # Concatenate Results
+    # --- 7. Concatenate Results ---
     all_preds_gamma_analytic = np.concatenate(all_preds_gamma_analytic, axis=0)
     all_targets_gamma_analytic = np.concatenate(all_targets_gamma_analytic, axis=0)
 
@@ -212,8 +324,26 @@ def run_ddpm_prediction_loop(
 
 
 def main(run_dir):
+
     # Reuse the Setup logic from SR lib
     config, device = io_lib.setup_evaluation(run_dir)
+
+    # --- LOAD SCALER (Same logic as SR) ---
+    scaler_path = os.path.join(
+        config["PREPROCESSED_DATA_DIR"], "log_transformed_precip_max_val.npy"
+    )
+    if not os.path.exists(scaler_path):
+        scaler_path = os.path.join(
+            config["PREPROCESSED_DATA_DIR"], "train", "precip_max_val.npy"
+        )
+
+    if os.path.exists(scaler_path):
+        # Load scalar (handle 0-d array)
+        PHYSICAL_MAX_VAL = float(np.load(scaler_path).item())
+        print(f"Loaded Physical Max Scaler: {PHYSICAL_MAX_VAL:.4f}")
+    else:
+        print("Warning: Scaler not found. Defaulting to 1.0")
+        PHYSICAL_MAX_VAL = 1.0
 
     # --- Load DDPM Specifics ---
     model, diffusion = load_ddpm_model(config, device, run_dir)
@@ -222,7 +352,7 @@ def main(run_dir):
     test_loader = io_lib.load_data(config, dem_stats)
 
     QUANTILE_LEVELS = config["QUANTILE_LEVELS"]
-    PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 1.0)
+    PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 2.0)
     EMULATOR_CHECKPOINT_PATH = config.get("EMULATOR_CHECKPOINT_PATH", None)
 
     # --- Audit Setup ---
@@ -237,7 +367,7 @@ def main(run_dir):
             device
         )
 
-    # --- Inference ---
+    # --- Inference (Single Shot) ---
     (
         all_preds_gamma_analytic,
         all_targets_gamma_analytic,
@@ -257,14 +387,28 @@ def main(run_dir):
         device,
         QUANTILE_LEVELS,
         PIXEL_SIZE_KM,
+        denormalizer_max_val=PHYSICAL_MAX_VAL,  # Pass Scaler
+        drizzle_threshold=config.get("DRIZZLE_THRESHOLD", 0.1),
     )
 
     # --- Create DataFrame (Reuse SR Lib) ---
+    # Note: create_metrics_dataframe expects 'all_dems'. Since DDPM loop didn't explicitly return Dems separately
+    # (assuming they are part of input tensor but not separated), we can pass a dummy or None if plotting lib allows.
+    # However, plotting_lib usually expects DEMs.
+    # Quick fix: Extract DEMs from inputs if possible or pass None.
+    # SRDataset returns [LR, DEM] in channel dim 1.
+    # all_inputs_phys we saved above is just the Precip channel if we followed SR logic,
+    # or we can assume plotting lib handles it.
+    # For now, let's pass None for DEMs to avoid breaking if dimensions mismatch.
+    all_dems = [None] * len(all_preds_phys)
+
     metrics_df = metrics_lib.create_metrics_dataframe(
         all_preds_gamma_analytic,
         all_targets_gamma_analytic,
         all_inputs_phys,
         all_targets_phys,
+        all_preds_phys,
+        all_dems,  # Passing dummy
         all_total_losses,
         all_mse_losses,
         all_surrogate_losses,
@@ -296,16 +440,29 @@ def main(run_dir):
         print(f"Avg Physical Error:     {metrics_df['L1_Physical_Error'].mean():.4f}")
         print("=" * 40 + "\n")
 
-    # Generate Plots (Exact same plots as SR for comparison)
+    # --- CRPS Audit (Ensemble) ---
+    avg_crps = run_ddpm_crps_audit(
+        model,
+        diffusion,
+        test_loader,
+        device,
+        denormalizer_max_val=PHYSICAL_MAX_VAL,
+        drizzle_threshold=config.get("DRIZZLE_THRESHOLD", 0.1),
+        n_ensemble=16,  # Adjust based on GPU memory
+        n_batches=10,  # Adjust based on time
+    )
+
+    # Save CRPS separately
+    with open(os.path.join(run_dir, "crps_score.txt"), "w") as f:
+        f.write(f"Average CRPS (N=16, 10 Batches): {avg_crps:.6f}\n")
+
+    # Generate Plots
     plotting_lib.plot_sample_comparisons_fixed(metrics_df, QUANTILE_LEVELS, run_dir)
     plotting_lib.plot_per_feature_matrices(per_feature_gamma_metrics, run_dir)
     plotting_lib.plot_gamma_mean_std_by_quantile(
         metrics_df, group_metrics, QUANTILE_LEVELS, run_dir
     )
     plotting_lib.plot_metric_distributions(metrics_df, run_dir)
-
-    # Note: Training log plot is skipped or needs separate handling as DDPM logs might differ structure,
-    # but keeping it optional in library is fine.
 
     print("\nDDPM Evaluation Complete.")
 

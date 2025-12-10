@@ -23,7 +23,7 @@ CONSTRAINT_MODE = config.get("CONSTRAINT_MODE", "hard")
 QUANTILE_LEVELS = config["QUANTILE_LEVELS"]
 N_QUANTILES = len(QUANTILE_LEVELS)
 PATCH_SIZE = config["PATCH_SIZE"]
-PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 1.0)
+PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 2.0)
 
 ARCHITECTURE = config.get("ARCHITECTURE", "Vanilla")
 if ARCHITECTURE == "Vanilla":
@@ -54,7 +54,7 @@ def load_emulator(checkpoint_path, config, device):
     constraint_mode = config.get("CONSTRAINT_MODE", "hybrid")
     patch_size = config["PATCH_SIZE"]
     n_quantiles = len(config["QUANTILE_LEVELS"])
-    pixel_size_km = config.get("PIXEL_SIZE_KM", 1.0)
+    pixel_size_km = config.get("PIXEL_SIZE_KM", 2.0)
     # Max precip is required for Soft/Hybrid scaling, ensure it matches training!
     max_dataset_precip = float(np.load(config["MAX_PRECIP_FILE"]))
 

@@ -125,22 +125,22 @@ def save_metrics_text(output_dir, group_metrics, per_feature_metrics):
 def save_metrics_npz(output_dir, metrics_df, per_feature_metrics):
     """Saves full metrics dataframe and per-feature gamma matrices."""
 
-    # Save dataframe
-    df_save_path = os.path.join(output_dir, "full_evaluation_metrics.csv")
-    # Drop object columns before saving to CSV for efficiency
-    cols_to_drop = [
-        col
-        for col in [
-            "pred_image",
-            "target_image",
-            "input_stack",
-            "pred_gamma",
-            "target_gamma",
-        ]
-        if col in metrics_df.columns
-    ]
-    metrics_df.drop(columns=cols_to_drop).to_csv(df_save_path)
-    print(f"Full per-sample metrics DataFrame saved to: {df_save_path}")
+    # # Save dataframe
+    # df_save_path = os.path.join(output_dir, "full_evaluation_metrics.csv")
+    # # Drop object columns before saving to CSV for efficiency
+    # cols_to_drop = [
+    #     col
+    #     for col in [
+    #         "pred_image",
+    #         "target_image",
+    #         "input_stack",
+    #         "pred_gamma",
+    #         "target_gamma",
+    #     ]
+    #     if col in metrics_df.columns
+    # ]
+    # metrics_df.drop(columns=cols_to_drop).to_csv(df_save_path)
+    # print(f"Full per-sample metrics DataFrame saved to: {df_save_path}")
 
     # Save per-feature NPZ
     npz_save_path = os.path.join(output_dir, "per_feature_gamma_metrics.npz")

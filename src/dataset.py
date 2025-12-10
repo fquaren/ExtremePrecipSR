@@ -3,7 +3,6 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as T
-from loss import compute_gamma_matrix_for_image
 
 # TODO: Consistency between outputs of SRDataset and PreprocessedNpzDataset
 
@@ -11,11 +10,6 @@ from loss import compute_gamma_matrix_for_image
 class SRDataset(Dataset):
     """
     Super-Resolution Dataset for UNet and DDPM Training.
-
-    NOTE:
-    This class loads 'original_precip.npz' and 'interpolated_original_precip.npz'.
-    These files must contain data strictly scaled to [0, 1] (or Log-Transformed [0, 1]).
-    Loading raw physical units (mm/h) here would break the Diffusion Signal-to-Noise ratio.
     """
 
     def __init__(
@@ -36,7 +30,6 @@ class SRDataset(Dataset):
         with open(metadata_file, "r") as f:
             lines = f.readlines()
 
-        # Robust header check
         try:
             float(lines[0].split()[0])
             start_idx = 0
@@ -44,22 +37,14 @@ class SRDataset(Dataset):
             start_idx = 1
         self.metadata = [line.strip().split() for line in lines[start_idx:]]
 
-        # --- 1. Load Normalized Ground Truth (High Res) ---
-        # Contains [0, 1] data
         precip_path = os.path.join(preprocessed_data_dir, split, "original_precip.npz")
-
-        # --- 2. Load Normalized Interpolated Input (Low Res) ---
-        # Contains [0, 1] data
         interp_path = os.path.join(
             preprocessed_data_dir, split, "interpolated_original_precip.npz"
         )
-
-        # --- 3. Load Auxiliary Targets ---
         gamma_path = os.path.join(preprocessed_data_dir, split, "gamma_targets.npz")
 
         print(f"Loading {split} dataset components...")
 
-        # Use mmap_mode='r' to keep RAM usage low on the GH200
         if not os.path.exists(precip_path):
             raise FileNotFoundError(f"Missing normalized ground truth: {precip_path}")
         self.original_patches = np.load(precip_path, mmap_mode="r")["data"]
@@ -69,7 +54,6 @@ class SRDataset(Dataset):
         self.interpolated_patches = np.load(interp_path, mmap_mode="r")["data"]
 
         if not os.path.exists(gamma_path):
-            # Fail gracefully or warn if you haven't run Script 6 yet
             print(f"Warning: Gamma targets not found at {gamma_path}. Using zeros.")
             self.gamma_targets = np.zeros((len(self.metadata), 3), dtype=np.float32)
         else:
@@ -78,28 +62,15 @@ class SRDataset(Dataset):
         # --- OPTIMIZATION: Zero-Filtering ---
         if self.is_train:
             print("Filtering dry patches for training...")
-            # We assume if the Max Intensity is 0 (or very close), the patch is dry.
-            # Using the pre-loaded mmap is fast enough for this check.
-
-            # Compute max along spatial dimensions (H, W) for every sample
-            # This returns a shape (N,) array
             max_vals = np.max(self.original_patches, axis=(1, 2))
-
-            # Keep indices where max > 0
-            # Note: Since data is floats, use a small epsilon instead of strict 0
             wet_indices = np.where(max_vals > 1e-6)[0]
-
-            # Filter metadata and arrays
             self.valid_indices = wet_indices
             print(
                 f"Retained {len(self.valid_indices)}/{len(self.original_patches)} wet patches."
             )
         else:
-            # Keep validation/test intact to evaluate the 'hard-coded zero' logic
             self.valid_indices = np.arange(len(self.original_patches))
 
-        # --- Augmentations ---
-        # Geometric transformations are safe for physical fields.
         self.geom_transform = T.Compose(
             [
                 T.RandomHorizontalFlip(p=0.5),
@@ -108,75 +79,50 @@ class SRDataset(Dataset):
         )
 
     def __len__(self):
-        # We now return the length of valid (wet) indices
         return len(self.valid_indices)
 
     def __getitem__(self, idx):
-
+        # NOTE: This index is 'virtual' (0 to len(valid_indices))
+        # We map it to the 'real' index in the .npz files
         real_idx = self.valid_indices[idx]
 
-        # 1. Fetch Tensors (Already Normalized [0, 1])
-        # Clone is necessary if using mmap to ensure we have a writable copy in memory
+        # 1. Fetch Tensors
+        # .copy() is used here to ensure mmap data is loaded into memory
         target_img = self.original_patches[real_idx].copy()
         interp_img = self.interpolated_patches[real_idx].copy()
 
-        # 2. Fetch DEM (Physical -> Normalize on the fly)
+        # 2. Fetch DEM
         meta_line = self.metadata[real_idx]
         y_coord, x_coord = int(meta_line[1]), int(meta_line[2])
         dem_filename = f"dem_patch_y{y_coord:04d}_x{x_coord:04d}.npy"
         dem_path = os.path.join(self.dem_patches_dir, dem_filename)
 
         try:
-            # Load DEM and normalize z-score: (x - u) / sigma
             dem_patch = np.load(dem_path)
             dem_patch = (dem_patch - self.dem_mean) / (self.dem_std + 1e-8)
         except FileNotFoundError:
-            # Fallback for missing DEMs
             dem_patch = np.zeros_like(target_img)
 
-        # 3. Convert to Tensors [C, H, W]
+        # 3. Convert to Tensors
         target_tensor = torch.from_numpy(target_img).float().unsqueeze(0)
         interp_tensor = torch.from_numpy(interp_img).float().unsqueeze(0)
         dem_tensor = torch.from_numpy(dem_patch).float().unsqueeze(0)
 
-        # 4. Construct Conditioning Stack
-        # Channel 0: Interpolated LR
-        # Channel 1: DEM
+        # 4. Construct Stack
         input_stack = torch.cat([interp_tensor, dem_tensor], dim=0)
 
-        # 5. Apply Synchronized Augmentations (Train only)
+        # 5. Augmentations
         if self.is_train:
-            # We must apply the exact same geometric transform to Input and Target
             state = torch.get_rng_state()
             input_stack = self.geom_transform(input_stack)
-
             torch.set_rng_state(state)
             target_tensor = self.geom_transform(target_tensor)
 
-        # 6. Prepare Gamma Targets
-        # These are likely raw values, so we apply log1p to compress dynamic range
+        # 6. Prepare Gamma Targets (Log Transform)
         gamma_phys = self.gamma_targets[real_idx]
         target_gamma_tensor = torch.from_numpy(np.log1p(gamma_phys)).float()
 
         return input_stack, target_tensor, target_gamma_tensor
-
-
-# --- Data Handling & Augmentation (using log1p transform) ---
-class AddGaussianNoise(object):
-    """Adds Gaussian noise to a tensor."""
-
-    def __init__(self, mean=0.0, std=0.01):
-        self.std, self.mean = std, mean
-
-    def __call__(self, tensor):
-        return (
-            tensor
-            + torch.randn(tensor.size(), device=tensor.device) * self.std
-            + self.mean
-        )
-
-    def __repr__(self):
-        return self.__class__.__name__ + f"(mean={self.mean}, std={self.std})"
 
 
 class PrecomputedMixupDataset(Dataset):
@@ -212,19 +158,22 @@ class PrecomputedMixupDataset(Dataset):
             )
             self.target_sources.append(
                 np.load(
-                    os.path.join(preprocessed_data_dir, "gamma_targets.npz"),
+                    os.path.join(
+                        preprocessed_data_dir, "gamma_targets_persistence.npz"
+                    ),
                     mmap_mode="r",
                 )["data"]
             )
 
         # 2. Load Pre-computed MixUp Data
-        if include_mixup:
+        self.include_mixup = include_mixup
+        if self.include_mixup:
             print("Loading Pre-computed MixUp Data...")
             mix_p_path = os.path.join(
                 preprocessed_data_dir, "mixup_augmented_precip.npz"
             )
             mix_t_path = os.path.join(
-                preprocessed_data_dir, "mixup_augmented_targets.npz"
+                preprocessed_data_dir, "mixup_augmented_targets_persistence.npz"
             )
 
             if os.path.exists(mix_p_path) and os.path.exists(mix_t_path):
