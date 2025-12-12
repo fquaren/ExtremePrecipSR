@@ -8,7 +8,8 @@
 #SBATCH --output outputs/%j
 #SBATCH --error job_errors/%j
 
-#SBATCH --partition cpu
+#SBATCH --partition gpu
+#SBATCH --gres gpu:1
 #SBATCH --nodes 1
 #SBATCH --ntasks 1
 #SBATCH --cpus-per-task 24
@@ -24,4 +25,4 @@
 source /users/fquareng/.bashrc
 micromamba activate dl-torch
 micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/calibrate_tau.py
-# micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_sr_unet.py --metric_loss_mode train
+micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_sr_unet.py --metric_loss_mode train

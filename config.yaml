@@ -49,7 +49,7 @@ SPLIT_RATIOS:
   test: 0.1
 
 # DataLoaders
-NUM_WORKERS: 4
+NUM_WORKERS: 24
 BATCH_SIZE: 128
 SAMPLE_WEIGHTS:
   "dry": 1.0
