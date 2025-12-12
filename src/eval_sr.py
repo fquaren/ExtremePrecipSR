@@ -6,6 +6,7 @@ import argparse
 import os
 from tqdm import tqdm
 import warnings
+from metrics import compute_fss, compute_sal
 
 # Import our libraries
 import io_lib_sr as io_lib
@@ -35,14 +36,14 @@ def run_prediction_loop(
     quantile_levels,
     pixel_size_km,
     trust_tau,
-    physical_max_val,  # <--- CRITICAL ARG: The scaler value (~5.0)
-    drizzle_threshold=0.1,  # <--- CRITICAL ARG: To remove background noise
+    physical_max_val,
+    drizzle_threshold=0.1,
 ):
     model.eval()
     if emulator:
         emulator.eval()
 
-    # Storage... (same as before)
+    # Storage
     all_preds_gamma_analytic = []
     all_targets_gamma_analytic = []
     all_preds_phys = []
@@ -51,6 +52,13 @@ def run_prediction_loop(
     all_dems = []
     all_total_losses, all_mse_losses, all_surrogate_losses = [], [], []
     all_trust_scores = []
+
+    # --- NEW: Storage for SAL and FSS ---
+    all_sal_S = []
+    all_sal_A = []
+    all_sal_L = []
+    all_fss = []  # Can store FSS at a specific key threshold, e.g., drizzle or higher
+
     audit_results = {
         "L1_phys_err": [],
         "L2_perc_err": [],
@@ -59,6 +67,13 @@ def run_prediction_loop(
     }
 
     print("\n--- Starting SR Inference ---")
+
+    # Define FSS/SAL parameters
+    # Adjust window_size for FSS (e.g., 10-20km -> ~5-10 pixels)
+    FSS_WINDOW = 5
+    # Threshold for SAL/FSS computation (metric_threshold)
+    # Using the drizzle threshold is standard to define "rain area"
+    METRIC_THRESHOLD = drizzle_threshold
 
     with torch.no_grad():
         for X, Y_true, Y_gamma_log_target in tqdm(loader, desc="Inference"):
@@ -71,17 +86,12 @@ def run_prediction_loop(
             # --- 1. RECONSTRUCT PHYSICAL PRECIPITATION ---
             pred_X_raw = model(X)
 
-            # A. Inverse Transform (Log Norm -> Physical)
-            # Use Softplus -> Scale -> Expm1 chain from training
+            # A. Inverse Transform
             pred_X_pos = F.softplus(pred_X_raw, beta=5.0)
             pred_X_phys = torch.expm1(pred_X_pos * physical_max_val)
-
-            # Apply same transform to Ground Truth (which is normalized log in dataset)
             Y_true_phys = torch.expm1(Y_true * physical_max_val)
 
             # B. Apply Sparsity / Drizzle Threshold
-            # Crucial for TDA and Emulator consistency.
-            # This prevents 0.01 mm/h background noise from being counted as a 65,000 km^2 storm.
             pred_X_phys = pred_X_phys * (pred_X_phys > drizzle_threshold).float()
             Y_true_phys = Y_true_phys * (Y_true_phys > drizzle_threshold).float()
 
@@ -91,36 +101,52 @@ def run_prediction_loop(
             all_inputs_phys.append(input_precip_batch)
             all_dems.append(dem_batch)
 
-            # --- 2. Compute Analytic Gamma (CPU TDA) ---
-            # Now inputs are physically correct (mm/h), so TDA will work
+            # --- 2. Compute Analytic Metrics (CPU) ---
             pred_X_np = pred_X_phys.cpu().numpy()
+            Y_true_np = Y_true_phys.cpu().numpy()
+
             batch_gammas = []
+
+            # Per-Sample CPU Loop
             for i in range(pred_X_np.shape[0]):
+                p_img = pred_X_np[i, 0]
+                t_img = Y_true_np[i, 0]
+
+                # A. Gamma Matrix
                 g = compute_gamma_matrix_for_image(
-                    pred_X_np[i, 0], quantile_levels, pixel_size_km
+                    p_img, quantile_levels, pixel_size_km
                 )
                 batch_gammas.append(g)
 
+                # B. SAL & FSS
+                s_val, a_val, l_val = compute_sal(
+                    p_img, t_img, threshold=METRIC_THRESHOLD
+                )
+                fss_val = compute_fss(
+                    p_img, t_img, window_size=FSS_WINDOW, threshold=METRIC_THRESHOLD
+                )
+
+                all_sal_S.append(s_val)
+                all_sal_A.append(a_val)
+                all_sal_L.append(l_val)
+                all_fss.append(fss_val)
+
             all_preds_gamma_analytic.append(np.array(batch_gammas))
 
-            # --- FIX: INVERSE TRANSFORM TARGETS FOR ANALYTIC COMPARISON ---
-            # The dataloader gives Log-Space targets (Y_gamma_log_target).
-            # We must inverse them to Physical Space (Area in km^2) so the MSE tables make sense.
+            # Inverse transform targets for analytic comparison
             Y_gamma_phys_target = np.expm1(Y_gamma_log_target.cpu().numpy())
             all_targets_gamma_analytic.append(Y_gamma_phys_target)
 
             # --- 3. Calculate Losses ---
-            # Standard metrics on Physical Values (MAE/MSE)
             loss_mse = mse_criterion(pred_X_phys, Y_true_phys).mean(dim=(1, 2, 3))
             loss_surr = torch.zeros_like(loss_mse)
             trust_vec = torch.ones_like(loss_mse)
 
             if emulator:
-                # --- Trust Calculation ---
-                gamma_true_phys = emulator(Y_true_phys)  # Physical Output
-                gamma_true_log_rec = torch.log1p(gamma_true_phys)  # Manifold Alignment
+                # Trust Calculation
+                gamma_true_phys = emulator(Y_true_phys)
+                gamma_true_log_rec = torch.log1p(gamma_true_phys)
 
-                # Compare Log vs Log
                 emu_error_matrix = F.mse_loss(
                     gamma_true_log_rec, Y_gamma_log_target, reduction="none"
                 )
@@ -129,12 +155,10 @@ def run_prediction_loop(
                 )
                 trust_vec = torch.exp(-trust_tau * emu_error)
 
-                # --- Surrogate Loss ---
+                # Surrogate Loss
                 if eval_mode != "none" and surrogate_criterion:
                     pred_gamma_phys = emulator(pred_X_phys)
-                    pred_gamma_log = torch.log1p(pred_gamma_phys)  # Manifold Alignment
-
-                    # Loss is calculated in Log Space (stable gradients)
+                    pred_gamma_log = torch.log1p(pred_gamma_phys)
                     loss_surr = surrogate_criterion(pred_gamma_log, Y_gamma_log_target)
 
             if eval_mode == "train":
@@ -144,21 +168,14 @@ def run_prediction_loop(
 
             # --- 4. Emulator Consistency Audit ---
             if emulator and audit_criterion:
-                # Forward passes (Physical Inputs)
                 gamma_pred_phys = emulator(pred_X_phys)
                 gamma_true_phys = emulator(Y_true_phys)
 
-                # Align to Log Space for Comparison
                 gamma_pred_log = torch.log1p(gamma_pred_phys)
                 gamma_true_log = torch.log1p(gamma_true_phys)
 
-                # L1: Pred (Log) vs Target (Log)
                 l1 = audit_criterion(gamma_pred_log, Y_gamma_log_target)
-
-                # L2: Pred (Log) vs Emu_on_True (Log) -> "Perceptual"
                 l2 = audit_criterion(gamma_pred_log, gamma_true_log)
-
-                # L3: Emu_on_True (Log) vs Target (Log) -> "Intrinsic"
                 l3 = audit_criterion(gamma_true_log, Y_gamma_log_target)
 
                 gap = torch.abs(l1 - l2)
@@ -194,11 +211,18 @@ def run_prediction_loop(
     all_surrogate_losses = np.concatenate(all_surrogate_losses, axis=0)
     all_trust_scores = np.concatenate(all_trust_scores, axis=0)
 
+    # NEW: Convert lists to numpy arrays
+    all_sal_S = np.array(all_sal_S)
+    all_sal_A = np.array(all_sal_A)
+    all_sal_L = np.array(all_sal_L)
+    all_fss = np.array(all_fss)
+
     for k in audit_results:
         audit_results[k] = np.concatenate(audit_results[k], axis=0)
 
     print(f"Inference complete. Processed {len(all_total_losses)} samples.")
 
+    # Return expanded tuple
     return (
         all_preds_gamma_analytic,
         all_targets_gamma_analytic,
@@ -211,6 +235,10 @@ def run_prediction_loop(
         all_surrogate_losses,
         all_trust_scores,
         audit_results,
+        all_sal_S,
+        all_sal_A,
+        all_sal_L,
+        all_fss,
     )
 
 
@@ -228,11 +256,9 @@ def main(run_dir):
     TRUST_TAU = config.get("TRUST_TAU", 2.0)
 
     # --- LOAD SCALER ---
-    # We need the exact scaler used during training to invert the normalization correctly.
     scaler_path = os.path.join(
         config["PREPROCESSED_DATA_DIR"], "log_transformed_precip_max_val.npy"
     )
-    # Fallback check
     if not os.path.exists(scaler_path):
         scaler_path = os.path.join(
             config["PREPROCESSED_DATA_DIR"], "train", "precip_max_val.npy"
@@ -279,6 +305,10 @@ def main(run_dir):
         all_surrogate_losses,
         all_trust_scores,
         audit_results,
+        all_sal_S,  # New
+        all_sal_A,  # New
+        all_sal_L,  # New
+        all_fss,  # New
     ) = run_prediction_loop(
         model,
         test_loader,
@@ -316,6 +346,12 @@ def main(run_dir):
     metrics_df["Consistency_Flag"] = audit_results["consistency_gap"]
     metrics_df["Trust_Score"] = all_trust_scores
 
+    # --- NEW: Add SAL and FSS to DataFrame ---
+    metrics_df["SAL_S"] = all_sal_S
+    metrics_df["SAL_A"] = all_sal_A
+    metrics_df["SAL_L"] = all_sal_L
+    metrics_df["FSS"] = all_fss
+
     # Metrics
     group_metrics = metrics_lib.calculate_grouped_metrics(metrics_df)
     per_feature_gamma_metrics = metrics_lib.calculate_per_feature_gamma_metrics(
@@ -326,16 +362,22 @@ def main(run_dir):
     io_lib.save_metrics_text(run_dir, group_metrics, per_feature_gamma_metrics)
     io_lib.save_metrics_npz(run_dir, metrics_df, per_feature_gamma_metrics)
 
-    # Print Audit Summary
+    # Print Summary
+    print("\n" + "=" * 40)
+    print("       SCIENTIFIC METRICS SUMMARY        ")
+    print("=" * 40)
+    # Using nanmean to handle potential NaNs in SAL calculation for empty fields
+    print(f"Mean FSS:   {np.nanmean(metrics_df['FSS']):.4f}")
+    print(f"Mean SAL_S: {np.nanmean(metrics_df['SAL_S']):.4f}")
+    print(f"Mean SAL_A: {np.nanmean(metrics_df['SAL_A']):.4f}")
+    print(f"Mean SAL_L: {np.nanmean(metrics_df['SAL_L']):.4f}")
+
     if emulator:
         pass_rate = (metrics_df["Consistency_Flag"] < 0.3).mean() * 100
         avg_trust = metrics_df["Trust_Score"].mean()
-        print("\n" + "=" * 40)
-        print(f"EMULATOR AUDIT SUMMARY (N={len(metrics_df)})")
-        print("=" * 40)
+        print("-" * 40)
         print(f"Pass Rate (Flag < 0.3): {pass_rate:.2f}%")
         print(f"Avg Trust Score:        {avg_trust:.4f}")
-        print(f"Avg Physical Error:     {metrics_df['L1_Physical_Error'].mean():.4f}")
         print("=" * 40 + "\n")
 
     # Plots

@@ -408,7 +408,7 @@ def main(run_dir):
         all_inputs_phys,
         all_targets_phys,
         all_preds_phys,
-        all_dems,  # Passing dummy
+        all_dems,
         all_total_losses,
         all_mse_losses,
         all_surrogate_losses,

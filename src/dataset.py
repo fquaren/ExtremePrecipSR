@@ -59,16 +59,33 @@ class SRDataset(Dataset):
         else:
             self.gamma_targets = np.load(gamma_path, mmap_mode="r")["data"]
 
-        # --- OPTIMIZATION: Zero-Filtering ---
+        # --- OPTIMIZATION: Zero-Filtering (Modified) ---
         if self.is_train:
-            print("Filtering dry patches for training...")
+            print("Filtering patches...")
             max_vals = np.max(self.original_patches, axis=(1, 2))
             wet_indices = np.where(max_vals > 1e-6)[0]
-            self.valid_indices = wet_indices
-            print(
-                f"Retained {len(self.valid_indices)}/{len(self.original_patches)} wet patches."
-            )
+            dry_indices = np.where(max_vals <= 1e-6)[0]
+
+            # Keep ALL wet patches
+            # Keep randomly selected dry patches (e.g., 20% ratio)
+            # You can tune this ratio. Too high -> model gets lazy. Too low -> model hallucinates.
+            n_dry_to_keep = int(len(wet_indices) * 0.2)
+
+            if len(dry_indices) > n_dry_to_keep:
+                # Use a fixed seed for reproducibility if desired, or random
+                keep_dry = np.random.choice(
+                    dry_indices, size=n_dry_to_keep, replace=False
+                )
+            else:
+                keep_dry = dry_indices
+
+            self.valid_indices = np.concatenate([wet_indices, keep_dry])
+            np.random.shuffle(self.valid_indices)  # Shuffle so batches are mixed
+
+            print(f"Dataset Balanced: {len(wet_indices)} Wet, {len(keep_dry)} Dry.")
+
         else:
+            # For validation/test, we MUST keep everything to evaluate performance honestly.
             self.valid_indices = np.arange(len(self.original_patches))
 
         self.geom_transform = T.Compose(

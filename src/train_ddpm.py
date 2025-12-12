@@ -219,7 +219,7 @@ def main():
     out_dir = os.path.join("sr_experiment_runs", run_name)
     os.makedirs(out_dir, exist_ok=True)
 
-    with open(os.path.join(out_dir, "config_snapshot.yaml"), "w") as f:
+    with open(os.path.join(out_dir, "config.yaml"), "w") as f:
         yaml.dump(config, f)
 
     # --- Data & Denormalizer ---

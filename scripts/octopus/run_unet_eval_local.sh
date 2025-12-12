@@ -15,7 +15,7 @@ ENV_NAME="dl"
 
 # --- EXPERIMENT DEFINITIONS ---
 # Exact arrays from the SLURM script
-MODELS_TO_EVAL=("GammaEmulatorv3_train_2025-12-09_08-16-13")
+MODELS_TO_EVAL=("GammaEmulatorv3_train_2025-12-11_00-25-05")
 
 N_EXPERIMENTS=${#MODELS_TO_EVAL[@]}
 

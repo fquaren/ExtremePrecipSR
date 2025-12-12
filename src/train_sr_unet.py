@@ -454,6 +454,18 @@ def main():
                     optimizer, mode="min", factor=0.5, patience=5
                 )
 
+            # Save this model
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "model_state_dict": sr_model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "best_val_loss": best_val_loss,
+                    "scaler": metric_loss_scaler,
+                },
+                os.path.join(output_dir, "warmup_complete_model.pth"),
+            )
+
         # --- 12. Checkpointing ---
         current_val_score = avg_val["mae"]
         scheduler.step(current_val_score)
