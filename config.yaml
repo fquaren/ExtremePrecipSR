@@ -9,27 +9,28 @@
 RAW_OPERA_DATA_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/raw_data/OPERA"
 
 # --- CURNAGL ---
-# METADATA_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA"
-# PREPROCESSED_DATA_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/precip"
-# DEM_DATA_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/dem"
-# DEM_STATS: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/dem/dem_stats.json"
+METADATA_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA"
+PREPROCESSED_DATA_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/precip"
+DEM_DATA_DIR: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/dem"
+DEM_STATS: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/dem/dem_stats.json"
 
-# TRAIN_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/train_patches_metadata_with_stats.txt"
-# VAL_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/val_patches_metadata_with_stats.txt"
-# TEST_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/test_patches_metadata_with_stats.txt"
-# MAX_PRECIP_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/precip/scaler_max_val.npy"
+TRAIN_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/train_patches_metadata_with_stats.txt"
+VAL_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/val_patches_metadata_with_stats.txt"
+TEST_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/test_patches_metadata_with_stats.txt"
+MAX_PRECIP_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/precip/scaler_max_val.npy"
+MAX_PRECIP_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/precip/log_transformed_precip_max_val.npy"
 
 # --- OCTOPUS ---
-METADATA_DIR: "/home/fquareng/work/data/extremes/OPERA"
-PREPROCESSED_DATA_DIR: "/home/fquareng/work/data/extremes/OPERA/patches/precip"
-DEM_DATA_DIR: "/home/fquareng/work/data/extremes/OPERA/patches/dem"
-DEM_STATS: "/home/fquareng/work/data/extremes/OPERA/patches/dem/dem_stats.json"
+# METADATA_DIR: "/home/fquareng/work/data/extremes/OPERA"
+# PREPROCESSED_DATA_DIR: "/home/fquareng/work/data/extremes/OPERA/patches/precip"
+# DEM_DATA_DIR: "/home/fquareng/work/data/extremes/OPERA/patches/dem"
+# DEM_STATS: "/home/fquareng/work/data/extremes/OPERA/patches/dem/dem_stats.json"
 
-TRAIN_METADATA_FILE: "/home/fquareng/work/data/extremes/OPERA/train_patches_metadata_with_stats.txt"
-VAL_METADATA_FILE: "/home/fquareng/work/data/extremes/OPERA/val_patches_metadata_with_stats.txt"
-TEST_METADATA_FILE: "/home/fquareng/work/data/extremes/OPERA/test_patches_metadata_with_stats.txt"
-MAX_PRECIP_FILE: "/home/fquareng/work/data/extremes/OPERA/patches/precip/scaler_max_val.npy"
-MAX_LOG_PRECIP_FILE: "/home/fquareng/work/data/extremes/OPERA/patches/precip/log_transformed_precip_max_val.npy"
+# TRAIN_METADATA_FILE: "/home/fquareng/work/data/extremes/OPERA/train_patches_metadata_with_stats.txt"
+# VAL_METADATA_FILE: "/home/fquareng/work/data/extremes/OPERA/val_patches_metadata_with_stats.txt"
+# TEST_METADATA_FILE: "/home/fquareng/work/data/extremes/OPERA/test_patches_metadata_with_stats.txt"
+# MAX_PRECIP_FILE: "/home/fquareng/work/data/extremes/OPERA/patches/precip/scaler_max_val.npy"
+# MAX_LOG_PRECIP_FILE: "/home/fquareng/work/data/extremes/OPERA/patches/precip/log_transformed_precip_max_val.npy"
 
 # --- CLUSTER AGNOSTIC ---
 # Precipitation patches
@@ -88,7 +89,8 @@ WEIGHT_DECAY: 0.00001
 QUANTILE_LEVELS: [0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]
 
 # Evaluation emulator (Using the best Hard+Attention model)
-EMULATOR_CHECKPOINT_PATH: "experiment_runs/GammaEmulator_OfflineMixup_hard_Attention_2025-12-05_05-59-38/best_model_checkpoint.pth" 
+EMULATOR_CHECKPOINT_PATH: /scratch/fquareng/experiment_runs/GammaEmulator_OfflineMixup_hard_Attention_2025-12-05_05-59-38/best_model_checkpoint.pth
+#"experiment_runs/GammaEmulator_OfflineMixup_hard_Attention_2025-12-05_05-59-38/best_model_checkpoint.pth" 
 
 # Training super resolution
 METRIC_LOSS_MODE: 'train'

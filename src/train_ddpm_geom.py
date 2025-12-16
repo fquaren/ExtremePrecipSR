@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F  # Added for softplus/relu
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -12,9 +13,14 @@ import time
 import matplotlib.pyplot as plt
 from scipy.stats import wasserstein_distance
 
+# Project imports
 from model_ddpm import ContextUnet
 from diffusion import Diffusion
 from dataset import SRDataset
+
+# Added imports for Geometric Loss
+from loss import GeometricLossSeparate, estimate_s_inv_from_dataset
+from utils import load_emulator  # Assumes utils.py exists as in your UNet script
 
 # --- Config ---
 parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -32,7 +38,14 @@ LR = 1e-4
 EPOCHS = 100
 PATIENCE = 10
 NUM_WORKERS = 4
-EXPERIMENT_NAME = "DDPM_SR"
+EXPERIMENT_NAME = "DDPM_SR_Geometric"
+
+# --- Geometric Loss Configuration ---
+GEOMETRIC_START_EPOCH = 20  # Warm-up phase (pure MSE)
+GEOMETRIC_WEIGHT = 0.1  # Scaling factor for auxiliary loss
+GEOMETRIC_T_THRESHOLD = 250  # Only apply loss when t < 250 (cleaner signal)
+TRUST_TAU = config.get("TRUST_TAU", 0.5)  # Trust gate decay rate
+EMULATOR_PATH = config.get("EMULATOR_CHECKPOINT_PATH", "checkpoints/emulator_best.pth")
 
 
 class DataDenormalizer:
@@ -45,11 +58,7 @@ class DataDenormalizer:
         try:
             # Load the numpy array
             data = np.load(stats_path)
-
-            # FIX: Use .item() instead of [0].
-            # .item() works for both 0-d scalars (array(5.0)) and 1-d arrays of size 1 (array([5.0]))
             self.max_val = float(data.item())
-
             print(f"Loaded Denormalizer. Max Val (Log Space): {self.max_val:.4f}")
         except FileNotFoundError:
             print(
@@ -64,7 +73,7 @@ class DataDenormalizer:
 
     def unnormalize(self, x_norm):
         """
-        Inverse Pipeline:
+        Inverse Pipeline (Numpy):
         1. Scale up: x' = x_norm * max_val
         2. Inverse Log: x_phys = exp(x') - 1
         """
@@ -75,6 +84,22 @@ class DataDenormalizer:
         x_phys = np.expm1(x_scaled)
         # Physical constraint: Precip >= 0
         return np.maximum(x_phys, 0.0)
+
+    def unnormalize_torch(self, x_norm):
+        """
+        Inverse Pipeline (Differentiable Torch):
+        Used for calculating geometric loss on the GPU.
+        """
+        # Ensure max_val is a tensor on the correct device
+        if not isinstance(self.max_val, torch.Tensor):
+            self.max_val = torch.tensor(
+                self.max_val, device=x_norm.device, dtype=x_norm.dtype
+            )
+
+        x_scaled = x_norm * self.max_val
+        x_phys = torch.expm1(x_scaled)
+        # Use ReLU to enforce non-negativity in the graph
+        return F.relu(x_phys)
 
 
 class EarlyStopping:
@@ -121,9 +146,7 @@ def compute_physical_metrics(real_batch, gen_batch, drizzle_threshold=0.1):
     real_flat = real_batch.flatten()
     gen_flat = gen_batch.flatten()
 
-    # 1. Wasserstein Distance (Earth Mover's Distance between intensity histograms)
-    # Using a subset for speed if arrays are massive is often wise,
-    # but for batch-level validation, full calculation is fine.
+    # 1. Wasserstein Distance
     wd = wasserstein_distance(real_flat, gen_flat)
 
     # 2. Max Intensity Error
@@ -143,7 +166,7 @@ def save_sample_images(model, diffusion, loader, device, out_dir, epoch, denorma
 
     X, Y = X.to(device, non_blocking=True), Y.to(device, non_blocking=True)
 
-    n_samples = min(5, X.shape[0])
+    n_samples = min(50, X.shape[0])
     X_sample = X[:n_samples]
     Y_sample = Y[:n_samples]
 
@@ -176,14 +199,11 @@ def save_sample_images(model, diffusion, loader, device, out_dir, epoch, denorma
     Gen_cpu = x_generated.float().cpu().numpy()
 
     # Denormalize Precip channels
-    # X_cpu is [N, 2, H, W] -> index 0 is Precip
     X_phys = denormalizer.unnormalize(X_cpu[:, 0])
     Y_phys = denormalizer.unnormalize(Y_cpu[:, 0])
     Gen_phys = denormalizer.unnormalize(Gen_cpu[:, 0])
 
     for i in range(n_samples):
-        # Plotting Physical Values (mm/h)
-        # Use a fixed vmax for consistent visualization if desired, or auto-scale
         vmax = max(np.max(Y_phys[i]), np.max(Gen_phys[i]), 1.0)
 
         im1 = axs[i, 0].imshow(X_phys[i], cmap="Blues", origin="lower", vmax=vmax)
@@ -219,7 +239,7 @@ def main():
     out_dir = os.path.join("sr_experiment_runs", run_name)
     os.makedirs(out_dir, exist_ok=True)
 
-    with open(os.path.join(out_dir, "config.yaml"), "w") as f:
+    with open(os.path.join(out_dir, "config_snapshot.yaml"), "w") as f:
         yaml.dump(config, f)
 
     # --- Data & Denormalizer ---
@@ -260,6 +280,26 @@ def main():
         persistent_workers=True,
     )
 
+    # --- Geometric Loss Setup ---
+    print(f"Initializing Geometric Loss (Start Epoch: {GEOMETRIC_START_EPOCH})...")
+
+    # 1. Estimate S_inv (Covariance) from training data
+    # Note: This might take a minute.
+    S_inv_tensors = estimate_s_inv_from_dataset(
+        train_dataset, num_samples=2000, device=device
+    )
+    geometric_criterion = GeometricLossSeparate(S_inv_tensors, reduction="none").to(
+        device
+    )
+
+    # 2. Load Emulator
+    # We freeze it to ensure we don't accidentally train the emulator
+    print(f"Loading Emulator from {EMULATOR_PATH}...")
+    emulator = load_emulator(EMULATOR_PATH, config, device)
+    emulator.eval()
+    for param in emulator.parameters():
+        param.requires_grad = False
+
     model = ContextUnet(in_channels=1, c_in_condition=2, device=device).to(device)
     diffusion = Diffusion(img_size=128, device=device)
 
@@ -268,18 +308,29 @@ def main():
     scaler = torch.amp.GradScaler("cuda")
     early_stopper = EarlyStopping(patience=PATIENCE, verbose=True)
 
-    history = {"epoch": [], "train_loss": [], "val_loss": [], "timestamp": []}
+    history = {
+        "epoch": [],
+        "train_loss": [],
+        "val_loss": [],
+        "train_geom": [],
+        "avg_trust": [],
+        "timestamp": [],
+    }
 
-    print("Starting DDPM Training (Mixed Precision)...")
+    print("Starting DDPM Training (Mixed Precision with Geometric Fine-Tuning)...")
 
     for epoch in range(EPOCHS):
         model.train()
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         running_loss = 0.0
+        running_geom = 0.0
+        running_trust = 0.0
 
-        for X, Y, _ in pbar:
+        # Unpack Y_gamma (dataset returns: input, target, target_gamma)
+        for X, Y, Y_gamma in pbar:
             X = X.to(device, non_blocking=True)
             Y = Y.to(device, non_blocking=True)
+            Y_gamma = Y_gamma.to(device, non_blocking=True)  # [B, 3] Log-space targets
 
             t = diffusion.sample_timesteps(X.shape[0])
             x_t, noise = diffusion.noise_images(Y, t)
@@ -287,17 +338,91 @@ def main():
             optimizer.zero_grad()
             with torch.amp.autocast("cuda"):
                 predicted_noise = model(x_t, t, X)
-                loss = mse(noise, predicted_noise)
+                loss_mse = mse(noise, predicted_noise)
 
-            scaler.scale(loss).backward()
+                # --- Geometric Loss Logic (Curriculum + Time Gated + Trust Gated) ---
+                loss_geom = torch.tensor(0.0, device=device)
+                avg_trust_val = 1.0
+
+                if epoch >= GEOMETRIC_START_EPOCH:
+                    # A. Analytic Reconstruction of x0
+                    # x0 ≈ (x_t - sqrt(1-alpha_hat) * eps_pred) / sqrt(alpha_hat)
+                    alpha_hat_t = diffusion.alpha_hat[t][:, None, None, None]
+                    sqrt_alpha_hat = torch.sqrt(alpha_hat_t)
+                    sqrt_one_minus = torch.sqrt(1 - alpha_hat_t)
+
+                    # Prevent division by zero stability check
+                    pred_x0 = (x_t - sqrt_one_minus * predicted_noise) / (
+                        sqrt_alpha_hat + 1e-8
+                    )
+
+                    # B. Time-Gating
+                    # Only apply geometric loss where signal is strong (t is small).
+                    mask_time = (t < GEOMETRIC_T_THRESHOLD).float()
+
+                    if mask_time.sum() > 0:
+                        # --- C. TRUST GATE CALCULATION ---
+                        with torch.no_grad():
+                            # 1. Unnormalize Ground Truth Y to Physical Units
+                            Y_phys = denormalizer.unnormalize_torch(Y)
+                            Y_phys = (
+                                Y_phys * (Y_phys > 0.1).float()
+                            )  # Sparsity consistency
+
+                            # 2. Emulator Prediction on Ground Truth
+                            gamma_truth_phys = emulator(Y_phys)
+                            gamma_truth_log_pred = torch.log1p(gamma_truth_phys)
+
+                            # 3. Calculate Emulator Error
+                            diff_trust = gamma_truth_log_pred - Y_gamma
+                            emu_error_sq = diff_trust.pow(2).mean(dim=1)  # [B]
+
+                            # 4. Compute Trust Weights
+                            trust_weights = torch.exp(-float(TRUST_TAU) * emu_error_sq)
+                            avg_trust_val = trust_weights.mean().item()
+
+                        # --- D. Loss Computation ---
+
+                        # 1. Prepare Predicted x0 (Physical)
+                        pred_x0_phys = denormalizer.unnormalize_torch(pred_x0)
+                        pred_x0_phys = pred_x0_phys * (pred_x0_phys > 0.1).float()
+
+                        # 2. Emulator Prediction on Predicted x0
+                        pred_gamma_phys = emulator(pred_x0_phys)
+                        pred_gamma_log = torch.log1p(pred_gamma_phys)
+
+                        # 3. Compute Raw Geometric Loss (Per Sample)
+                        raw_geom_loss = geometric_criterion(pred_gamma_log, Y_gamma)
+
+                        # 4. Apply Trust Weights AND Time Mask
+                        weighted_loss = raw_geom_loss * trust_weights * mask_time
+
+                        # Normalize by number of valid samples
+                        loss_geom = weighted_loss.sum() / (mask_time.sum() + 1e-8)
+
+                # Total Loss
+                total_loss = loss_mse + (GEOMETRIC_WEIGHT * loss_geom)
+
+            scaler.scale(total_loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
-            running_loss += loss.item()
-            pbar.set_postfix(MSE=loss.item())
+            running_loss += loss_mse.item()
+            running_geom += loss_geom.item()
+            running_trust += avg_trust_val
+
+            pbar.set_postfix(
+                MSE=f"{loss_mse.item():.4f}",
+                Geom=f"{loss_geom.item():.4f}",
+                Trust=f"{avg_trust_val:.2f}",
+            )
 
         avg_loss = running_loss / len(train_loader)
-        print(f"Epoch {epoch+1} Train MSE: {avg_loss:.6f}")
+        avg_geom = running_geom / len(train_loader)
+        avg_trust = running_trust / len(train_loader)
+        print(
+            f"Epoch {epoch+1} Train MSE: {avg_loss:.6f} | Geom: {avg_geom:.6f} | Avg Trust: {avg_trust:.2f}"
+        )
 
         # --- Validation ---
         model.eval()
@@ -323,6 +448,8 @@ def main():
         history["epoch"].append(epoch + 1)
         history["train_loss"].append(avg_loss)
         history["val_loss"].append(avg_val_loss)
+        history["train_geom"].append(avg_geom)
+        history["avg_trust"].append(avg_trust)
         history["timestamp"].append(time.strftime("%H:%M:%S"))
         pd.DataFrame(history).to_csv(
             os.path.join(out_dir, "loss_history.csv"), index=False
@@ -344,8 +471,6 @@ def main():
 
             # Storage for aggregating metrics
             val_metrics = {"wd": [], "max_err": []}
-
-            # Limit validation to N batches to prevent excessive training downtime
             NUM_PHYS_BATCHES = 10
 
             with torch.no_grad():
@@ -356,7 +481,6 @@ def main():
                     X_val, Y_val = X_val.to(device), Y_val.to(device)
 
                     # --- FILTER WET SAMPLES ---
-                    # We only care about performance on rainy patches
                     input_precip = X_val[:, 0, :, :]
                     is_wet = input_precip.amax(dim=(1, 2)) > 1e-6
                     wet_indices = torch.where(is_wet)[0]
@@ -373,7 +497,6 @@ def main():
                     )
 
                     # --- PHYSICAL TRANSFORMATION ---
-                    # Move to CPU and Denormalize
                     Y_cpu = Y_wet.cpu().numpy().squeeze()
                     Gen_cpu = gen_wet.cpu().numpy().squeeze()
 

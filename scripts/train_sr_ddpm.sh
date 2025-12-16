@@ -13,7 +13,7 @@
 #SBATCH --gres-flags enforce-binding
 #SBATCH --nodes 1
 #SBATCH --ntasks 1
-#SBATCH --cpus-per-task 24
+#SBATCH --cpus-per-task 16
 #SBATCH --mem 350G
 #SBATCH --time 72:00:00
 
@@ -25,4 +25,5 @@
 
 source /users/fquareng/.bashrc
 micromamba activate dl-torch
-micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_ddpm.py
+# micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_ddpm.py
+micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_ddpm_geom.py
