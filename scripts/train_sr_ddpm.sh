@@ -26,4 +26,4 @@
 source /users/fquareng/.bashrc
 micromamba activate dl-torch
 # micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_ddpm.py
-micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_ddpm_geom.py
+micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_ddpm_geom.py # --resume /scratch/fquareng/sr_experiment_runs/DDPM_SR_Geometric_20251215_125749/ddpm_latest.pth

@@ -18,7 +18,7 @@ TRAIN_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/ex
 VAL_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/val_patches_metadata_with_stats.txt"
 TEST_METADATA_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/test_patches_metadata_with_stats.txt"
 MAX_PRECIP_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/precip/scaler_max_val.npy"
-MAX_PRECIP_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/precip/log_transformed_precip_max_val.npy"
+MAX_LOG_PRECIP_FILE: "/work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/data/extremes/OPERA/patches/precip/log_transformed_precip_max_val.npy"
 
 # --- OCTOPUS ---
 # METADATA_DIR: "/home/fquareng/work/data/extremes/OPERA"
