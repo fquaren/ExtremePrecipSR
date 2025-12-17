@@ -2,7 +2,7 @@
 
 # --- CONFIGURATION ---
 PROJECT_ROOT="/home/fquareng/work/ExtremePrecipSR" 
-SCRIPT_PATH="${PROJECT_ROOT}/src/train_sr_unet.py"
+SCRIPT_PATH="${PROJECT_ROOT}/src/train_sr_unet_soft.py"
 SCRIPT_PATH_2="${PROJECT_ROOT}/src/calibrate_tau.py"
 
 # Logging setup
