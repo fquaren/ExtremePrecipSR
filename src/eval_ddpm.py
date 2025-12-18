@@ -151,8 +151,8 @@ def run_ddpm_prediction_loop(
     device,
     quantile_levels,
     pixel_size_km,
-    denormalizer_max_val,  # <--- CRITICAL ARG: The scaler value (~5.0)
-    drizzle_threshold=0.1,  # <--- CRITICAL ARG: To remove background noise
+    denormalizer_max_val,
+    drizzle_threshold=0.1,
 ):
     """
     Iterates through the test set, sampling from the DDPM for each batch.
