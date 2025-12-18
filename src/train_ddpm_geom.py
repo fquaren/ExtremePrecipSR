@@ -38,7 +38,7 @@ BATCH_SIZE = 128
 LR = 1e-4
 EPOCHS = 100
 PATIENCE = 5
-NUM_WORKERS = 4
+NUM_WORKERS = 24
 EXPERIMENT_NAME = "DDPM_SR_Geometric"
 
 # --- Geometric Loss Configuration ---
