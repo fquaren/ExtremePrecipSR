@@ -81,6 +81,9 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    # Enable anomaly detection to catch any lingering NaNs immediately
+    # torch.autograd.set_detect_anomaly(True)
+
     # --- 1. Load Physical Scalar ---
     scaler_path = os.path.join(
         PREPROCESSED_DATA_DIR, "log_transformed_precip_max_val.npy"
@@ -189,6 +192,7 @@ def main():
     )
 
     # --- 6. Models & Optimizer ---
+    # Ensure the new class is used
     sr_model = UNetSR(in_channels=2, out_channels=1).to(device)
 
     optimizer = torch.optim.Adam(
@@ -230,7 +234,6 @@ def main():
     # --- 8. Logging Init ---
     log_file_path = os.path.join(output_dir, "sr_training_log.csv")
     with open(log_file_path, "w") as log_file:
-        # Removed clf logging headers
         log_file.write(
             "epoch,train_loss_total,train_loss_mae,train_loss_metric,"
             "val_loss_total,val_loss_mae,val_loss_metric,"
@@ -272,7 +275,7 @@ def main():
                 progress = (epoch - METRIC_WARMUP_EPOCHS + 1) / float(
                     METRIC_RAMP_EPOCHS
                 )
-                current_metric_weight = min(1.0, progress) * METRIC_LOSS_WEIGHT
+                current_metric_weight = (min(1.0, progress) ** 2) * METRIC_LOSS_WEIGHT
 
         sr_model.train()
         logs = {"loss": 0.0, "mae": 0.0, "metric": 0.0, "trust": 0.0}
@@ -286,28 +289,33 @@ def main():
             optimizer.zero_grad()
 
             # --- Prepare Physical Constraint for SmCL ---
-            # SmCL operates on physical units.
-            # Input X is stack [Interp, DEM]. We take channel 0 (Interp).
-            # We must inverse-transform it to physical units for the constraint.
-            # Assuming X[:,0] is log-normalized similarly to Y.
             with torch.no_grad():
                 X_precip_norm = X[:, 0:1, :, :]
-                # Inverse Softplus+Scale used in preprocessing
                 X_pos = F.softplus(X_precip_norm, beta=5.0)
-                X_phys = torch.expm1(X_pos * PHYSICAL_MAX_VAL)
+
+                # Clamp the exponent argument to avoid float32 overflow (approx exp(88))
+                exponent_arg = X_pos * PHYSICAL_MAX_VAL
+                if exponent_arg.max() > 88.0:
+                    exponent_arg = torch.clamp(exponent_arg, max=88.0)
+
+                X_phys = torch.expm1(exponent_arg)
+
+                # Sanity Check for Input
+                if torch.isnan(X_phys).any() or torch.isinf(X_phys).any():
+                    print("WARN: NaN/Inf detected in X_phys input. Skipping batch.")
+                    continue
 
             # --- Forward Pass ---
             # Model returns PHYSICAL units now due to SmCL
             pred_X_phys = sr_model(X, X_phys)
 
             # --- Loss Calculation ---
-            # The criterion targets Y (normalized log-space).
-            # We must convert pred_X_phys BACK to normalized log-space to compute L1 against Y.
+            # Convert pred_X_phys BACK to normalized log-space.
+            # Must clamp to non-negative to avoid log of negative if instability occurs.
+            pred_X_phys = torch.clamp(pred_X_phys, min=0.0)
+
             pred_X_log_space = torch.log1p(pred_X_phys)
             pred_X_norm = pred_X_log_space / PHYSICAL_MAX_VAL
-
-            # Note: Softplus inversion is not strictly bijective for negative inputs
-            # but SmCL guarantees positivity, so we are safe.
 
             # --- 1. Intensity Loss (MAE) ---
             loss_mae = pixel_criterion(pred_X_norm, Y)
@@ -318,16 +326,13 @@ def main():
             avg_trust = 1.0
 
             if METRIC_LOSS_MODE == "train" and current_metric_weight > 0:
-                # Sparsity
                 pred_X_phys_sparse = (
                     pred_X_phys * (pred_X_phys > DRIZZLE_THRESHOLD).float()
                 )
 
-                # Emulator Prediction
                 pred_gamma_phys = emulator_model(pred_X_phys_sparse)
                 pred_gamma_log = torch.log1p(pred_gamma_phys)
 
-                # Trust Gating
                 with torch.no_grad():
                     Y_phys = torch.expm1(Y * PHYSICAL_MAX_VAL)
                     Y_phys_clean = Y_phys * (Y_phys > DRIZZLE_THRESHOLD).float()
@@ -354,8 +359,16 @@ def main():
             else:
                 total_loss = loss_mae
 
+            # Check loss validity
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
+                print("CRITICAL: Loss is NaN/Inf. Skipping batch step.")
+                continue
+
             total_loss.backward()
+
+            # Gradient Clipping is mandatory for physics-based constraints
             torch.nn.utils.clip_grad_norm_(sr_model.parameters(), max_norm=1.0)
+
             optimizer.step()
 
             logs["loss"] += total_loss.item()
@@ -369,7 +382,11 @@ def main():
             )
 
         n_train = len(train_loader)
-        avg_train = {k: v / n_train for k, v in logs.items()}
+        if n_train > 0:
+            avg_train = {k: v / n_train for k, v in logs.items()}
+        else:
+            avg_train = logs  # Handle edge case of empty loader
+
         print(
             f"Train Ep {epoch+1}: Loss={avg_train['loss']:.4f}, MAE={avg_train['mae']:.4f}, Trust={avg_train['trust']:.2f}"
         )
@@ -391,10 +408,16 @@ def main():
                 # Prepare Constraint
                 X_precip_norm = X[:, 0:1, :, :]
                 X_pos = F.softplus(X_precip_norm, beta=5.0)
-                X_phys = torch.expm1(X_pos * PHYSICAL_MAX_VAL)
+
+                # Clamp val inputs too
+                exponent_arg = X_pos * PHYSICAL_MAX_VAL
+                if exponent_arg.max() > 88.0:
+                    exponent_arg = torch.clamp(exponent_arg, max=88.0)
+                X_phys = torch.expm1(exponent_arg)
 
                 # Forward
                 pred_X_phys = sr_model(X, X_phys)
+                pred_X_phys = torch.clamp(pred_X_phys, min=0.0)
 
                 # Convert to Normalized for Loss
                 pred_X_log_space = torch.log1p(pred_X_phys)

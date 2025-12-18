@@ -11,6 +11,8 @@ import json
 import time
 import matplotlib.pyplot as plt
 from scipy.stats import wasserstein_distance
+import copy
+import matplotlib.colors as mcolors
 
 from model_ddpm import ContextUnet
 from diffusion import Diffusion
@@ -135,19 +137,23 @@ def compute_physical_metrics(real_batch, gen_batch, drizzle_threshold=0.1):
 
 
 def save_sample_images(model, diffusion, loader, device, out_dir, epoch, denormalizer):
+    """
+    Runs inference on a batch and saves visualization plots matching the
+    style of _plot_comprehensive_sample (Gray background for zeros, shared scales).
+    """
     model.eval()
     try:
         X, Y, _ = next(iter(loader))
     except StopIteration:
         return
 
+    # --- INFERENCE LOGIC ---
     X, Y = X.to(device, non_blocking=True), Y.to(device, non_blocking=True)
 
     n_samples = min(5, X.shape[0])
     X_sample = X[:n_samples]
     Y_sample = Y[:n_samples]
 
-    # --- INFERENCE GATE LOGIC ---
     x_generated = torch.zeros(
         (n_samples, 1, diffusion.img_size, diffusion.img_size), device=device
     )
@@ -165,44 +171,83 @@ def save_sample_images(model, diffusion, loader, device, out_dir, epoch, denorma
                 gen_wet = diffusion.sample(model, n=n_wet, conditions=X_wet)
                 x_generated[wet_indices] = gen_wet
 
-    # --- VISUALIZATION (PHYSICAL UNITS) ---
-    fig, axs = plt.subplots(n_samples, 3, figsize=(12, 4 * n_samples))
-    if n_samples == 1:
-        axs = axs[None, :]
-
+    # --- DATA PREPARATION ---
     # Move to CPU
     X_cpu = X_sample.float().cpu().numpy()
     Y_cpu = Y_sample.float().cpu().numpy()
     Gen_cpu = x_generated.float().cpu().numpy()
 
-    # Denormalize Precip channels
-    # X_cpu is [N, 2, H, W] -> index 0 is Precip
+    # Denormalize Precip channels (Index 0)
     X_phys = denormalizer.unnormalize(X_cpu[:, 0])
     Y_phys = denormalizer.unnormalize(Y_cpu[:, 0])
     Gen_phys = denormalizer.unnormalize(Gen_cpu[:, 0])
 
+    # --- STYLE ADAPTATION ---
+
+    # 1. Define Colormap (Blues with Grey background for NaNs)
+    precip_cmap = copy.copy(plt.get_cmap("Blues"))
+    precip_cmap.set_bad(color="lightgrey", alpha=1.0)
+
+    # 2. Masking Helper
+    def mask_low_values(img, threshold=0.1):
+        """Masks values below threshold to NaN for plotting."""
+        masked = img.copy()
+        masked[masked <= threshold] = np.nan
+        return masked
+
+    # 3. Setup Figure
+    # Adjust figsize: Width 18 (3 cols * 6), Height 4 * n_samples
+    _, axs = plt.subplots(n_samples, 3, figsize=(18, 5 * n_samples), squeeze=False)
+
     for i in range(n_samples):
-        # Plotting Physical Values (mm/h)
-        # Use a fixed vmax for consistent visualization if desired, or auto-scale
-        vmax = max(np.max(Y_phys[i]), np.max(Gen_phys[i]), 1.0)
+        # Extract fields
+        img_in = X_phys[i]
+        img_target = Y_phys[i]
+        img_gen = Gen_phys[i]
 
-        im1 = axs[i, 0].imshow(X_phys[i], cmap="Blues", origin="lower", vmax=vmax)
-        axs[i, 0].set_title(f"LR Input (mm/h)\nMax: {np.max(X_phys[i]):.2f}")
+        # Determine Global Max for this sample (Shared Colorbar)
+        # We ensure min vmax is 1.0 to avoid errors on empty frames
+        local_max = np.nanmax(
+            [np.nanmax(img_in), np.nanmax(img_target), np.nanmax(img_gen)]
+        )
+        vmax = max(local_max, 1.0)
+        norm = mcolors.Normalize(vmin=0, vmax=vmax)
+
+        # Apply masking
+        img_in_masked = mask_low_values(img_in)
+        img_target_masked = mask_low_values(img_target)
+        img_gen_masked = mask_low_values(img_gen)
+
+        # Plot A: Input (LR)
+        im1 = axs[i, 0].imshow(
+            img_in_masked, cmap=precip_cmap, norm=norm, origin="lower"
+        )
+        axs[i, 0].set_title(f"Input (LR) | Max: {np.nanmax(img_in):.2f} mm/h")
         axs[i, 0].axis("off")
-        plt.colorbar(im1, ax=axs[i, 0], fraction=0.046, pad=0.04)
+        plt.colorbar(im1, ax=axs[i, 0], fraction=0.046, pad=0.04, label="mm/h")
 
-        im2 = axs[i, 1].imshow(Y_phys[i], cmap="Blues", origin="lower", vmax=vmax)
-        axs[i, 1].set_title(f"Ground Truth (mm/h)\nMax: {np.max(Y_phys[i]):.2f}")
+        # Plot B: Generated (SR)
+        im2 = axs[i, 1].imshow(
+            img_gen_masked, cmap=precip_cmap, norm=norm, origin="lower"
+        )
+        axs[i, 1].set_title(f"Generated (SR) | Max: {np.nanmax(img_gen):.2f} mm/h")
         axs[i, 1].axis("off")
-        plt.colorbar(im2, ax=axs[i, 1], fraction=0.046, pad=0.04)
+        plt.colorbar(im2, ax=axs[i, 1], fraction=0.046, pad=0.04, label="mm/h")
 
-        im3 = axs[i, 2].imshow(Gen_phys[i], cmap="Blues", origin="lower", vmax=vmax)
-        axs[i, 2].set_title(f"Generated (mm/h)\nMax: {np.max(Gen_phys[i]):.2f}")
+        # Plot C: Ground Truth (HR)
+        im3 = axs[i, 2].imshow(
+            img_target_masked, cmap=precip_cmap, norm=norm, origin="lower"
+        )
+        axs[i, 2].set_title(f"Target (HR) | Max: {np.nanmax(img_target):.2f} mm/h")
         axs[i, 2].axis("off")
-        plt.colorbar(im3, ax=axs[i, 2], fraction=0.046, pad=0.04)
+        plt.colorbar(im3, ax=axs[i, 2], fraction=0.046, pad=0.04, label="mm/h")
 
     plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, f"sample_epoch_{epoch:03d}.png"))
+
+    # Ensure directory exists before saving
+    os.makedirs(out_dir, exist_ok=True)
+    save_path = os.path.join(out_dir, f"sample_epoch_{epoch:03d}.png")
+    plt.savefig(save_path, bbox_inches="tight", dpi=100)
     plt.close()
 
 

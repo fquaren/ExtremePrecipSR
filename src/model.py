@@ -4,11 +4,7 @@ import torch.nn as nn
 
 class SoftmaxConstraintLayer(nn.Module):
     """
-    Implements the Softmax Constraint Layer (SmCL) from Harder et al. (2023).
-    Ref:
-
-    Enforces non-negativity and mass conservation between the input (LR) and output (HR).
-    y_j = exp(y_tilde_j) * (x / mean(exp(y_tilde_i)))
+    Numerically stable implementation of Softmax Constraint Layer (SmCL).
     """
 
     def __init__(self):
@@ -16,24 +12,27 @@ class SoftmaxConstraintLayer(nn.Module):
 
     def forward(self, logits, x_phys):
         """
-        logits: (B, 1, H, W) - Raw unnormalized output from the UNet.
-        x_phys: (B, 1, H, W) - Physical input (interpolated LR) serving as the mass constraint.
+        logits: (B, 1, H, W)
+        x_phys: (B, 1, H, W)
         """
-        # 1. Numerator: exp(y_tilde) -> Enforces Positivity
-        exp_y = torch.exp(logits)
+        # 1. Numerical Stability: Subtract max logit per sample/patch
+        # We detach the max to avoid affecting gradients of the shift itself,
+        # though mathematically it cancels out.
+        logit_max = torch.amax(logits, dim=(2, 3), keepdim=True).detach()
+        logits_shifted = logits - logit_max
 
-        # 2. Denominator: Mean of the predicted super-pixel (or global patch)
-        # We apply a Global Constraint per patch as per since exact
-        # grid alignment is unknown.
-        # mean over spatial dims (2, 3)
+        # 2. Numerator: exp(y_tilde - max)
+        exp_y = torch.exp(logits_shifted)
+
+        # 3. Denominator: Mean of the shifted exponential
         mean_exp_y = exp_y.mean(dim=(2, 3), keepdim=True)
 
-        # 3. Constraint Target: Mean of the physical input
-        # We assume the input interpolated image preserves the mass of the LR data.
+        # 4. Constraint Target
         mean_x = x_phys.mean(dim=(2, 3), keepdim=True)
 
-        # 4. Apply Constraint Eq (7)
-        # Epsilon added for numerical stability to prevent division by zero in dry patches
+        # 5. Apply Constraint
+        # The exp(max) factor mathematically cancels out in numerator/denominator ratio
+        # Ratio = (exp(l-m) * e^m) / (mean(exp(l-m)) * e^m) = exp(l-m)/mean(exp(l-m))
         out_phys = exp_y * (mean_x / (mean_exp_y + 1e-8))
 
         return out_phys
