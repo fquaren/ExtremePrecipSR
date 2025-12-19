@@ -14,7 +14,7 @@ import argparse
 import pandas as pd
 
 # Project imports
-from model import UNetSR
+from model import UNetSR_soft
 from dataset import SRDataset
 from loss import (
     estimate_s_inv_from_dataset,
@@ -193,7 +193,7 @@ def main():
 
     # --- 6. Models & Optimizer ---
     # Ensure the new class is used
-    sr_model = UNetSR(in_channels=2, out_channels=1).to(device)
+    sr_model = UNetSR_soft(in_channels=2, out_channels=1).to(device)
 
     optimizer = torch.optim.Adam(
         sr_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY

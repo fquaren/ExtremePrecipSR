@@ -50,26 +50,26 @@ SPLIT_RATIOS:
   test: 0.1
 
 # DataLoaders
-NUM_WORKERS: 24
+NUM_WORKERS: 8
 BATCH_SIZE: 128
 SAMPLE_WEIGHTS:
   "dry": 1.0
   "normal": 1.0
   "extreme": 1.0
 
-EXPERIMENT_NAME: "GammaEmulatorv3"
+EXPERIMENT_NAME: "UNet_SR_ExponentialWeighted_Loss"
 
 # Gamma emulator settings
 ARCHITECTURE: "Attention" 
 Q_EMBEDDING_DIM: 32
 CONSTRAINT_MODE: "hard"
 CONSTRAINT_WARMUP_EPOCHS: 10
-LOSS_LAMBDA: 0.25 
+LOSS_LAMBDA: 0.25
 
 # Weights loss
 WEIGHT_A: 1.0
 WEIGHT_P: 1.0
-WEIGHT_CC: 0.5
+WEIGHT_CC: 1.2
 
 LAMBDA_MONOTONICITY: 0.1
 LAMBDA_PLAUSIBILITY: 0.1
@@ -89,8 +89,8 @@ WEIGHT_DECAY: 0.00001
 QUANTILE_LEVELS: [0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]
 
 # Evaluation emulator (Using the best Hard+Attention model)
-EMULATOR_CHECKPOINT_PATH: /scratch/fquareng/experiment_runs/GammaEmulator_OfflineMixup_hard_Attention_2025-12-05_05-59-38/best_model_checkpoint.pth
-#"experiment_runs/GammaEmulator_OfflineMixup_hard_Attention_2025-12-05_05-59-38/best_model_checkpoint.pth" 
+EMULATOR_CHECKPOINT_PATH: "experiment_runs/GammaEmulator_OfflineMixup_hard_Attention_2025-12-05_05-59-38/best_model_checkpoint.pth" 
+#/scratch/fquareng/experiment_runs/GammaEmulator_OfflineMixup_hard_Attention_2025-12-05_05-59-38/best_model_checkpoint.pth 
 
 # Training super resolution
 METRIC_LOSS_MODE: 'train'

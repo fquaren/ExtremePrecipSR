@@ -43,7 +43,7 @@ LEARNING_RATE = config.get("SR_LEARNING_RATE", 1e-4)
 WEIGHT_DECAY = config.get("SR_WEIGHT_DECAY", 1e-5)
 NUM_EPOCHS = config.get("SR_NUM_EPOCHS", 50)
 NUM_WORKERS = config.get("NUM_WORKERS", 32)
-EXPERIMENT_NAME = config.get("EXPERIMENT_NAME", "SR_UNet_DualHead")
+EXPERIMENT_NAME = config.get("EXPERIMENT_NAME", "SR_UNet_SingleHead_SoftWeight")
 
 # Metric Loss Config
 METRIC_LOSS_MODE = config.get("METRIC_LOSS_MODE", "none")
@@ -54,18 +54,46 @@ METRIC_WARMUP_EPOCHS = config.get("METRIC_WARMUP_EPOCHS", 5)
 METRIC_RAMP_EPOCHS = config.get("METRIC_RAMP_EPOCHS", 15)
 TRUST_TAU = config.get("TRUST_TAU", 0.5)
 
-# Dual Head Config
-CLF_LOSS_WEIGHT = config.get("CLF_LOSS_WEIGHT", 1.0)  # Weight for Binary Classification
-
 # Physical Constants
 QUANTILE_LEVELS = config["QUANTILE_LEVELS"]
 PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 2.0)
 DRIZZLE_THRESHOLD = config.get("DRIZZLE_THRESHOLD", 0.1)  # mm/h
 
+# --- Zero Weighting Config (Method 3) ---
+# Alpha: Maximum extra weight at Y=0. (e.g. 5.0 means weight is 6.0 at zero)
+# Beta: Decay rate. (e.g. 10.0 means weight drops quickly as Y increases)
+ZERO_WEIGHT_ALPHA = config.get("ZERO_WEIGHT_ALPHA", 5.0)
+ZERO_WEIGHT_BETA = config.get("ZERO_WEIGHT_BETA", 10.0)
+
+
+# --- Custom Loss Class ---
+class SoftExponentialWeightedL1Loss(nn.Module):
+    def __init__(self, alpha, beta):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+
+    def forward(self, pred, target):
+        """
+        w(y) = 1 + alpha * exp(-beta * y)
+        Loss = w(target) * |pred - target|
+
+        Note: Target should be normalized [0,1] for beta to be stable.
+        """
+        l1_diff = torch.abs(pred - target)
+
+        # Calculate weights based on Ground Truth (Target)
+        # Detach to prevent gradients flowing into the weight calculation itself
+        with torch.no_grad():
+            weights = 1.0 + self.alpha * torch.exp(-self.beta * target)
+
+        weighted_loss = (l1_diff * weights).mean()
+        return weighted_loss
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train a Super-Resolution UNet model (Dual Head)."
+        description="Train a Super-Resolution UNet model (Single Head Regression)."
     )
     parser.add_argument(
         "--metric_loss_mode",
@@ -83,6 +111,9 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    print("Loss Configuration: Soft Exponential Weighting")
+    print(f"  Alpha (Max Boost): {ZERO_WEIGHT_ALPHA}")
+    print(f"  Beta (Decay Rate): {ZERO_WEIGHT_BETA}")
 
     # --- 1. Load Physical Scalar ---
     # We load the scaler that represents the Max Value in Log Space (~5.017)
@@ -122,7 +153,7 @@ def main():
     # --- 3. Initialize Datasets ---
     print("\n--- Initializing Datasets ---")
 
-    # TRAIN DATASET: Wet patches only (mostly)
+    # TRAIN DATASET
     train_dataset = SRDataset(
         PREPROCESSED_DATA_DIR,
         METADATA_TRAIN_METADATA_FILE,
@@ -131,7 +162,7 @@ def main():
         split="train",
     )
 
-    # VALIDATION DATASET: Full dataset (Wet + Dry)
+    # VALIDATION DATASET
     val_dataset = SRDataset(
         PREPROCESSED_DATA_DIR,
         METADATA_VAL_METADATA_FILE,
@@ -225,12 +256,10 @@ def main():
         optimizer, mode="min", factor=0.5, patience=5
     )
 
-    # Loss 1: Intensity (Regression)
-    pixel_criterion = nn.L1Loss()
-
-    # Loss 2: Rain/No-Rain (Classification)
-    # BCEWithLogitsLoss is numerically stable for logits
-    clf_criterion = nn.BCEWithLogitsLoss()
+    # --- Initialize Custom Loss ---
+    criterion_mae = SoftExponentialWeightedL1Loss(
+        alpha=ZERO_WEIGHT_ALPHA, beta=ZERO_WEIGHT_BETA
+    ).to(device)
 
     # --- 7. Metric/Emulator Setup ---
     emulator_model = None
@@ -261,8 +290,8 @@ def main():
     log_file_path = os.path.join(output_dir, "sr_training_log.csv")
     with open(log_file_path, "w") as log_file:
         log_file.write(
-            "epoch,train_loss_total,train_loss_mae,train_loss_clf,train_loss_metric,"
-            "val_loss_total,val_loss_mae,val_loss_clf,val_loss_metric,"
+            "epoch,train_loss_total,train_loss_mae,train_loss_metric,"
+            "val_loss_total,val_loss_mae,val_loss_metric,"
             "val_consistency_gap,val_intrinsic_error,"
             "epoch_duration_sec,current_metric_weight,avg_trust_weight\n"
         )
@@ -304,7 +333,7 @@ def main():
                 current_metric_weight = min(1.0, progress) * METRIC_LOSS_WEIGHT
 
         sr_model.train()
-        logs = {"loss": 0.0, "mae": 0.0, "clf": 0.0, "metric": 0.0, "trust": 0.0}
+        logs = {"loss": 0.0, "mae": 0.0, "metric": 0.0, "trust": 0.0}
 
         pbar = tqdm(
             train_loader, desc=f"Ep {epoch+1} | W_metric={current_metric_weight:.4f}"
@@ -314,22 +343,14 @@ def main():
             X, Y, Y_gamma_log = X.to(device), Y.to(device), Y_gamma_log.to(device)
             optimizer.zero_grad()
 
-            # --- Forward Pass (Dual Head) ---
-            pred_X, pred_logits = sr_model(X)
+            # --- Forward Pass (Single Head) ---
+            pred_X = sr_model(X)
 
-            # --- 1. Intensity Loss (MAE) ---
-            loss_mae = pixel_criterion(pred_X, Y)
+            # --- 1. Weighted Intensity Loss (MAE) ---
+            # Using custom loss which weights zero-pixels heavily
+            loss_mae = criterion_mae(pred_X, Y)
 
-            # --- 2. Classification Loss (BCE) ---
-            # Create binary targets: 1 if Precip > Threshold, 0 otherwise
-            # We must convert normalized Y to physical units to apply threshold correctly
-            with torch.no_grad():
-                Y_phys = torch.expm1(Y * PHYSICAL_MAX_VAL)
-                Y_binary = (Y_phys > DRIZZLE_THRESHOLD).float()
-
-            loss_clf = clf_criterion(pred_logits, Y_binary)
-
-            # --- 3. Metric Loss ---
+            # --- 2. Metric Loss ---
             metric_term = torch.tensor(0.0, device=device)
             raw_metric_mean = torch.tensor(0.0, device=device)
             avg_trust = 1.0
@@ -343,14 +364,17 @@ def main():
                 # Sparsity
                 pred_X_phys = pred_X_phys * (pred_X_phys > DRIZZLE_THRESHOLD).float()
 
+                # Physical Ground Truth
+                with torch.no_grad():
+                    Y_phys = torch.expm1(Y * PHYSICAL_MAX_VAL)
+                    Y_phys_clean = Y_phys * (Y_phys > DRIZZLE_THRESHOLD).float()
+
                 # Emulator Prediction
                 pred_gamma_phys = emulator_model(pred_X_phys)
                 pred_gamma_log = torch.log1p(pred_gamma_phys)
 
                 # Trust Gating
                 with torch.no_grad():
-                    # Y_phys already computed above
-                    Y_phys_clean = Y_phys * (Y_phys > DRIZZLE_THRESHOLD).float()
                     gamma_truth_phys = emulator_model(Y_phys_clean)
                     gamma_truth_log_pred = torch.log1p(gamma_truth_phys)
 
@@ -368,13 +392,11 @@ def main():
                 raw_metric_mean = loss_vec.mean()
                 metric_term = (loss_vec * trust_weights).mean()
 
-                total_loss = (
-                    loss_mae
-                    + (CLF_LOSS_WEIGHT * loss_clf)
-                    + (current_metric_weight * metric_loss_scaler * metric_term)
+                total_loss = loss_mae + (
+                    current_metric_weight * metric_loss_scaler * metric_term
                 )
             else:
-                total_loss = loss_mae + (CLF_LOSS_WEIGHT * loss_clf)
+                total_loss = loss_mae
 
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(sr_model.parameters(), max_norm=1.0)
@@ -382,20 +404,18 @@ def main():
 
             logs["loss"] += total_loss.item()
             logs["mae"] += loss_mae.item()
-            logs["clf"] += loss_clf.item()
             logs["metric"] += raw_metric_mean.item()
             logs["trust"] += avg_trust
 
             pbar.set_postfix(
                 L=f"{total_loss.item():.3f}",
                 MAE=f"{loss_mae.item():.3f}",
-                CLF=f"{loss_clf.item():.3f}",
             )
 
         n_train = len(train_loader)
         avg_train = {k: v / n_train for k, v in logs.items()}
         print(
-            f"Train Ep {epoch+1}: Loss={avg_train['loss']:.4f}, MAE={avg_train['mae']:.4f}, CLF={avg_train['clf']:.4f}, Trust={avg_train['trust']:.2f}"
+            f"Train Ep {epoch+1}: Loss={avg_train['loss']:.4f}, MAE={avg_train['mae']:.4f}, Trust={avg_train['trust']:.2f}"
         )
 
         # --- 10. Validation Loop ---
@@ -403,7 +423,6 @@ def main():
         val_logs = {
             "loss": 0.0,
             "mae": 0.0,
-            "clf": 0.0,
             "metric": 0.0,
             "gap": 0.0,
             "intr": 0.0,
@@ -413,15 +432,11 @@ def main():
             for X, Y, Y_gamma_log in tqdm(val_loader, desc="Validation"):
                 X, Y, Y_gamma_log = X.to(device), Y.to(device), Y_gamma_log.to(device)
 
-                # Unpack Dual Head
-                pred_X, pred_logits = sr_model(X)
+                # Single Head Output
+                pred_X = sr_model(X)
 
-                loss_mae = pixel_criterion(pred_X, Y)
-
-                # Compute Binary Target for Validation
-                Y_phys = torch.expm1(Y * PHYSICAL_MAX_VAL)
-                Y_binary = (Y_phys > DRIZZLE_THRESHOLD).float()
-                loss_clf = clf_criterion(pred_logits, Y_binary)
+                # Weighted MAE
+                loss_mae = criterion_mae(pred_X, Y)
 
                 loss_metric_val = torch.tensor(0.0, device=device)
                 gap = torch.tensor(0.0, device=device)
@@ -435,7 +450,10 @@ def main():
                     pred_X_phys = (
                         pred_X_phys * (pred_X_phys > DRIZZLE_THRESHOLD).float()
                     )
-                    Y_phys_clean = Y_phys * (Y_phys > DRIZZLE_THRESHOLD).float()
+
+                    with torch.no_grad():
+                        Y_phys = torch.expm1(Y * PHYSICAL_MAX_VAL)
+                        Y_phys_clean = Y_phys * (Y_phys > DRIZZLE_THRESHOLD).float()
 
                     if METRIC_LOSS_MODE == "train":
                         pred_gamma_phys = emulator_model(pred_X_phys)
@@ -455,11 +473,10 @@ def main():
                         )
                         gap = loss_perc_vec.mean()
 
-                val_total_loss = loss_mae + (CLF_LOSS_WEIGHT * loss_clf)
+                val_total_loss = loss_mae
 
                 val_logs["loss"] += val_total_loss.item()
                 val_logs["mae"] += loss_mae.item()
-                val_logs["clf"] += loss_clf.item()
                 val_logs["metric"] += loss_metric_val.item()
                 val_logs["gap"] += gap.item()
                 val_logs["intr"] += intr.item()
@@ -467,7 +484,7 @@ def main():
         n_val = len(val_loader)
         avg_val = {k: v / n_val for k, v in val_logs.items()}
         print(
-            f"Val Ep {epoch+1}: MAE={avg_val['mae']:.4f}, CLF={avg_val['clf']:.4f}, Metric={avg_val['metric']:.4f}, Gap={avg_val['gap']:.4f}"
+            f"Val Ep {epoch+1}: MAE={avg_val['mae']:.4f}, Metric={avg_val['metric']:.4f}, Gap={avg_val['gap']:.4f}"
         )
 
         # --- 11. Auto-Calibration ---
@@ -491,8 +508,6 @@ def main():
                 )
 
         # --- 12. Checkpointing ---
-        # We track MAE as the primary success metric for stopping,
-        # though you could use total_loss if classification is critical.
         current_val_score = avg_val["mae"]
         scheduler.step(current_val_score)
 
@@ -525,8 +540,8 @@ def main():
 
         with open(log_file_path, "a") as log:
             log.write(
-                f"{epoch+1},{avg_train['loss']:.6f},{avg_train['mae']:.6f},{avg_train['clf']:.6f},{avg_train['metric']:.6f},"
-                f"{avg_val['loss']:.6f},{avg_val['mae']:.6f},{avg_val['clf']:.6f},{avg_val['metric']:.6f},"
+                f"{epoch+1},{avg_train['loss']:.6f},{avg_train['mae']:.6f},{avg_train['metric']:.6f},"
+                f"{avg_val['loss']:.6f},{avg_val['mae']:.6f},{avg_val['metric']:.6f},"
                 f"{avg_val['gap']:.6f},{avg_val['intr']:.6f},"
                 f"{time.time()-start_time:.2f},{current_metric_weight:.4f},{avg_train['trust']:.4f}\n"
             )

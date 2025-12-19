@@ -20,7 +20,9 @@ import matplotlib.colors as mcolors
 from model_ddpm import ContextUnet
 from diffusion import Diffusion
 from dataset import SRDataset
-from loss import GeometricLossSeparate, estimate_s_inv_from_dataset
+
+# Note: We are defining the loss classes locally as requested,
+# so we do not import GeometricLossSeparate from loss.py to avoid conflicts.
 from utils import load_emulator
 
 # --- Config ---
@@ -40,13 +42,18 @@ EPOCHS = 100
 PATIENCE = 5
 NUM_WORKERS = 24
 EXPERIMENT_NAME = "DDPM_SR_Geometric"
+N_QUANTILES = len(config["QUANTILE_LEVELS"])
 
 # --- Geometric Loss Configuration ---
-GEOMETRIC_TARGET_WEIGHT = 1  # The final weight we want to reach
-GEOMETRIC_WARMUP_EPOCHS = 5  # Curriculum: Ramp up over 5 epochs
+GEOMETRIC_TARGET_WEIGHT = 1
+GEOMETRIC_WARMUP_EPOCHS = 5
 GEOMETRIC_T_THRESHOLD = 250
 TRUST_TAU = config.get("TRUST_TAU", 0.5)
 EMULATOR_PATH = config.get("EMULATOR_CHECKPOINT_PATH", "checkpoints/emulator_best.pth")
+
+# ------------------------------------------------------------------------------
+# 1. Helper Classes & Functions
+# ------------------------------------------------------------------------------
 
 
 class DataDenormalizer:
@@ -81,6 +88,9 @@ class DataDenormalizer:
             self.max_val, device=x_norm.device, dtype=x_norm.dtype
         )
         x_scaled = x_norm * max_val_tensor
+        # Clamp the exponent to avoid Inf in unnormalization
+        # If x_scaled > 88.0, exp(x) overflows float32. We clamp conservatively.
+        x_scaled = torch.clamp(x_scaled, max=50.0)
         x_phys = torch.expm1(x_scaled)
         return F.relu(x_phys)
 
@@ -158,7 +168,105 @@ def compute_physical_metrics(real_batch, gen_batch, drizzle_threshold=0.1):
     return {"wasserstein_dist": wd, "max_intensity_err": max_err}
 
 
-# --- NEW HELPER FUNCTION TO AVOID DUPLICATION ---
+# --- NEW Geometric Loss Implementation ---
+
+
+class GeometricLossSeparate(nn.Module):
+    def __init__(self, S_inv_tensors, reduction="mean"):
+        super(GeometricLossSeparate, self).__init__()
+        if not hasattr(S_inv_tensors, "__len__") or len(S_inv_tensors) != 3:
+            raise ValueError("S_inv_tensors must be a sequence of 3 tensors.")
+
+        # Register as buffers to keep them on the correct device
+        self.register_buffer("S_A_inv", S_inv_tensors[0])
+        self.register_buffer("S_P_inv", S_inv_tensors[1])
+        self.register_buffer("S_CC_inv", S_inv_tensors[2])
+        self.reduction = reduction
+
+    def forward(self, gamma_pred_3d, gamma_target_3d):
+        # CRITICAL FIX: Cast to float32 to prevent overflow in Mahalanobis calculation
+        gamma_pred_3d = gamma_pred_3d.float()
+        gamma_target_3d = gamma_target_3d.float()
+
+        pred_A = gamma_pred_3d[:, 0, :]
+        pred_P = gamma_pred_3d[:, 1, :]
+        pred_CC = gamma_pred_3d[:, 2, :]
+
+        target_A = gamma_target_3d[:, 0, :]
+        target_P = gamma_target_3d[:, 1, :]
+        target_CC = gamma_target_3d[:, 2, :]
+
+        diff_A = pred_A - target_A
+        diff_P = pred_P - target_P
+        diff_CC = pred_CC - target_CC
+
+        # (diff @ S_inv) * diff -> sum(dim=1)
+        # We assume S_inv is already float32 from the estimator
+        loss_A_sq = torch.sum((diff_A @ self.S_A_inv) * diff_A, dim=1)
+        loss_P_sq = torch.sum((diff_P @ self.S_P_inv) * diff_P, dim=1)
+        loss_CC_sq = torch.sum((diff_CC @ self.S_CC_inv) * diff_CC, dim=1)
+
+        # Numerical stability: Ensure non-negative before sqrt
+        loss_A = torch.sqrt(F.relu(loss_A_sq) + 1e-8)
+        loss_P = torch.sqrt(F.relu(loss_P_sq) + 1e-8)
+        loss_CC = torch.sqrt(F.relu(loss_CC_sq) + 1e-8)
+
+        per_sample_loss = loss_A + loss_P + loss_CC
+
+        if self.reduction == "mean":
+            return torch.mean(per_sample_loss)
+        elif self.reduction == "none":
+            return per_sample_loss
+        return per_sample_loss
+
+
+def estimate_s_inv_from_dataset(dataset, num_samples, device):
+    """
+    Estimates the inverse covariance matrix.
+    SCIENTIFIC NOTE: We enforce log-transform here because the loss function
+    operates in log-space. Computing covariance on physical values and
+    applying it to log-differences is mathematically incorrect.
+    """
+    print(f"Estimating S_inv from {num_samples} training samples (Log Space)...")
+    indices = torch.randperm(len(dataset))[:num_samples].tolist()
+    all_gamma_A, all_gamma_P, all_gamma_CC = [], [], []
+
+    for idx in tqdm(indices, desc="Collecting gamma targets"):
+        out_dataset = dataset[idx]
+        # Assuming dataset returns physical values (check your dataset implementation!)
+        # If your dataset ALREADY returns logs, remove the np.log1p below.
+        # Based on typical flows, we assume dataset = physical, model = logs.
+        Y_gamma = out_dataset[-1].numpy()
+
+        # Apply log1p to match the training loss domain
+        Y_gamma_log = np.log1p(Y_gamma)
+
+        all_gamma_A.append(Y_gamma_log[0, :])
+        all_gamma_P.append(Y_gamma_log[1, :])
+        all_gamma_CC.append(Y_gamma_log[2, :])
+
+    all_gamma_A_np = np.array(all_gamma_A)
+    all_gamma_P_np = np.array(all_gamma_P)
+    all_gamma_CC_np = np.array(all_gamma_CC)
+
+    # Added stronger regularization for stability
+    reg = 1e-5
+    S_A = np.cov(all_gamma_A_np, rowvar=False) + np.eye(N_QUANTILES) * reg
+    S_P = np.cov(all_gamma_P_np, rowvar=False) + np.eye(N_QUANTILES) * reg
+    S_CC = np.cov(all_gamma_CC_np, rowvar=False) + np.eye(N_QUANTILES) * reg
+
+    S_A_inv = np.linalg.inv(S_A)
+    S_P_inv = np.linalg.inv(S_P)
+    S_CC_inv = np.linalg.inv(S_CC)
+
+    print("S_inv estimation complete.")
+    return (
+        torch.from_numpy(S_A_inv).float().to(device),
+        torch.from_numpy(S_P_inv).float().to(device),
+        torch.from_numpy(S_CC_inv).float().to(device),
+    )
+
+
 def compute_geometric_loss_component(
     diffusion,
     emulator,
@@ -168,53 +276,58 @@ def compute_geometric_loss_component(
     predicted_noise,
     t,
     Y,
-    Y_gamma,
+    Y_gamma,  # Assumed to be log-space target if consistent with criterion
     compute_trust=True,
 ):
     """
-    Computes the geometric loss component.
-    Used in both Training (with gradients) and Validation (no_grad).
+    Computes the geometric loss component with strict type casting.
     """
     loss_geom = torch.tensor(0.0, device=x_t.device)
     avg_trust_val = 1.0
 
-    # 1. Reconstruct x0 (Approximation)
+    # 1. Reconstruct x0
     alpha_hat_t = diffusion.alpha_hat[t][:, None, None, None]
     sqrt_alpha_hat = torch.sqrt(alpha_hat_t)
     sqrt_one_minus = torch.sqrt(1 - alpha_hat_t)
 
+    # Predicted x0 (Normalized space)
     pred_x0 = (x_t - sqrt_one_minus * predicted_noise) / (sqrt_alpha_hat + 1e-8)
 
-    # 2. Masking (Apply only for t < Threshold)
+    # CRITICAL FIX: Clamp x0 to prevent exp() explosion in denormalizer
+    pred_x0 = torch.clamp(pred_x0, min=-5.0, max=5.0)
+
+    # 2. Masking
     mask_time = (t < GEOMETRIC_T_THRESHOLD).float()
 
     if mask_time.sum() > 0:
         trust_weights = torch.ones(x_t.shape[0], device=x_t.device)
 
-        # 3. Trust Mechanism (If enabled)
         if compute_trust:
-            # Note: We use torch.no_grad() for the 'trust' estimation part usually,
-            # even during training, as we don't want to optimize the emulator here.
             with torch.no_grad():
                 Y_phys = denormalizer.unnormalize_torch(Y)
                 Y_phys = Y_phys * (Y_phys > 0.1).float()
                 gamma_truth_phys = emulator(Y_phys)
                 gamma_truth_log_pred = torch.log1p(gamma_truth_phys)
 
-                diff_trust = gamma_truth_log_pred - Y_gamma
+                # Ensure float32 for metric calculation
+                diff_trust = (gamma_truth_log_pred - Y_gamma).float()
                 emu_error_sq = diff_trust.pow(2).mean(dim=1)
                 trust_weights = torch.exp(-float(TRUST_TAU) * emu_error_sq)
                 avg_trust_val = trust_weights.mean().item()
 
-        # 4. Forward pass through Emulator for Gradient Flow
+        # 4. Gradient Flow
         pred_x0_phys = denormalizer.unnormalize_torch(pred_x0)
-        pred_x0_phys = pred_x0_phys * (pred_x0_phys > 0.1).float()  # Drizzle threshold
+        pred_x0_phys = pred_x0_phys * (pred_x0_phys > 0.1).float()
+
         pred_gamma_phys = emulator(pred_x0_phys)
         pred_gamma_log = torch.log1p(pred_gamma_phys)
 
-        raw_geom_loss = criterion(pred_gamma_log, Y_gamma)
+        # Force float32 for Geometric Loss
+        raw_geom_loss = criterion(pred_gamma_log.float(), Y_gamma.float())
 
-        weight_factor = (trust_weights * mask_time).view(-1, 1)
+        weight_factor = (trust_weights * mask_time).view(
+            -1
+        )  # shape fix if reduction=none returns 1D
         weighted_loss = raw_geom_loss * weight_factor
         loss_geom = weighted_loss.sum() / (mask_time.sum() + 1e-8)
 
@@ -360,6 +473,7 @@ def main():
     S_inv_tensors = estimate_s_inv_from_dataset(
         train_dataset, num_samples=2000, device=device
     )
+    # Important: Set reduction='none' because we apply masking per-sample later
     geometric_criterion = GeometricLossSeparate(S_inv_tensors, reduction="none").to(
         device
     )
@@ -383,15 +497,15 @@ def main():
         "train_loss": [],
         "val_loss": [],
         "train_geom": [],
-        "val_geom": [],  # Added val_geom to history
+        "val_geom": [],
         "avg_trust": [],
-        "geom_weight": [],  # Added geom_weight to history
+        "geom_weight": [],
     }
     start_epoch = 0
 
     # State flags for Curriculum Learning
     geometric_phase = False
-    geometric_start_epoch = None  # The epoch index when the phase switched
+    geometric_start_epoch = None
 
     # --- RESUME LOGIC ---
     if args.resume:
@@ -435,9 +549,7 @@ def main():
         # --- CALCULATE CURRENT CURRICULUM WEIGHT ---
         current_geom_weight = 0.0
         if geometric_phase and geometric_start_epoch is not None:
-            # Linear Warmup: Ramp from 0 to TARGET_WEIGHT over WARMUP_EPOCHS
             epochs_active = epoch - geometric_start_epoch
-            # Clamp between 0 and 1
             progress = min(
                 1.0, max(0.0, epochs_active / float(GEOMETRIC_WARMUP_EPOCHS))
             )
@@ -457,6 +569,9 @@ def main():
         for X, Y, Y_gamma in pbar:
             X = X.to(device, non_blocking=True)
             Y = Y.to(device, non_blocking=True)
+            # Ensure target gamma is physically consistent with loss (log space)
+            # Assuming Y_gamma from loader is log-transformed.
+            # If not, verify this matches estimate_s_inv logic.
             Y_gamma = Y_gamma.to(device, non_blocking=True)
 
             t = diffusion.sample_timesteps(X.shape[0])
@@ -467,11 +582,11 @@ def main():
                 predicted_noise = model(x_t, t, X)
                 loss_mse = mse(noise, predicted_noise)
 
-                # Compute Geometric Component (always 0.0 if weight is 0.0, but we skip computation if weight is 0)
                 loss_geom = torch.tensor(0.0, device=device)
                 avg_trust_val = 1.0
 
                 if current_geom_weight > 0.0:
+                    # We compute the loss. Inside the helper, it forces float32
                     loss_geom, avg_trust_val = compute_geometric_loss_component(
                         diffusion,
                         emulator,
@@ -485,7 +600,6 @@ def main():
                         compute_trust=True,
                     )
 
-                # Apply Dynamic Weight
                 total_loss = loss_mse + (current_geom_weight * loss_geom)
 
             scaler.scale(total_loss).backward()
@@ -504,13 +618,12 @@ def main():
         avg_loss = running_loss / len(train_loader)
         avg_geom = running_geom / len(train_loader)
 
-        # --- VALIDATION LOOP (Modified to include Geometric Loss) ---
+        # --- VALIDATION LOOP ---
         model.eval()
         val_mse_loss = 0.0
         val_geom_loss = 0.0
 
         with torch.no_grad():
-            # Note: We now unpack Y_gamma in validation too!
             for X, Y, Y_gamma in val_loader:
                 X = X.to(device, non_blocking=True)
                 Y = Y.to(device, non_blocking=True)
@@ -523,7 +636,6 @@ def main():
                     predicted_noise = model(x_t, t, X)
                     loss_m = mse(noise, predicted_noise)
 
-                    # ALWAYS compute geometric loss in validation for monitoring
                     loss_g, _ = compute_geometric_loss_component(
                         diffusion,
                         emulator,
@@ -546,14 +658,13 @@ def main():
             f"Epoch {epoch+1} Val MSE: {avg_val_mse:.6f} | Val Geom: {avg_val_geom:.6f}"
         )
 
-        # Update History
         history["epoch"].append(epoch + 1)
         history["train_loss"].append(avg_loss)
         history["val_loss"].append(avg_val_mse)
         history["train_geom"].append(avg_geom)
-        history["val_geom"].append(avg_val_geom)  # Log validation geometric loss
-        history["avg_trust_val"].append(avg_trust_val)
-        history["geom_weight"].append(current_geom_weight)  # Log the curriculum weight
+        history["val_geom"].append(avg_val_geom)
+        history["avg_trust"].append(avg_trust_val)
+        history["geom_weight"].append(current_geom_weight)
 
         pd.DataFrame(history).to_csv(
             os.path.join(out_dir, "loss_history.csv"), index=False
@@ -574,11 +685,10 @@ def main():
             "history": history,
             "best_val_loss": early_stopper.val_loss_min,
             "geometric_phase": geometric_phase,
-            "geometric_start_epoch": geometric_start_epoch,  # Save curriculum state
+            "geometric_start_epoch": geometric_start_epoch,
         }
         torch.save(checkpoint_latest, os.path.join(out_dir, "ddpm_latest.pth"))
 
-        # Save best based on MSE (primary metric)
         if epoch > 0 and avg_val_mse < min(history["val_loss"][:-1]):
             torch.save(checkpoint_latest, os.path.join(out_dir, "ddpm_best.pth"))
 
@@ -594,7 +704,6 @@ def main():
                     if i >= NUM_PHYS_BATCHES:
                         break
                     X_val, Y_val = X_val.to(device), Y_val.to(device)
-                    # ... [Same physical validation logic as before] ...
                     input_precip = X_val[:, 0, :, :]
                     is_wet = input_precip.amax(dim=(1, 2)) > 1e-6
                     wet_indices = torch.where(is_wet)[0]
@@ -614,7 +723,6 @@ def main():
                 mean_wd = np.mean(val_metrics["wd"])
                 print(f"  > Wasserstein Dist: {mean_wd:.4f}")
 
-                # Check Early Stopping
                 should_trigger = early_stopper(mean_wd)
 
                 if should_trigger:
@@ -626,7 +734,7 @@ def main():
                             f"!!! Ramping up Geometric Loss over next {GEOMETRIC_WARMUP_EPOCHS} epochs !!!"
                         )
                         geometric_phase = True
-                        geometric_start_epoch = epoch + 1  # Start curriculum next epoch
+                        geometric_start_epoch = epoch + 1
                         early_stopper.reset()
                     else:
                         print(
