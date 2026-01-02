@@ -4,8 +4,6 @@ import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as T
 
-# TODO: Consistency between outputs of SRDataset and PreprocessedNpzDataset
-
 
 class SRDataset(Dataset):
     """
@@ -19,6 +17,7 @@ class SRDataset(Dataset):
         dem_patches_dir,
         dem_stats,
         split="train",
+        subset_fraction=1.0,
     ):
         self.preprocessed_data_dir = preprocessed_data_dir
         self.dem_patches_dir = dem_patches_dir
@@ -68,11 +67,9 @@ class SRDataset(Dataset):
 
             # Keep ALL wet patches
             # Keep randomly selected dry patches (e.g., 20% ratio)
-            # You can tune this ratio. Too high -> model gets lazy. Too low -> model hallucinates.
             n_dry_to_keep = int(len(wet_indices) * 0.2)
 
             if len(dry_indices) > n_dry_to_keep:
-                # Use a fixed seed for reproducibility if desired, or random
                 keep_dry = np.random.choice(
                     dry_indices, size=n_dry_to_keep, replace=False
                 )
@@ -80,13 +77,37 @@ class SRDataset(Dataset):
                 keep_dry = dry_indices
 
             self.valid_indices = np.concatenate([wet_indices, keep_dry])
-            np.random.shuffle(self.valid_indices)  # Shuffle so batches are mixed
-
-            print(f"Dataset Balanced: {len(wet_indices)} Wet, {len(keep_dry)} Dry.")
+            np.random.shuffle(self.valid_indices)
+            print(
+                f"Dataset Balanced (Pre-subset): {len(wet_indices)} Wet, {len(keep_dry)} Dry."
+            )
 
         else:
             # For validation/test, we MUST keep everything to evaluate performance honestly.
             self.valid_indices = np.arange(len(self.original_patches))
+
+        # --- SUBSET LOGIC ---
+        # We apply this AFTER the wet/dry balance logic to ensure we are subsetting
+        # the distribution intended for training.
+        if 0.0 < subset_fraction < 1.0:
+            total_samples = len(self.valid_indices)
+            subset_size = int(total_samples * subset_fraction)
+            if subset_size < 1:
+                subset_size = 1  # Ensure at least one sample
+
+            print(
+                f"Subsetting {split} dataset to {subset_fraction*100:.1f}% ({subset_size}/{total_samples} samples)."
+            )
+
+            # Use a fixed seed for subsetting to ensure runs are comparable
+            rng = np.random.default_rng(seed=42)
+            self.valid_indices = rng.choice(
+                self.valid_indices, size=subset_size, replace=False
+            )
+        elif subset_fraction <= 0.0 or subset_fraction > 1.0:
+            raise ValueError(
+                f"subset_fraction must be in (0, 1]. Received {subset_fraction}"
+            )
 
         self.geom_transform = T.Compose(
             [
@@ -104,7 +125,6 @@ class SRDataset(Dataset):
         real_idx = self.valid_indices[idx]
 
         # 1. Fetch Tensors
-        # .copy() is used here to ensure mmap data is loaded into memory
         target_img = self.original_patches[real_idx].copy()
         interp_img = self.interpolated_patches[real_idx].copy()
 
@@ -148,8 +168,9 @@ class PrecomputedMixupDataset(Dataset):
         preprocessed_data_dir,
         metadata_file,
         augment=True,
-        include_original=True,  # Set True to train on Real + MixUp
-        include_mixup=True,  # Set True to train on Real + MixUp
+        include_original=True,
+        include_mixup=True,
+        subset_fraction=1.0,
     ):
         # Metadata loading (assumes metadata aligns with 'physical_precip.npz')
         with open(metadata_file, "r") as f:
@@ -205,6 +226,27 @@ class PrecomputedMixupDataset(Dataset):
         self.cumulative_sizes = np.cumsum([len(d) for d in self.data_sources])
         self.total_len = self.cumulative_sizes[-1]
 
+        # --- SUBSET LOGIC ---
+        # For Mixup dataset, since we don't have an explicit 'valid_indices' list
+        # mapping to files, we create a virtual index mapper.
+        self.indices_map = np.arange(self.total_len)
+
+        if 0.0 < subset_fraction < 1.0:
+            subset_size = int(self.total_len * subset_fraction)
+            if subset_size < 1:
+                subset_size = 1
+            print(
+                f"Subsetting MixupDataset to {subset_fraction*100:.1f}% ({subset_size}/{self.total_len})."
+            )
+            rng = np.random.default_rng(seed=42)
+            self.indices_map = rng.choice(
+                self.indices_map, size=subset_size, replace=False
+            )
+        elif subset_fraction <= 0.0 or subset_fraction > 1.0:
+            raise ValueError(
+                f"subset_fraction must be in (0, 1]. Received {subset_fraction}"
+            )
+
         self.augment = augment
         if self.augment:
             self.transform = T.Compose(
@@ -217,18 +259,21 @@ class PrecomputedMixupDataset(Dataset):
                 ]
             )
 
-        print(f"Total Dataset Size: {self.total_len} samples.")
+        print(f"Total Dataset Size: {len(self.indices_map)} samples.")
 
     def __len__(self):
-        return self.total_len
+        return len(self.indices_map)
 
     def __getitem__(self, idx):
+        # Map the virtual subset index to the real dataset index
+        real_idx = self.indices_map[idx]
+
         # Resolve Index to Source
-        source_idx = np.searchsorted(self.cumulative_sizes, idx, side="right")
+        source_idx = np.searchsorted(self.cumulative_sizes, real_idx, side="right")
         if source_idx == 0:
-            local_idx = idx
+            local_idx = real_idx
         else:
-            local_idx = idx - self.cumulative_sizes[source_idx - 1]
+            local_idx = real_idx - self.cumulative_sizes[source_idx - 1]
 
         patch = self.data_sources[source_idx][local_idx]
         target_phys = self.target_sources[source_idx][local_idx]

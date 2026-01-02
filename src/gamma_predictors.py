@@ -39,6 +39,397 @@ class InputNormalization(nn.Module):
         return x / (self.scale_factor + 1e-8)
 
 
+# ==========================================
+# New Helper Layers for Differentiability
+# ==========================================
+
+
+class BlurPool2d(nn.Module):
+    """
+    Improvement #3: Anti-Aliased Downsampling.
+    Replaces standard pooling with a low-pass filter (blur) followed by stride-2 subsampling.
+    This ensures shift-invariance, making the loss landscape smoother.
+    """
+
+    def __init__(self, channels, pad_type="reflect", filt_size=3, stride=2, off=0):
+        super(BlurPool2d, self).__init__()
+        self.filt_size = filt_size
+        self.pad_off = off
+        self.pad_sizes = [
+            int(1.0 * (filt_size - 1) / 2),
+            int(np.ceil(1.0 * (filt_size - 1) / 2)),
+            int(1.0 * (filt_size - 1) / 2),
+            int(np.ceil(1.0 * (filt_size - 1) / 2)),
+        ]
+        self.pad_sizes = [pad_size + off for pad_size in self.pad_sizes]
+        self.stride = stride
+        self.off = off
+        self.channels = channels
+
+        # Standard Gaussian-like kernel [1, 2, 1]
+        if self.filt_size == 3:
+            a = np.array([1.0, 2.0, 1.0])
+
+        # Create the 2D kernel
+        filt = torch.Tensor(a[:, None] * a[None, :])
+        filt = filt / torch.sum(filt)
+        # Reshape for depthwise convolution [Channels, 1, H, W]
+        self.register_buffer(
+            "filt", filt[None, None, :, :].repeat((self.channels, 1, 1, 1))
+        )
+
+        self.pad = get_pad_layer(pad_type)(self.pad_sizes)
+
+    def forward(self, inp):
+        if self.filt_size == 1:
+            if self.pad_off == 0:
+                return inp[:, :, :: self.stride, :: self.stride]
+            else:
+                return self.pad(inp)[:, :, :: self.stride, :: self.stride]
+        else:
+            # Use depthwise convolution for blurring
+            return F.conv2d(
+                self.pad(inp), self.filt, stride=self.stride, groups=inp.shape[1]
+            )
+
+
+def get_pad_layer(pad_type):
+    if pad_type in ["reflect", "refl"]:
+        return nn.ReflectionPad2d
+    elif pad_type in ["replicate", "repl"]:
+        return nn.ReplicationPad2d
+    elif pad_type == "zero":
+        return nn.ZeroPad2d
+    else:
+        raise ValueError("Pad type [%s] not recognized" % pad_type)
+
+
+class SpatialAttention(nn.Module):
+    """
+    Improvement #2: Spatial Attention Module.
+    Learns a 2D mask to highlight important spatial regions (e.g., edges)
+    before pooling. This localizes gradients for the SR model.
+    Based on CBAM (Convolutional Block Attention Module) spatial component.
+    """
+
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        assert kernel_size in (3, 7), "kernel size must be 3 or 7"
+        padding = 3 if kernel_size == 7 else 1
+        # Compress channels to 2 (avg and max pool across channels) -> Conv -> Sigmoid
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # Max pool along channel axis [B, 1, H, W]
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        # Avg pool along channel axis [B, 1, H, W]
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        # Concatenate [B, 2, H, W]
+        x_cat = torch.cat([avg_out, max_out], dim=1)
+        # Generate attention map [B, 1, H, W]
+        scale_map = self.sigmoid(self.conv1(x_cat))
+        # Reweight input features
+        return x * scale_map
+
+
+# ==========================================
+# Updated Main Emulator Classes (V2)
+# ==========================================
+
+
+class GammaPredictorHierarchicalHardGated_V2(nn.Module):
+    """
+    Updated 'Hard' Emulator with:
+    1. Multi-Scale Feature Aggregation
+    2. Spatial Attention
+    3. Anti-Aliased BlurPool
+    Using the Differentiable Soft-Step Area Calculation.
+    """
+
+    def __init__(
+        self,
+        input_shape,
+        n_quantiles,
+        activation_fn=F.gelu,
+        quantile_levels=[0.0],
+        pixel_area_km2=4.0,
+        max_precip_value=150.0,
+        q_embedding_dim=32,
+    ):
+        super().__init__()
+        self.n_quantiles = n_quantiles
+        self.activation = activation_fn
+        self.register_buffer(
+            "quantile_levels_tensor", torch.tensor(quantile_levels, dtype=torch.float32)
+        )
+        self.pixel_area_km2 = pixel_area_km2
+        self.q_emb = q_embedding_dim
+
+        # --- 1. Internal Normalizer ---
+        self.normalizer = InputNormalization(max_precip_value)
+
+        # --- 2. Improved CNN Trunk (MSFA + SA + BlurPool) ---
+        # Block 1
+        self.conv1 = nn.Conv2d(1, 16, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.sa1 = SpatialAttention()
+        self.pool1 = BlurPool2d(16)  # Replaces AvgPool
+
+        # Block 2
+        self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(32)
+        self.sa2 = SpatialAttention()
+        self.pool2 = BlurPool2d(32)
+
+        # Block 3
+        self.conv3 = nn.Conv2d(32, 64, 3, padding=1)
+        self.bn3 = nn.BatchNorm2d(64)
+        self.sa3 = SpatialAttention()
+        self.pool3 = BlurPool2d(64)
+
+        # Global pooling for feature aggregation
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        # Input size to FC is sum of channels from all scales due to MSFA
+        self.fc_input_size = 16 + 32 + 64
+
+        # --- 3. Shared Latent ---
+        self.shared_fc = nn.Linear(self.fc_input_size, 256)
+        self.dropout = nn.Dropout(0.3)
+
+        # --- 4. Convolutional Heads (IQ-CGN) - Unchanged ---
+        total_latent_size = self.n_quantiles * self.q_emb
+        self.expand_A = nn.Linear(256, total_latent_size)
+        self.expand_P = nn.Linear(256, total_latent_size)
+        self.expand_CC = nn.Linear(256, total_latent_size)
+        self.mix_A = nn.Conv1d(self.q_emb, self.q_emb, kernel_size=3, padding=1)
+        self.mix_P = nn.Conv1d(self.q_emb, self.q_emb, kernel_size=3, padding=1)
+        self.mix_CC = nn.Conv1d(self.q_emb, self.q_emb, kernel_size=3, padding=1)
+        self.head_A = nn.Conv1d(self.q_emb, 1, kernel_size=1)
+        self.head_P = nn.Conv1d(self.q_emb, 1, kernel_size=1)
+        self.head_CC = nn.Conv1d(self.q_emb, 1, kernel_size=1)
+        self.gate_A_to_P = nn.Conv1d(self.q_emb, self.q_emb, kernel_size=1)
+        self.gate_AP_to_CC = nn.Conv1d(self.q_emb * 2, self.q_emb, kernel_size=1)
+
+    def forward(self, x_phys):
+        epsilon = 1e-6
+        batch_size = x_phys.size(0)
+        x_norm = self.normalizer(x_phys)
+
+        # --- A. Improved Backbone Forward Pass ---
+        # Block 1
+        x1 = self.activation(self.bn1(self.conv1(x_norm)))
+        x1 = self.sa1(x1)  # Apply Spatial Attention
+        f1 = self.pool1(x1)  # Apply BlurPool
+
+        # Block 2
+        x2 = self.activation(self.bn2(self.conv2(f1)))
+        x2 = self.sa2(x2)
+        f2 = self.pool2(x2)
+
+        # Block 3
+        x3 = self.activation(self.bn3(self.conv3(f2)))
+        x3 = self.sa3(x3)
+        f3 = self.pool3(x3)
+
+        # Multi-Scale Feature Aggregation (MSFA)
+        # Global average pool each scale and concatenate
+        g1 = self.global_pool(f1).view(batch_size, -1)
+        g2 = self.global_pool(f2).view(batch_size, -1)
+        g3 = self.global_pool(f3).view(batch_size, -1)
+        x_flat = torch.cat([g1, g2, g3], dim=1)
+
+        shared = self.activation(self.shared_fc(x_flat))
+        shared = self.dropout(shared)
+
+        # --- B. Gated Convolutional Heads (Unchanged) ---
+        def to_sequence(tensor):
+            return tensor.view(batch_size, self.n_quantiles, self.q_emb).permute(
+                0, 2, 1
+            )
+
+        # Path A
+        feat_A_mixed = self.activation(self.mix_A(to_sequence(self.expand_A(shared))))
+        raw_A_logits = self.head_A(self.dropout(feat_A_mixed)).squeeze(1)
+
+        # Path P
+        feat_P_mixed = self.activation(self.mix_P(to_sequence(self.expand_P(shared))))
+        gate_A = torch.sigmoid(self.gate_A_to_P(feat_A_mixed))
+        feat_P_gated = feat_P_mixed * gate_A
+        raw_P_logits = self.head_P(self.dropout(feat_P_gated)).squeeze(1)
+
+        # Path CC
+        feat_CC_mixed = self.activation(
+            self.mix_CC(to_sequence(self.expand_CC(shared)))
+        )
+        feat_combined = torch.cat([feat_A_mixed, feat_P_gated], dim=1)
+        gate_AP = torch.sigmoid(self.gate_AP_to_CC(feat_combined))
+        feat_CC_gated = feat_CC_mixed * gate_AP
+        raw_CC_logits = self.head_CC(self.dropout(feat_CC_gated)).squeeze(1)
+
+        # --- C. Differentiable Hard Constraints ---
+        # 1. Soft Area Calculation (Differentiable Highway)
+        temperature = 0.01
+        threshold = self.quantile_levels_tensor[0]
+        soft_mask = torch.sigmoid((x_phys - threshold) / temperature)
+        A_total_soft = soft_mask.sum(dim=(2, 3)).float() * self.pixel_area_km2 + epsilon
+
+        # 2. Area Distribution & Cumsum
+        probs_A = torch.softmax(raw_A_logits, dim=1)
+        scaled_probs_A = probs_A * A_total_soft
+        pred_A = torch.flip(
+            torch.cumsum(torch.flip(scaled_probs_A, dims=[1]), dim=1), dims=[1]
+        )
+
+        # 3. Perimeter & CC
+        P_min = torch.sqrt(4 * math.pi * (pred_A + epsilon))
+        R_P = 1.0 + F.softplus(raw_P_logits)
+        pred_P = P_min * R_P
+        pred_CC_continuous = F.softplus(raw_CC_logits)
+        pred_CC = (
+            pred_CC_continuous if self.training else torch.round(pred_CC_continuous)
+        )
+
+        constrained_output = torch.stack([pred_A, pred_P, pred_CC], dim=1)
+
+        # 4. Soft Differentiable Wet Factor
+        total_precip_sum = x_phys.sum(dim=(1, 2, 3))
+        wet_factor_soft = torch.sigmoid((total_precip_sum - (2 * epsilon)) * 100).view(
+            -1, 1, 1
+        )
+
+        return constrained_output * wet_factor_soft
+
+
+class GammaPredictorHierarchicalSoftGated_V2(nn.Module):
+    """
+    Updated 'Soft' Emulator with:
+    1. Multi-Scale Feature Aggregation
+    2. Spatial Attention
+    3. Anti-Aliased BlurPool
+    Outputs raw regressions, relies on Loss penalties for physics.
+    """
+
+    def __init__(
+        self,
+        input_shape=(1, 128, 128),
+        n_quantiles=9,
+        activation_fn=F.gelu,
+        max_precip_value=150.0,
+        q_embedding_dim=32,
+    ):
+        super().__init__()
+        self.n_quantiles = n_quantiles
+        self.activation = activation_fn
+        self.q_emb = q_embedding_dim
+
+        self.normalizer = InputNormalization(max_precip_value)
+
+        # --- Improved CNN Trunk (Identical to Hard V2) ---
+        # Block 1
+        self.conv1 = nn.Conv2d(1, 16, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.sa1 = SpatialAttention()
+        self.pool1 = BlurPool2d(16)
+        # Block 2
+        self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(32)
+        self.sa2 = SpatialAttention()
+        self.pool2 = BlurPool2d(32)
+        # Block 3
+        self.conv3 = nn.Conv2d(32, 64, 3, padding=1)
+        self.bn3 = nn.BatchNorm2d(64)
+        self.sa3 = SpatialAttention()
+        self.pool3 = BlurPool2d(64)
+
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc_input_size = 16 + 32 + 64  # MSFA sum
+
+        # Shared Latent
+        self.shared_fc = nn.Linear(self.fc_input_size, 256)
+        self.dropout = nn.Dropout(0.5)
+
+        # --- Convolutional Heads (Unchanged) ---
+        total_latent_size = self.n_quantiles * self.q_emb
+        self.expand_A = nn.Linear(256, total_latent_size)
+        self.expand_P = nn.Linear(256, total_latent_size)
+        self.expand_CC = nn.Linear(256, total_latent_size)
+        self.mix_A = nn.Conv1d(self.q_emb, self.q_emb, kernel_size=3, padding=1)
+        self.mix_P = nn.Conv1d(self.q_emb, self.q_emb, kernel_size=3, padding=1)
+        self.mix_CC = nn.Conv1d(self.q_emb, self.q_emb, kernel_size=3, padding=1)
+        self.head_A = nn.Conv1d(self.q_emb, 1, kernel_size=1)
+        self.head_P = nn.Conv1d(self.q_emb, 1, kernel_size=1)
+        self.head_CC = nn.Conv1d(self.q_emb, 1, kernel_size=1)
+        self.gate_A_to_P = nn.Conv1d(self.q_emb, self.q_emb, kernel_size=1)
+        self.gate_AP_to_CC = nn.Conv1d(self.q_emb * 2, self.q_emb, kernel_size=1)
+
+    def forward(self, x_phys):
+        batch_size = x_phys.size(0)
+        x_norm = self.normalizer(x_phys)
+
+        # --- A. Improved Backbone Forward Pass (Identical to Hard V2) ---
+        x1 = self.activation(self.bn1(self.conv1(x_norm)))
+        x1 = self.sa1(x1)
+        f1 = self.pool1(x1)
+
+        x2 = self.activation(self.bn2(self.conv2(f1)))
+        x2 = self.sa2(x2)
+        f2 = self.pool2(x2)
+
+        x3 = self.activation(self.bn3(self.conv3(f2)))
+        x3 = self.sa3(x3)
+        f3 = self.pool3(x3)
+
+        g1 = self.global_pool(f1).view(batch_size, -1)
+        g2 = self.global_pool(f2).view(batch_size, -1)
+        g3 = self.global_pool(f3).view(batch_size, -1)
+        x_flat = torch.cat([g1, g2, g3], dim=1)
+
+        shared = self.activation(self.shared_fc(x_flat))
+        shared = self.dropout(shared)
+
+        # --- B. Gated Heads (Unchanged) ---
+        def to_sequence(tensor):
+            return tensor.view(batch_size, self.n_quantiles, self.q_emb).permute(
+                0, 2, 1
+            )
+
+        feat_A_mixed = self.activation(self.mix_A(to_sequence(self.expand_A(shared))))
+        raw_A_logits = self.head_A(self.dropout(feat_A_mixed)).squeeze(1)
+
+        feat_P_mixed = self.activation(self.mix_P(to_sequence(self.expand_P(shared))))
+        gate_A = torch.sigmoid(self.gate_A_to_P(feat_A_mixed))
+        feat_P_gated = feat_P_mixed * gate_A
+        raw_P_logits = self.head_P(self.dropout(feat_P_gated)).squeeze(1)
+
+        feat_CC_mixed = self.activation(
+            self.mix_CC(to_sequence(self.expand_CC(shared)))
+        )
+        feat_combined = torch.cat([feat_A_mixed, feat_P_gated], dim=1)
+        gate_AP = torch.sigmoid(self.gate_AP_to_CC(feat_combined))
+        feat_CC_gated = feat_CC_mixed * gate_AP
+        raw_CC_logits = self.head_CC(self.dropout(feat_CC_gated)).squeeze(1)
+
+        # --- C. Soft Regressions (No hard constraints) ---
+        pred_A = F.softplus(raw_A_logits)
+        pred_P = F.softplus(raw_P_logits)
+        pred_CC_continuous = F.softplus(raw_CC_logits)
+        pred_CC = (
+            pred_CC_continuous if self.training else torch.round(pred_CC_continuous)
+        )
+
+        final_output = torch.stack([pred_A, pred_P, pred_CC], dim=1)
+
+        # NOTE: Global Dry Mask REMOVED here for proper Soft Constraint learning.
+
+        return final_output
+
+
+#####
+# Legacy Classes (for comparison)
+
+
 class GammaPredictorHierarchicalHardGated(nn.Module):
     def __init__(
         self,
@@ -51,6 +442,159 @@ class GammaPredictorHierarchicalHardGated(nn.Module):
         q_embedding_dim=32,
     ):
         super(GammaPredictorHierarchicalHardGated, self).__init__()
+        self.n_quantiles = n_quantiles
+        self.activation = activation_fn
+        self.register_buffer(
+            "quantile_levels_tensor", torch.tensor(quantile_levels, dtype=torch.float32)
+        )
+        self.pixel_area_km2 = pixel_area_km2
+        self.q_emb = q_embedding_dim
+
+        # --- 1. Internal Normalizer ---
+        self.normalizer = InputNormalization(max_precip_value)
+
+        # --- 2. CNN Trunk ---
+        self.conv1 = nn.Conv2d(1, 16, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(32)
+        self.conv3 = nn.Conv2d(32, 64, 3, padding=1)
+        self.bn3 = nn.BatchNorm2d(64)
+        self.pool = nn.AvgPool2d(2, 2)
+
+        self.fc_input_size = self._get_conv_output_size(input_shape)
+
+        # --- 3. Shared Latent ---
+        self.shared_fc = nn.Linear(self.fc_input_size, 256)
+        self.dropout = nn.Dropout(0.3)
+
+        # --- 4. Convolutional Heads (IQ-CGN) ---
+        total_latent_size = self.n_quantiles * self.q_emb
+
+        self.expand_A = nn.Linear(256, total_latent_size)
+        self.expand_P = nn.Linear(256, total_latent_size)
+        self.expand_CC = nn.Linear(256, total_latent_size)
+
+        self.mix_A = nn.Conv1d(self.q_emb, self.q_emb, kernel_size=3, padding=1)
+        self.mix_P = nn.Conv1d(self.q_emb, self.q_emb, kernel_size=3, padding=1)
+        self.mix_CC = nn.Conv1d(self.q_emb, self.q_emb, kernel_size=3, padding=1)
+
+        self.head_A = nn.Conv1d(self.q_emb, 1, kernel_size=1)
+        self.head_P = nn.Conv1d(self.q_emb, 1, kernel_size=1)
+        self.head_CC = nn.Conv1d(self.q_emb, 1, kernel_size=1)
+
+        self.gate_A_to_P = nn.Conv1d(self.q_emb, self.q_emb, kernel_size=1)
+        self.gate_AP_to_CC = nn.Conv1d(self.q_emb * 2, self.q_emb, kernel_size=1)
+
+    def _get_conv_output_size(self, shape):
+        with torch.no_grad():
+            input_tensor = torch.rand(1, *shape)
+            output = self._forward_conv(input_tensor)
+            return int(np.prod(output.size()[1:]))
+
+    def _forward_conv(self, x):
+        x = self.pool(self.activation(self.bn1(self.conv1(x))))
+        x = self.pool(self.activation(self.bn2(self.conv2(x))))
+        x = self.pool(self.activation(self.bn3(self.conv3(x))))
+        return x
+
+    def forward(self, x_phys):
+        epsilon = 1e-6
+        batch_size = x_phys.size(0)
+
+        # --- A. Backbone ---
+        x_norm = self.normalizer(x_phys)
+        x_conv = self._forward_conv(x_norm)
+        x_flat = torch.flatten(x_conv, 1)
+
+        shared = self.activation(self.shared_fc(x_flat))
+        shared = self.dropout(shared)
+
+        def to_sequence(tensor):
+            return tensor.view(batch_size, self.n_quantiles, self.q_emb).permute(
+                0, 2, 1
+            )
+
+        # --- B. Gated Convolutional Pass ---
+        # 1. Path A
+        feat_A_mixed = self.activation(self.mix_A(to_sequence(self.expand_A(shared))))
+        raw_A_logits = self.head_A(self.dropout(feat_A_mixed)).squeeze(1)
+
+        # 2. Path P
+        feat_P_mixed = self.activation(self.mix_P(to_sequence(self.expand_P(shared))))
+        gate_A = torch.sigmoid(self.gate_A_to_P(feat_A_mixed))
+        feat_P_gated = feat_P_mixed * gate_A
+        raw_P_logits = self.head_P(self.dropout(feat_P_gated)).squeeze(1)
+
+        # 3. Path CC
+        feat_CC_mixed = self.activation(
+            self.mix_CC(to_sequence(self.expand_CC(shared)))
+        )
+        feat_combined = torch.cat([feat_A_mixed, feat_P_gated], dim=1)
+        gate_AP = torch.sigmoid(self.gate_AP_to_CC(feat_combined))
+        feat_CC_gated = feat_CC_mixed * gate_AP
+        raw_CC_logits = self.head_CC(self.dropout(feat_CC_gated)).squeeze(1)
+
+        # --- C. Differentiable Constraints (THE FIX) ---
+
+        # 1. Soft Area Calculation
+        # We replace the hard mask with a Sigmoid.
+        # Temp: Sharpness of the transition. 1.0 is standard, higher is sharper.
+        # We need it somewhat sharp but differentiable.
+        temperature = 0.01
+        threshold = self.quantile_levels_tensor[0]
+
+        # Sigmoid: 0 when x << thresh, 1 when x >> thresh
+        # Gradients flow nicely around the threshold
+        soft_mask = torch.sigmoid((x_phys - threshold) / temperature)
+
+        # Sum the soft mask to get differentiable area
+        A_total_soft = soft_mask.sum(dim=(2, 3)).float() * self.pixel_area_km2 + epsilon
+
+        # 2. Area Distribution
+        probs_A = torch.softmax(raw_A_logits, dim=1)
+        scaled_probs_A = probs_A * A_total_soft  # Connected to input gradients!
+
+        pred_A = torch.flip(
+            torch.cumsum(torch.flip(scaled_probs_A, dims=[1]), dim=1), dims=[1]
+        )
+
+        # 2. Perimeter (Connected to A)
+        P_min = torch.sqrt(4 * math.pi * (pred_A + epsilon))
+        R_P = 1.0 + F.softplus(raw_P_logits)
+        pred_P = P_min * R_P
+
+        # 3. CC (Unchanged)
+        pred_CC_continuous = F.softplus(raw_CC_logits)
+        pred_CC = (
+            pred_CC_continuous if self.training else torch.round(pred_CC_continuous)
+        )
+
+        constrained_output = torch.stack([pred_A, pred_P, pred_CC], dim=1)
+
+        # 4. Wet Factor (Also made Soft)
+        # Previously hard boolean. Now soft sigmoid based on total sum.
+        # If sum < epsilon, factor goes to 0.
+        total_precip_sum = x_phys.sum(dim=(1, 2, 3))
+        # Sigmoid centered at 2*epsilon, steep slope
+        wet_factor_soft = torch.sigmoid((total_precip_sum - (2 * epsilon)) * 100)
+        wet_factor_soft = wet_factor_soft.view(-1, 1, 1)
+
+        return constrained_output * wet_factor_soft
+
+
+class GammaPredictorHierarchicalHardGated_old(nn.Module):
+    def __init__(
+        self,
+        input_shape,
+        n_quantiles,
+        activation_fn=F.gelu,
+        quantile_levels=[0.0],
+        pixel_area_km2=4.0,
+        max_precip_value=150.0,
+        q_embedding_dim=32,
+    ):
+        super(GammaPredictorHierarchicalHardGated_old, self).__init__()
         self.n_quantiles = n_quantiles
         self.activation = activation_fn
         self.register_buffer(
@@ -100,7 +644,7 @@ class GammaPredictorHierarchicalHardGated(nn.Module):
         # Gate A -> P
         self.gate_A_to_P = nn.Conv1d(self.q_emb, self.q_emb, kernel_size=1)
 
-        # Gate (A + P) -> CC (MODIFIED)
+        # Gate (A + P) -> CC
         # Concatenates A and P features to inform CC
         self.gate_AP_to_CC = nn.Conv1d(self.q_emb * 2, self.q_emb, kernel_size=1)
 
@@ -348,13 +892,13 @@ class GammaPredictorHierarchicalSoftGated(nn.Module):
 
         final_output = torch.stack([pred_A, pred_P, pred_CC], dim=1)
 
-        # 6. Global Dry Mask
-        with torch.no_grad():
-            epsilon = 1e-6
-            is_dry_mask = x_phys.sum(dim=(1, 2, 3)) <= epsilon
-            wet_factor = (~is_dry_mask).float().view(-1, 1, 1)
+        # # 6. Global Dry Mask
+        # with torch.no_grad():
+        #     epsilon = 1e-6
+        #     is_dry_mask = x_phys.sum(dim=(1, 2, 3)) <= epsilon
+        #     wet_factor = (~is_dry_mask).float().view(-1, 1, 1)
 
-        return final_output * wet_factor
+        return final_output
 
 
 class GammaPredictorSeparateHeadsHard(nn.Module):

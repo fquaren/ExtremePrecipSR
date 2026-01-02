@@ -234,7 +234,7 @@ def plot_trust_analysis(metrics_df, output_dir):
 
 def plot_metric_distributions(metrics_df, output_dir):
     print("\nGenerating metric distribution box plots...")
-    cols = ["total_loss", "mse_loss", "surrogate_loss"]
+    cols = ["total_loss", "mae_loss", "surrogate_loss"]
     if "Trust_Score" in metrics_df:
         cols.append("Trust_Score")
 
@@ -318,7 +318,7 @@ def plot_per_feature_matrices(per_feature_metrics, output_dir):
     print("\nGenerating per-feature matrices...")
     matrices = [
         per_feature_metrics["r2_matrix"],
-        per_feature_metrics["mse_matrix"],
+        per_feature_metrics["mae_matrix"],
         per_feature_metrics["var_matrix"],
     ]
     titles = ["R² Score", "MSE", "Target Variance"]
@@ -440,3 +440,104 @@ def plot_training_log(log_path, output_dir, config):
         import traceback
 
         traceback.print_exc()
+
+
+def plot_perception_distortion(metrics_df, output_dir):
+    """
+    Plots the Perception-Distortion plane (MAE vs Log-Spectral Distance).
+    """
+    print("\nGenerating Perception-Distortion (Pareto) plot...")
+
+    # Critical check: Ensure variable names match physical quantities in your future work.
+    if "mae_loss" not in metrics_df or "spectral_dist" not in metrics_df:
+        print("Missing 'mae_loss' or 'spectral_dist'. Skipping.")
+        return
+
+    # Filter for valid data
+    plot_df = metrics_df[metrics_df["mean_precip"] > 0.05].copy()
+    if len(plot_df) < 10:
+        print("Not enough wet samples for robust Pareto plot. Using all data.")
+        plot_df = metrics_df
+
+    # --- CALCULATION OF MEANS ---
+    # We calculate statistics on the data actually being plotted (plot_df)
+    mean_distortion = plot_df["mae_loss"].mean()
+    mean_perception = plot_df["spectral_dist"].mean()
+
+    fig = plt.figure(figsize=(10, 8))
+    gs = gridspec.GridSpec(5, 5)
+
+    # Main Scatter
+    ax_main = fig.add_subplot(gs[1:, :-1])
+
+    scatter = ax_main.scatter(
+        plot_df["mae_loss"],
+        plot_df["spectral_dist"],
+        c=np.log1p(plot_df["mean_precip"]),
+        cmap="viridis",
+        alpha=0.6,
+        edgecolor="w",
+        linewidth=0.3,
+        s=30,
+    )
+
+    try:
+        sns.kdeplot(
+            data=plot_df,
+            x="mae_loss",
+            y="spectral_dist",
+            levels=5,
+            color="k",
+            linewidths=0.8,
+            ax=ax_main,
+            alpha=0.5,
+        )
+    except Exception:
+        pass
+
+    ax_main.set_xlabel("Distortion (MAE) [mm/hr]", fontsize=12, fontweight="bold")
+    ax_main.set_ylabel("Perception (Log-Spectral Dist)", fontsize=12, fontweight="bold")
+    ax_main.grid(True, linestyle="--", alpha=0.4)
+
+    # Marginal Histogram (X - Distortion)
+    ax_x = fig.add_subplot(gs[0, :-1], sharex=ax_main)
+    ax_x.hist(plot_df["mae_loss"], bins=50, color="gray", alpha=0.7, density=True)
+    ax_x.axis("off")
+
+    title_str = (
+        f"Perception-Distortion Trade-off\n"
+        f"Mean MAE: {mean_distortion:.4f} | Mean Perception: {mean_perception:.4f}"
+    )
+    ax_x.set_title(title_str, fontsize=12)
+
+    # Marginal Histogram (Y - Perception)
+    ax_y = fig.add_subplot(gs[1:, -1], sharey=ax_main)
+    ax_y.hist(
+        plot_df["spectral_dist"],
+        bins=50,
+        orientation="horizontal",
+        color="gray",
+        alpha=0.7,
+        density=True,
+    )
+    ax_y.axis("off")
+
+    cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+    cbar = fig.colorbar(scatter, cax=cbar_ax)
+    cbar.set_label("Log(Mean Precip Intensity)")
+
+    ax_main.text(
+        0.05,
+        0.05,
+        "Ideal Region\n(Sharp & Accurate)",
+        transform=ax_main.transAxes,
+        fontsize=10,
+        verticalalignment="bottom",
+        horizontalalignment="left",
+        bbox=dict(facecolor="white", alpha=0.8, edgecolor="green"),
+    )
+
+    out_path = os.path.join(output_dir, "perception_distortion_pareto.png")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"Saved Perception-Distortion plot to {out_path}")
+    plt.close(fig)

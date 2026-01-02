@@ -59,36 +59,46 @@ QUANTILE_LEVELS = config["QUANTILE_LEVELS"]
 PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 2.0)
 DRIZZLE_THRESHOLD = config.get("DRIZZLE_THRESHOLD", 0.1)  # mm/h
 
-# --- Zero Weighting Config (Method 3) ---
-# Alpha: Maximum extra weight at Y=0. (e.g. 5.0 means weight is 6.0 at zero)
-# Beta: Decay rate. (e.g. 10.0 means weight drops quickly as Y increases)
-ZERO_WEIGHT_ALPHA = config.get("ZERO_WEIGHT_ALPHA", 5.0)
-ZERO_WEIGHT_BETA = config.get("ZERO_WEIGHT_BETA", 10.0)
+# --- Zero Weighting Config ---
+ZERO_WEIGHT_ALPHA = config.get("ZERO_WEIGHT_ALPHA", 10.0)
+ZERO_WEIGHT_BETA = config.get("ZERO_WEIGHT_BETA", 5.0)
 
 
-# --- Custom Loss Class ---
 class SoftExponentialWeightedL1Loss(nn.Module):
-    def __init__(self, alpha, beta):
+    def __init__(self, alpha, beta, hard_zero_weight=10.0):
         super().__init__()
         self.alpha = alpha
         self.beta = beta
+        # A specific weight for the "hard zero" constraint
+        self.hard_zero_weight = hard_zero_weight
 
     def forward(self, pred, target):
         """
-        w(y) = 1 + alpha * exp(-beta * y)
-        Loss = w(target) * |pred - target|
-
-        Note: Target should be normalized [0,1] for beta to be stable.
+        1. Weighted L1: w(y) = 1 + alpha * exp(-beta * y)
+        2. Hard Zero: If target == 0, minimize pred^2 heavily.
         """
+        # --- Component 1: Your original Soft Weighted L1 ---
         l1_diff = torch.abs(pred - target)
-
-        # Calculate weights based on Ground Truth (Target)
-        # Detach to prevent gradients flowing into the weight calculation itself
         with torch.no_grad():
             weights = 1.0 + self.alpha * torch.exp(-self.beta * target)
+        weighted_l1_loss = (l1_diff * weights).mean()
 
-        weighted_loss = (l1_diff * weights).mean()
-        return weighted_loss
+        # --- Component 2: Hard Zero Constraint ---
+        # Create a boolean mask where the target is effectively zero
+        # We use a small epsilon because of float precision, though strict 0 is likely in your data
+        zero_mask = (target < 1e-6).float()
+
+        # Calculate how many zero pixels exist to normalize correctly
+        num_zeros = zero_mask.sum()
+
+        zero_loss = torch.tensor(0.0, device=pred.device)
+        if num_zeros > 0:
+            # We punish the magnitude of the prediction in zero regions.
+            # L2 (squaring) is often better here to kill small noise (0.01 -> 0.0001)
+            # whereas L1 (0.01) might be overpowered by the metric loss.
+            zero_loss = (pred**2 * zero_mask).sum() / num_zeros
+
+        return weighted_l1_loss + (self.hard_zero_weight * zero_loss)
 
 
 def main():
@@ -102,12 +112,28 @@ def main():
         choices=["none", "train", "validate"],
         help="Override config METRIC_LOSS_MODE via CLI",
     )
+    parser.add_argument(
+        "--data_percentage",
+        type=float,
+        default=100.0,
+        help="Percentage of dataset to use for training/validation (0-100]. Default 100.",
+    )
     args = parser.parse_args()
+
+    # --- Convert percentage to fraction ---
+    subset_fraction = args.data_percentage / 100.0
+    if not (0.0 < subset_fraction <= 1.0):
+        raise ValueError(
+            f"Data percentage must be > 0 and <= 100. Got {args.data_percentage}"
+        )
 
     global METRIC_LOSS_MODE
     if args.metric_loss_mode is not None:
         METRIC_LOSS_MODE = args.metric_loss_mode
         print(f"--- CLI OVERRIDE: Using METRIC_LOSS_MODE='{METRIC_LOSS_MODE}' ---")
+
+    if subset_fraction < 1.0:
+        print(f"--- EXPERIMENTAL MODE: Using {args.data_percentage}% of data ---")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -116,7 +142,6 @@ def main():
     print(f"  Beta (Decay Rate): {ZERO_WEIGHT_BETA}")
 
     # --- 1. Load Physical Scalar ---
-    # We load the scaler that represents the Max Value in Log Space (~5.017)
     scaler_path = os.path.join(
         PREPROCESSED_DATA_DIR, "log_transformed_precip_max_val.npy"
     )
@@ -139,7 +164,10 @@ def main():
 
     # --- 2. Setup Experiment Output ---
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_name = f"{EXPERIMENT_NAME}_{METRIC_LOSS_MODE}_{timestamp}"
+    # Updated Run Name to include percentage
+    run_name = (
+        f"{EXPERIMENT_NAME}_{METRIC_LOSS_MODE}_p{args.data_percentage}_{timestamp}"
+    )
     output_dir = os.path.join("sr_experiment_runs", run_name)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -153,22 +181,22 @@ def main():
     # --- 3. Initialize Datasets ---
     print("\n--- Initializing Datasets ---")
 
-    # TRAIN DATASET
     train_dataset = SRDataset(
         PREPROCESSED_DATA_DIR,
         METADATA_TRAIN_METADATA_FILE,
         DEM_DATA_DIR,
         dem_stats,
         split="train",
+        subset_fraction=subset_fraction,
     )
 
-    # VALIDATION DATASET
     val_dataset = SRDataset(
         PREPROCESSED_DATA_DIR,
         METADATA_VAL_METADATA_FILE,
         DEM_DATA_DIR,
         dem_stats,
         split="validation",
+        subset_fraction=subset_fraction,
     )
 
     print(f"Training Samples (Wet Only): {len(train_dataset)}")
@@ -181,6 +209,7 @@ def main():
         meta_df = pd.read_csv(METADATA_TRAIN_METADATA_FILE, sep=r"\s+")
 
         # Align metadata indices with the dataset's filtered indices
+        # This automatically handles the subsetting done in __init__
         if hasattr(train_dataset, "valid_indices"):
             print(
                 f"Aligning sampler metadata with {len(train_dataset)} filtered patches..."
@@ -196,8 +225,6 @@ def main():
 
         if target_col:
             max_vals = meta_df[target_col].values
-
-            # Create classes for balancing
             t1 = np.quantile(max_vals, 1.0 / 3.0)
             t2 = np.quantile(max_vals, 2.0 / 3.0)
             labels = np.zeros_like(max_vals, dtype=int)
@@ -210,8 +237,6 @@ def main():
 
             weights = 1.0 / np.maximum(counts, 1)
             weights_tensor = torch.from_numpy(weights[labels]).float()
-
-            assert len(weights_tensor) == len(train_dataset)
 
             sampler = WeightedRandomSampler(
                 weights=weights_tensor,
@@ -257,8 +282,11 @@ def main():
     )
 
     # --- Initialize Custom Loss ---
+    # We add the hard_zero_weight argument
     criterion_mae = SoftExponentialWeightedL1Loss(
-        alpha=ZERO_WEIGHT_ALPHA, beta=ZERO_WEIGHT_BETA
+        alpha=ZERO_WEIGHT_ALPHA,
+        beta=ZERO_WEIGHT_BETA,
+        hard_zero_weight=100.0,
     ).to(device)
 
     # --- 7. Metric/Emulator Setup ---
@@ -347,7 +375,6 @@ def main():
             pred_X = sr_model(X)
 
             # --- 1. Weighted Intensity Loss (MAE) ---
-            # Using custom loss which weights zero-pixels heavily
             loss_mae = criterion_mae(pred_X, Y)
 
             # --- 2. Metric Loss ---
@@ -488,26 +515,27 @@ def main():
         )
 
         # --- 11. Auto-Calibration ---
-        # Using TRAIN stats for calibration to avoid dry-patch dilution
+        # We use VALIDATION stats because Train metric was 0.0 during warmup
         if METRIC_LOSS_MODE == "train" and epoch == METRIC_WARMUP_EPOCHS - 1:
-            train_metric_avg = avg_train["metric"] + 1e-8
+            # Fallback to validation metric if train metric is empty
+            ref_metric = avg_train["metric"]
+            if ref_metric < 1e-6:
+                ref_metric = avg_val["metric"]
 
-            if train_metric_avg > 1e-6:
-                # Calibrate against MAE only (Physical Intensity vs Shape)
-                metric_loss_scaler = avg_train["mae"] / train_metric_avg
+            if ref_metric > 1e-6:
+                # Calibrate: We want (Weight * Scaler * Metric) ≈ MAE
+                # So Scaler ≈ MAE / Metric
+                metric_loss_scaler = avg_train["mae"] / ref_metric
                 print(
-                    f"WARMUP COMPLETE. Auto-Calibrated Scaler (on Train stats): {metric_loss_scaler:.4f}"
+                    f"WARMUP COMPLETE. Auto-Calibrated Scaler: {metric_loss_scaler:.6f} (Ref Metric: {ref_metric:.4f})"
                 )
 
+                # Reset optimizer to apply new constraints gently
                 best_val_loss = float("inf")
                 for pg in optimizer.param_groups:
                     pg["lr"] = LEARNING_RATE
 
-                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                    optimizer, mode="min", factor=0.5, patience=5
-                )
-
-        # --- 12. Checkpointing ---
+        # --- 12. Checkpointing & EARLY STOPPING ---
         current_val_score = avg_val["mae"]
         scheduler.step(current_val_score)
 
@@ -520,6 +548,15 @@ def main():
             "scaler": metric_loss_scaler,
         }
 
+        # --- Determine if Early Stopping Should be Locked ---
+        # We lock early stopping if we are in the metric build-up phase (Warmup + Ramp).
+        # Reason: The loss function is non-stationary here.
+        early_stopping_locked = False
+        if METRIC_LOSS_MODE == "train":
+            build_up_end = METRIC_WARMUP_EPOCHS + METRIC_RAMP_EPOCHS
+            if epoch < build_up_end:
+                early_stopping_locked = True
+
         if current_val_score < best_val_loss:
             best_val_loss = current_val_score
             torch.save(
@@ -529,7 +566,15 @@ def main():
             print(">>> New Best Model Saved.")
             patience_counter = 0
         else:
-            patience_counter += 1
+            # Check the lock before incrementing patience
+            if early_stopping_locked:
+                patience_counter = 0
+                print(
+                    f"Early Stopping Suppressed (Metric Build-up Phase Active: Ep {epoch+1})"
+                )
+            else:
+                patience_counter += 1
+
             torch.save(
                 state_dict,
                 os.path.join(output_dir, "last_sr_model.pth"),

@@ -422,7 +422,20 @@ def save_sample_images(model, diffusion, loader, device, out_dir, epoch, denorma
 def main():
     parser = argparse.ArgumentParser(description="Train DDPM with Curriculum Learning")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint")
+    parser.add_argument(
+        "--data_percentage",
+        type=float,
+        default=100.0,
+        help="Percentage of dataset to use for training/validation (0-100]. Default 100.",
+    )
     args = parser.parse_args()
+
+    # --- Convert percentage to fraction ---
+    subset_fraction = args.data_percentage / 100.0
+    if not (0.0 < subset_fraction <= 1.0):
+        raise ValueError(
+            f"Data percentage must be > 0 and <= 100. Got {args.data_percentage}"
+        )
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available.")
@@ -433,6 +446,9 @@ def main():
     run_name = f"{EXPERIMENT_NAME}_{timestamp}"
     out_dir = os.path.join("sr_experiment_runs", run_name)
     os.makedirs(out_dir, exist_ok=True)
+
+    if subset_fraction < 1.0:
+        print(f"--- EXPERIMENTAL MODE: Using {args.data_percentage}% of data ---")
 
     with open(os.path.join(out_dir, "config_snapshot.yaml"), "w") as f:
         yaml.dump(config, f)
@@ -446,10 +462,20 @@ def main():
     )
 
     train_dataset = SRDataset(
-        PREPROCESSED_DATA_DIR, METADATA_TRAIN, DEM_DATA_DIR, dem_stats, split="train"
+        PREPROCESSED_DATA_DIR,
+        METADATA_TRAIN,
+        DEM_DATA_DIR,
+        dem_stats,
+        split="train",
+        subset_fraction=subset_fraction,
     )
     val_dataset = SRDataset(
-        PREPROCESSED_DATA_DIR, METADATA_VAL, DEM_DATA_DIR, dem_stats, split="validation"
+        PREPROCESSED_DATA_DIR,
+        METADATA_VAL,
+        DEM_DATA_DIR,
+        dem_stats,
+        split="validation",
+        subset_fraction=subset_fraction,
     )
 
     train_loader = DataLoader(

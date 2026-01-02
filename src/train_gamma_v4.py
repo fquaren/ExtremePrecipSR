@@ -20,8 +20,8 @@ from dataset import PrecomputedMixupDataset
 from gamma_predictors import (
     GammaPredictorSeparateHeadsSoft,
     GammaPredictorSeparateHeadsHard,
-    GammaPredictorHierarchicalSoftGated,
-    GammaPredictorHierarchicalHardGated,
+    GammaPredictorHierarchicalSoftGated_V2,
+    GammaPredictorHierarchicalHardGated_V2,
 )
 
 # --- Config ---
@@ -66,17 +66,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--constraint_mode", type=str, default="hybrid")
     parser.add_argument("--arch", type=str, default="Vanilla")
-    parser.add_argument(
-        "--data_percentage",
-        type=float,
-        default=100.0,
-        help="Percentage of training data to use (0-100). Default 100.",
-    )
     args = parser.parse_args()
 
     CONSTRAINT_MODE = args.constraint_mode
     current_arch = args.arch if args.arch else config.get("ARCHITECTURE", "Vanilla")
-    subset_fraction = args.data_percentage / 100.0
 
     print(f"Mode: {CONSTRAINT_MODE} | Architecture: {current_arch}")
 
@@ -84,8 +77,8 @@ def main():
         HARD_EMULATOR = GammaPredictorSeparateHeadsHard
         SOFT_EMULATOR = GammaPredictorSeparateHeadsSoft
     elif current_arch == "Attention":
-        HARD_EMULATOR = GammaPredictorHierarchicalHardGated
-        SOFT_EMULATOR = GammaPredictorHierarchicalSoftGated
+        HARD_EMULATOR = GammaPredictorHierarchicalHardGated_V2
+        SOFT_EMULATOR = GammaPredictorHierarchicalSoftGated_V2
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -105,9 +98,8 @@ def main():
         preprocessed_data_dir=os.path.join(PREPROCESSED_DATA_DIR, "train"),
         metadata_file=TRAIN_METADATA_FILE,
         augment=True,
-        include_original=True,
-        include_mixup=True,
-        subset_fraction=subset_fraction,  # Pass the fraction here
+        include_original=True,  # Load physical_precip.npz
+        include_mixup=True,  # Load mixup_augmented_precip.npz
     )
 
     # Validation: Real Data + Precomputed MixUp Data

@@ -71,12 +71,29 @@ def main():
         choices=["none", "train", "validate"],
         help="Override config METRIC_LOSS_MODE via CLI",
     )
+    # --- NEW ARGUMENT ---
+    parser.add_argument(
+        "--data_percentage",
+        type=float,
+        default=100.0,
+        help="Percentage of dataset to use for training/validation (0-100]. Default 100.",
+    )
     args = parser.parse_args()
+
+    # Convert percentage (0-100) to fraction (0.0-1.0)
+    subset_fraction = args.data_percentage / 100.0
+    if not (0.0 < subset_fraction <= 1.0):
+        raise ValueError(
+            f"Data percentage must be > 0 and <= 100. Got {args.data_percentage}"
+        )
 
     global METRIC_LOSS_MODE
     if args.metric_loss_mode is not None:
         METRIC_LOSS_MODE = args.metric_loss_mode
         print(f"--- CLI OVERRIDE: Using METRIC_LOSS_MODE='{METRIC_LOSS_MODE}' ---")
+
+    if subset_fraction < 1.0:
+        print(f"--- EXPERIMENTAL MODE: Using {args.data_percentage}% of data ---")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -106,7 +123,10 @@ def main():
 
     # --- 2. Setup Experiment Output ---
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_name = f"{EXPERIMENT_NAME}_{METRIC_LOSS_MODE}_{timestamp}"
+    # Include percentage in run name for tracking
+    run_name = (
+        f"{EXPERIMENT_NAME}_{METRIC_LOSS_MODE}_p{args.data_percentage}_{timestamp}"
+    )
     output_dir = os.path.join("sr_experiment_runs", run_name)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -126,6 +146,7 @@ def main():
         DEM_DATA_DIR,
         dem_stats,
         split="train",
+        subset_fraction=subset_fraction,
     )
 
     val_dataset = SRDataset(
@@ -134,6 +155,7 @@ def main():
         DEM_DATA_DIR,
         dem_stats,
         split="validation",
+        subset_fraction=subset_fraction,
     )
 
     print(f"Training Samples (Wet Only): {len(train_dataset)}")
@@ -146,6 +168,8 @@ def main():
         meta_df = pd.read_csv(METADATA_TRAIN_METADATA_FILE, sep=r"\s+")
 
         if hasattr(train_dataset, "valid_indices"):
+            # This logic remains valid because train_dataset.valid_indices
+            # is now already subsetted in the Dataset class.
             meta_df = meta_df.iloc[train_dataset.valid_indices].reset_index(drop=True)
 
         target_col = next((c for c in meta_df.columns if "max" in c.lower()), None)

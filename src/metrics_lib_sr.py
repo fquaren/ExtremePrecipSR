@@ -67,8 +67,9 @@ def create_metrics_dataframe(
     all_preds_images,
     all_dems,
     all_total_losses,
-    all_mse_losses,
+    all_mae_losses,
     all_surrogate_losses,
+    all_spectral_dists,
     quantiles,
     pixel_size_km,
 ):
@@ -77,14 +78,15 @@ def create_metrics_dataframe(
     # 1. Calculate scalar metrics based on Gamma curves
     sample_metrics = _calculate_per_sample_metrics(all_preds_gamma, all_targets_gamma)
 
-    # 2. Calculate physical mean precipitation for grouping
+    # 2. Calculate physical mean precipitation
     mean_precip = np.mean(all_targets_images, axis=(1, 2))
 
     # 3. Build Base DataFrame
     data = {
         "total_loss": all_total_losses,
-        "mse_loss": all_mse_losses,
+        "mae_loss": all_mae_losses,
         "surrogate_loss": all_surrogate_losses,
+        "spectral_dist": all_spectral_dists,
         "mean_precip": mean_precip,
     }
     data.update(sample_metrics)
