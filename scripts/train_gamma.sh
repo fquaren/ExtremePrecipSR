@@ -8,12 +8,12 @@
 #SBATCH --output outputs/%j
 #SBATCH --error job_errors/%j
 
-#SBATCH --partition gpu-gh
+#SBATCH --partition gpu
 #SBATCH --gres gpu:1
 #SBATCH --gres-flags enforce-binding
 #SBATCH --nodes 1
 #SBATCH --ntasks 1
-#SBATCH --cpus-per-task 32
+#SBATCH --cpus-per-task 24
 #SBATCH --mem 350G
 #SBATCH --time 72:00:00
 
