@@ -19,7 +19,7 @@ QUANTILE_LEVELS = np.array(config["QUANTILE_LEVELS"], dtype=np.float32)
 PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 2.0)
 # Default to 0.05 if not in config, matching your production script default
 PERSISTENCE_THRESHOLD = config.get("PERSISTENCE_THRESHOLD", 0.05)
-NUM_WORKERS = 4
+NUM_WORKERS = config.get("NUM_WORKERS", 4)
 
 # --- HYPERPARAMETERS FOR MIXUP ---
 MIXUP_ALPHA = 0.2
