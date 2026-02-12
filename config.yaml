@@ -56,20 +56,21 @@ SAMPLE_WEIGHTS:
   "dry": 1.0
   "normal": 1.0
   "extreme": 1.0
+VAL_INCLUDE_MIXUP: false  # Not computed
 
-EXPERIMENT_NAME: "UNet_SR_ExponentialWeighted_Loss"
+EXPERIMENT_NAME: "GammaUNet_V5"
 
 # Gamma emulator settings
-ARCHITECTURE: "Attention" 
+ARCHITECTURE: "Constrained" 
 Q_EMBEDDING_DIM: 32
 CONSTRAINT_MODE: "hard"
 CONSTRAINT_WARMUP_EPOCHS: 10
 LOSS_LAMBDA: 0.5
 
 # Weights loss
-WEIGHT_A: 1.0
+WEIGHT_A: 3.0
 WEIGHT_P: 1.0
-WEIGHT_CC: 2.0
+WEIGHT_CC: 1.5
 
 LAMBDA_MONOTONICITY: 1.0
 LAMBDA_PLAUSIBILITY: 0.5
@@ -83,22 +84,23 @@ EARLY_STOPPING: true
 EARLY_STOPPING_PATIENCE: 15
 EARLY_STOPPING_DELTA: 0.001
 
-LEARNING_RATE: 0.00005
-WEIGHT_DECAY: 0.0001
+LEARNING_RATE: 0.00013811154521813725  # Optimized for Attention architecture with hard constraints
+WEIGHT_DECAY: 0.0000031037955091396024
 
 QUANTILE_LEVELS: [0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]
 
 # Evaluation emulator (Using the best Hard+Attention model)
-EMULATOR_CHECKPOINT_PATH: "experiment_runs/GammaEmulator_OfflineMixup_hard_Attention_2025-12-05_05-59-38/best_model_checkpoint.pth" 
+EMULATOR_CHECKPOINT_PATH: "/home/fquareng/work/experiment_runs/GammaEmulator_v6_Constrained_SingleRun_2026-01-10_23-54-19/best_model_checkpoint.pth"
+#"experiment_runs/GammaEmulator_OfflineMixup_hard_Attention_2025-12-05_05-59-38/best_model_checkpoint.pth" 
 #/scratch/fquareng/experiment_runs/GammaEmulator_OfflineMixup_hard_Attention_2025-12-05_05-59-38/best_model_checkpoint.pth 
 
 # Training super resolution
 METRIC_LOSS_MODE: 'train'
 METRIC_LOSS_TYPE: 'geometric'
-METRIC_WARMUP_EPOCHS: 5
-METRIC_RAMP_EPOCHS: 10
+METRIC_WARMUP_EPOCHS: 3
+METRIC_RAMP_EPOCHS: 5
 METRIC_LOSS_WEIGHT: 0.5
-S_ESTIMATION_SAMPLES: 10000
+S_ESTIMATION_SAMPLES: 100000
 
 # Evaluation
 EVAL_MODE: 'hard'

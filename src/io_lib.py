@@ -1,22 +1,20 @@
 import yaml
 import torch
-import torch.nn as nn
+import numpy as np
 import os
 from torch.utils.data import DataLoader
 
-# Import your existing modules
-from gamma_predictors import (
-    GammaPredictorSeparateHeadsSoft,
-    GammaPredictorSeparateHeadsHard,
-    GammaPredictorHierarchicalSoftGated,
-    GammaPredictorHierarchicalHardGated,
-)
+from gamma_predictors_v5 import BaselineCNN, IsometricCNN, ConstrainedIsometricCNN
+from models_fno import ProbabilisticFNO
+
 from loss import estimate_s_inv_from_dataset
 from dataset import PrecomputedMixupDataset
 
 
 def setup_evaluation(run_dir):
-    """Loads config and sets up device."""
+    """
+    Loads config, sets up device, and retrieves the normalization scalar used during training.
+    """
     print(f"Setting up evaluation for: {run_dir}")
     if not os.path.isdir(run_dir):
         raise FileNotFoundError(f"Error: Run directory not found at '{run_dir}'")
@@ -28,74 +26,96 @@ def setup_evaluation(run_dir):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    return config, device
+    # --- CRITICAL: Load the scalar used for input normalization ---
+    # This must match the training script's logic exactly.
+    data_dir = config["PREPROCESSED_DATA_DIR"]
+    scaler_path = config.get(
+        "MAX_LOG_PRECIP_FILE", os.path.join(data_dir, "precip_max_val.npy")
+    )
+
+    if os.path.exists(scaler_path):
+        scaler_val = float(np.load(scaler_path))
+        print(f"Loaded normalization scalar from disk: {scaler_val:.4f}")
+    else:
+        print(
+            "Warning: Normalization scalar file not found. Defaulting to 5.5 (Check your paths!)"
+        )
+        scaler_val = 5.5
+
+    return config, device, scaler_val
 
 
 def load_model(
-    config, device, run_dir, constraint_mode_override=None, architecture_type=None
+    config,
+    device,
+    run_dir,
+    scaler_val,
+    architecture_type=None,
 ):
-    """Loads the specified model and checkpoint."""
-    N_QUANTILES = len(config["QUANTILE_LEVELS"])
+    """
+    Loads the specified architecture and restores weights.
+    Now correctly passes scaler_val to Constrained architectures.
+    """
+    print(f"\nLoading Model Architecture: {architecture_type}")
+
+    # Extract config parameters
     PATCH_SIZE = config["PATCH_SIZE"]
+    INPUT_SHAPE = (1, PATCH_SIZE, PATCH_SIZE)
+    N_QUANTILES = len(config["QUANTILE_LEVELS"])
+    QUANTILE_LEVELS = config["QUANTILE_LEVELS"]
     PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 2.0)
 
-    if architecture_type == "Vanilla":
-        HARD_EMULATOR = GammaPredictorSeparateHeadsHard
-        SOFT_EMULATOR = GammaPredictorSeparateHeadsSoft
-    elif architecture_type == "Attention":
-        HARD_EMULATOR = GammaPredictorHierarchicalHardGated
-        SOFT_EMULATOR = GammaPredictorHierarchicalSoftGated
-    else:
-        print("Architecture type not valid.")
-
-    CONSTRAINT_MODE = config.get("CONSTRAINT_MODE", "hybrid")
-    if constraint_mode_override:
-        CONSTRAINT_MODE = constraint_mode_override
-        print(f"Overriding constraint mode to: {CONSTRAINT_MODE}")
-
-    INPUT_SHAPE = (1, PATCH_SIZE, PATCH_SIZE)
-
-    if CONSTRAINT_MODE == "soft" or CONSTRAINT_MODE == "none":
-        print("Using SOFT constrained model.")
-        model = SOFT_EMULATOR(
-            input_shape=INPUT_SHAPE, n_quantiles=N_QUANTILES, activation_fn=nn.Mish()
-        ).to(device)
-    elif CONSTRAINT_MODE == "hybrid" or CONSTRAINT_MODE == "hard":
-        print("Using HARD constrained model.")
-        print(f"Architecture: {architecture_type}.")
-        model = HARD_EMULATOR(
-            input_shape=INPUT_SHAPE,
+    # Instantiate the correct class
+    if architecture_type == "Baseline":
+        model = BaselineCNN(n_quantiles=N_QUANTILES, input_shape=INPUT_SHAPE)
+    elif architecture_type == "Isometric":
+        model = IsometricCNN(n_quantiles=N_QUANTILES, input_shape=INPUT_SHAPE)
+    elif architecture_type == "Constrained":
+        # CRITICAL FIX: Pass max_input_val to match training
+        model = ConstrainedIsometricCNN(
             n_quantiles=N_QUANTILES,
-            activation_fn=nn.Mish(),
-            quantile_levels=config["QUANTILE_LEVELS"],
+            input_shape=INPUT_SHAPE,
+            quantile_levels=QUANTILE_LEVELS,
             pixel_area_km2=PIXEL_SIZE_KM**2,
-        ).to(device)
+            max_input_val=scaler_val,
+        )
+    elif architecture_type == "FNO":
+        print("Initializing Probabilistic FNO...")
+        model = ProbabilisticFNO(n_quantiles=N_QUANTILES, modes=12, width=32)
     else:
-        raise ValueError(f"Unknown CONSTRAINT_MODE: {CONSTRAINT_MODE}")
+        raise ValueError(
+            f"Unknown architecture: {architecture_type}. Choose: Baseline, Isometric, Constrained, FNO"
+        )
 
+    model = model.to(device)
+
+    # Load Weights
     checkpoint_path = os.path.join(run_dir, "best_model_checkpoint.pth")
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(
             f"Error: Checkpoint file not found: '{checkpoint_path}'"
         )
 
-    print("Loading checkpoint...")
+    print(f"Restoring weights from: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+
+    state_dict = checkpoint["model_state_dict"]
+    model.load_state_dict(state_dict)
+
     model.eval()
-    print("Model loaded successfully.")
     return model
 
 
-def load_data(config):
-    """Loads test data loader."""
+def load_data(config, scaler_val):
+    """Loads test data loader with correct normalization."""
     # Validation: Real Data + Precomputed MixUp Data
     test_dataset = PrecomputedMixupDataset(
         preprocessed_data_dir=os.path.join(config["PREPROCESSED_DATA_DIR"], "test"),
         metadata_file=config["TEST_METADATA_FILE"],
+        scaler_val=scaler_val,  # CRITICAL: Pass the scalar
         augment=False,
-        include_original=True,  # Load physical_precip.npz
-        include_mixup=False,  # Don't load mixup_augmented_precip.npz
+        include_original=True,
+        include_mixup=False,
     )
     test_loader = DataLoader(
         test_dataset,
@@ -108,15 +128,16 @@ def load_data(config):
     return test_loader
 
 
-def load_s_inv(config, device):
+def load_s_inv(config, device, scaler_val):
     """Loads train dataset to compute S_inv for geometric loss."""
     print("Loading train dataset to compute S_inv...")
     train_dataset_for_s_inv = PrecomputedMixupDataset(
         preprocessed_data_dir=os.path.join(config["PREPROCESSED_DATA_DIR"], "train"),
         metadata_file=config["TRAIN_METADATA_FILE"],
+        scaler_val=scaler_val,  # CRITICAL: Pass the scalar
         augment=True,
-        include_original=True,  # Load physical_precip.npz
-        include_mixup=True,  # Load mixup_augmented_precip.npz
+        include_original=True,
+        include_mixup=True,
     )
     S_inv_tensors = estimate_s_inv_from_dataset(
         train_dataset_for_s_inv, config.get("S_ESTIMATION_SAMPLES", 1000), device
@@ -156,7 +177,6 @@ def save_metrics_text(
             )
             f.write("Includes Target Variance (Var) to contextualize MSE and R2.\n\n")
 
-            # Use scientific notation for MSE/Var, standard for R2
             f.write(
                 global_group_metrics.to_string(
                     float_format=lambda x: "{:.4g}".format(x)

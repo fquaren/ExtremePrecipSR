@@ -368,20 +368,18 @@ def plot_gamma_mean_std_by_quantile(
     print(f"Saved mean/std plots to: {plot_save_dir}")
 
 
-# --- 4. Training Log Plot ---
-
-
+# --- Training Log Plot ---
 def plot_training_log(log_path, output_dir):
     """
     Plots the training history from the training_log.csv file.
-    (This function is unchanged from your original script as it
-    does not depend on the new evaluation metrics_df.)
+    Dynamically adjusts to the columns present in the CSV (Losses, Components, Penalties, Temperature).
     """
     if not os.path.exists(log_path):
         print(
             f"\nWarning: Log file not found at {log_path}. Skipping training history plot."
         )
         return
+
     print("\nGenerating training history plot...")
     try:
         df = pd.read_csv(log_path)
@@ -389,175 +387,223 @@ def plot_training_log(log_path, output_dir):
         print(f"Error reading log file with pandas: {e}. Skipping plot.")
         return
 
-    # Check for main loss columns, handle if missing
-    if "train_loss_main" not in df.columns:
-        if all(
-            c in df.columns for c in ["train_loss_A", "train_loss_P", "train_loss_CC"]
-        ):
-            df["train_loss_main"] = (
-                df["train_loss_A"] + df["train_loss_P"] + df["train_loss_CC"]
-            )
-    if "val_loss_main" not in df.columns:
-        if all(c in df.columns for c in ["val_loss_A", "val_loss_P", "val_loss_CC"]):
-            df["val_loss_main"] = (
-                df["val_loss_A"] + df["val_loss_P"] + df["val_loss_CC"]
-            )
+    # --- Determine what to plot based on available columns ---
 
-    required_cols = [
-        "epoch",
-        "train_loss_total",
-        "val_loss_total",
+    # Group 1: Aggregate Losses (Expected to always be present)
+    has_total = "train_loss_total" in df.columns and "val_loss_total" in df.columns
+    has_main = "train_loss_main" in df.columns and "val_loss_main" in df.columns
+
+    # Group 2: Components (A, P, CC)
+    comp_cols = [
         "train_loss_A",
         "train_loss_P",
         "train_loss_CC",
         "val_loss_A",
         "val_loss_P",
         "val_loss_CC",
-        "train_loss_main",
-        "val_loss_main",
     ]
+    has_components = all(c in df.columns for c in comp_cols)
 
-    # Check for optional penalty columns
-    penalty_cols = [
-        "train_penalty_zero",
-        "train_penalty_mono",
-        "train_penalty_plaus",
-        "train_penalty_bound",
-        "val_penalty_zero",
-        "val_penalty_mono",
-        "val_penalty_plaus",
-        "val_penalty_bound",
-    ]
-    found_penalty_cols = [c for c in penalty_cols if c in df.columns]
+    # Group 3: Penalties
+    # Find any column starting with "train_penalty" or "val_penalty"
+    penalty_cols = [c for c in df.columns if "penalty" in c]
+    has_penalties = len(penalty_cols) > 0
 
-    # Check if all *required* columns are present
-    if not all(col in df.columns for col in required_cols):
-        print("Warning: Log file columns mismatch. Skipping training history plot.")
-        print(f"Missing: {[c for c in required_cols if c not in df.columns]}")
+    # Group 4: Temperature (Specific to Constrained Model)
+    has_temp = "temperature" in df.columns
+
+    # Count active panels
+    panels = []
+    if has_total or has_main:
+        panels.append("losses")
+    if has_components:
+        panels.append("components")
+    if has_penalties:
+        panels.append("penalties")
+    if has_temp:
+        panels.append("temperature")
+
+    if not panels:
+        print("Error: No recognized loss columns found in log file.")
         return
 
-    # Determine number of subplots
-    n_subplots = 3 if found_penalty_cols else 2
-    fig, axes = plt.subplots(n_subplots, 1, figsize=(12, 6 * n_subplots), sharex=True)
+    # --- Setup Figure ---
+    n_plots = len(panels)
+    # Scale height based on number of plots
+    fig, axes = plt.subplots(n_plots, 1, figsize=(12, 4 * n_plots), sharex=True)
 
-    # --- Plot 1: Total & Main Loss ---
-    ax1 = axes[0]
-    ax1.plot(df["epoch"], df["train_loss_total"], "o-", label="Train Total", color="C0")
-    ax1.plot(df["epoch"], df["val_loss_total"], "o-", label="Val Total", color="C1")
-    ax1.plot(
-        df["epoch"],
-        df["train_loss_main"],
-        "x--",
-        label="Train Main",
-        color="C0",
-        alpha=0.6,
-    )
-    ax1.plot(
-        df["epoch"], df["val_loss_main"], "x--", label="Val Main", color="C1", alpha=0.6
-    )
-    ax1.set_ylabel("Loss Value")
-    ax1.set_title("Total & Main Loss")
-    ax1.legend(ncol=2)
-    ax1.grid(True, linestyle="--", alpha=0.6)
-    ax1.set_yscale("log")
+    # Ensure axes is iterable even if n_plots is 1
+    if n_plots == 1:
+        axes = [axes]
 
-    # --- Plot 2: Main Loss Components ---
-    ax2 = axes[1]
-    ax2.plot(
-        df["epoch"],
-        df["train_loss_A"],
-        "s--",
-        label="Train Loss A",
-        color="lightblue",
-        alpha=0.8,
-    )
-    ax2.plot(
-        df["epoch"], df["val_loss_A"], "s-", label="Val Loss A", color="blue", alpha=0.8
-    )
-    ax2.plot(
-        df["epoch"],
-        df["train_loss_P"],
-        "x--",
-        label="Train Loss P",
-        color="lightgreen",
-        alpha=0.8,
-    )
-    ax2.plot(
-        df["epoch"],
-        df["val_loss_P"],
-        "x-",
-        label="Val Loss P",
-        color="green",
-        alpha=0.8,
-    )
-    ax2.plot(
-        df["epoch"],
-        df["train_loss_CC"],
-        "d--",
-        label="Train Loss CC",
-        color="wheat",
-        alpha=0.8,
-    )
-    ax2.plot(
-        df["epoch"],
-        df["val_loss_CC"],
-        "d-",
-        label="Val Loss CC",
-        color="orange",
-        alpha=0.8,
-    )
-    ax2.set_ylabel("Component Loss")
-    ax2.set_title("Main Loss Components (in Log-Space)")
-    ax2.legend(ncol=3)
-    ax2.grid(True, linestyle="--", alpha=0.6)
-    ax2.set_yscale("log")
+    # --- Plotting Loop ---
+    for ax, panel_type in zip(axes, panels):
 
-    # --- Plot 3: Penalty Terms (if they exist) ---
-    if n_subplots == 3:
-        ax3 = axes[2]
-
-        # Plotting only the penalty columns that were found
-        penalty_plot_map = {
-            "train_penalty_zero": ("p:", "black", 0.6, "Train Zero Pen."),
-            "val_penalty_zero": ("p-", "black", 1.0, "Val Zero Pen."),
-            "train_penalty_mono": ("s:", "cyan", 0.6, "Train Mono Pen."),
-            "val_penalty_mono": ("s-", "cyan", 1.0, "Val Mono Pen."),
-            "train_penalty_plaus": ("x:", "lime", 0.6, "Train Plaus Pen."),
-            "val_penalty_plaus": ("x-", "lime", 1.0, "Val Plaus Pen."),
-            "train_penalty_bound": ("d:", "magenta", 0.6, "Train Bound Pen."),
-            "val_penalty_bound": ("d-", "magenta", 1.0, "Val Bound Pen."),
-        }
-
-        for col_name, (fmt, color, alpha, label) in penalty_plot_map.items():
-            if col_name in df.columns:
-                ax3.plot(
+        # 1. Plot Aggregate Losses
+        if panel_type == "losses":
+            if has_total:
+                ax.plot(
                     df["epoch"],
-                    df[col_name],
-                    fmt,
-                    label=label,
-                    color=color,
+                    df["train_loss_total"],
+                    "o-",
+                    label="Train Total",
+                    color="black",
+                    linewidth=1.5,
+                    markersize=4,
+                )
+                ax.plot(
+                    df["epoch"],
+                    df["val_loss_total"],
+                    "o-",
+                    label="Val Total",
+                    color="red",
+                    linewidth=1.5,
+                    markersize=4,
+                )
+            if has_main:
+                # If total exists, make main dashed/lighter. If not, make it primary.
+                style = "--" if has_total else "-"
+                alpha = 0.7 if has_total else 1.0
+                ax.plot(
+                    df["epoch"],
+                    df["train_loss_main"],
+                    style,
+                    label="Train Main",
+                    color="C0",
+                    alpha=alpha,
+                )
+                ax.plot(
+                    df["epoch"],
+                    df["val_loss_main"],
+                    style,
+                    label="Val Main",
+                    color="C1",
                     alpha=alpha,
                 )
 
-        ax3.set_xlabel("Epoch")
-        ax3.set_ylabel("Penalty Value")
-        ax3.set_title("Soft Penalty Terms")
-        ax3.legend(ncol=2)  # Adjusted to ncol=2 for fewer columns
-        ax3.grid(True, linestyle="--", alpha=0.6)
+            ax.set_ylabel("Loss (Log Scale)")
+            ax.set_title("Overall Loss Convergence")
+            ax.set_yscale("log")
+            ax.legend(loc="upper right", fontsize=9, ncol=2)
+            ax.grid(True, linestyle="--", alpha=0.5)
 
-        # Set y-scale to log only if there are values > 0
-        if (df[found_penalty_cols] > 0).any().any():
-            ax3.set_yscale("log")
+        # 2. Plot Components
+        elif panel_type == "components":
+            ax.plot(
+                df["epoch"],
+                df["train_loss_A"],
+                "x--",
+                label="Train A",
+                color="lightblue",
+                alpha=0.8,
+            )
+            ax.plot(
+                df["epoch"],
+                df["val_loss_A"],
+                "x-",
+                label="Val A",
+                color="blue",
+                alpha=0.8,
+            )
 
-    # Set X-label on the last axis
+            ax.plot(
+                df["epoch"],
+                df["train_loss_P"],
+                "x--",
+                label="Train P",
+                color="lightgreen",
+                alpha=0.8,
+            )
+            ax.plot(
+                df["epoch"],
+                df["val_loss_P"],
+                "x-",
+                label="Val P",
+                color="green",
+                alpha=0.8,
+            )
+
+            ax.plot(
+                df["epoch"],
+                df["train_loss_CC"],
+                "x--",
+                label="Train CC",
+                color="wheat",
+                alpha=0.8,
+            )
+            ax.plot(
+                df["epoch"],
+                df["val_loss_CC"],
+                "x-",
+                label="Val CC",
+                color="orange",
+                alpha=0.8,
+            )
+
+            ax.set_ylabel("Component Loss (Log Scale)")
+            ax.set_title("Loss Breakdown: Area, Perimeter, CC")
+            ax.set_yscale("log")
+            ax.legend(loc="upper right", fontsize=9, ncol=3)
+            ax.grid(True, linestyle="--", alpha=0.5)
+
+        # 3. Plot Penalties
+        elif panel_type == "penalties":
+            # Assign colors dynamically
+            colors = sns.color_palette("husl", len(penalty_cols))
+            for i, col in enumerate(penalty_cols):
+                is_train = "train" in col
+                style = ":" if is_train else "-"
+                width = 1.0 if is_train else 1.5
+                label_clean = (
+                    col.replace("train_", "T: ")
+                    .replace("val_", "V: ")
+                    .replace("penalty_", "")
+                )
+
+                ax.plot(
+                    df["epoch"],
+                    df[col],
+                    linestyle=style,
+                    linewidth=width,
+                    label=label_clean,
+                    color=colors[i],
+                )
+
+            ax.set_ylabel("Penalty Value")
+            ax.set_title("Constraint Penalties")
+            # Only log scale if values are substantially > 0
+            if df[penalty_cols].max().max() > 0:
+                ax.set_yscale("log")
+            ax.legend(loc="upper right", fontsize=8, ncol=2)
+            ax.grid(True, linestyle="--", alpha=0.5)
+
+        # 4. Plot Temperature
+        elif panel_type == "temperature":
+            ax.plot(
+                df["epoch"],
+                df["temperature"],
+                "p-",
+                color="purple",
+                label="Softmax Temperature",
+            )
+            ax.set_ylabel("Temp (Linear)")
+            ax.set_title("Annealing Schedule")
+            ax.set_ylim(0, 1.05)  # Temp usually 0 to 1
+            ax.axhline(0, color="grey", linewidth=0.5)
+            ax.legend(loc="upper right")
+            ax.grid(True, linestyle="--", alpha=0.5)
+
+    # Set X-label on the bottom-most plot
     axes[-1].set_xlabel("Epoch")
 
-    fig.suptitle("Training History", fontsize=16)
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     save_path = os.path.join(output_dir, "training_history.png")
     plt.savefig(save_path, dpi=300)
     plt.close(fig)
-    print(f"Saved training history plot to: {save_path}")
+    print(f"Saved robust training history plot to: {save_path}")
+
+
+# --- 4. Per-Feature Matrices Plot ---
 
 
 def plot_per_feature_matrices(per_feature_metrics, output_dir):
@@ -725,3 +771,252 @@ def plot_qq_summary(metrics_df, output_dir):
     plt.savefig(save_path, dpi=300)
     plt.close(fig)
     print(f"Saved QQ plots to: {save_path}")
+
+
+def plot_jacobian_spectrum(jacobian_data, output_dir):
+    """
+    Plots the distribution of Gradient Norms (Jacobian Spectrum approximation)
+    to analyze the isometry/stability of the emulator.
+
+    Args:
+        jacobian_data (dict): Dictionary containing lists of norms:
+                              {'Area': [...], 'Perimeter': [...], 'CC': [...]}
+        output_dir (str): Path to save the plot.
+    """
+    print("\nGenerating Jacobian Spectrum (Gradient Norm) analysis plots...")
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    colors = {"Area": "royalblue", "Perimeter": "salmon", "CC": "forestgreen"}
+
+    # We plot the Kernel Density Estimate (KDE) and Histogram
+    for component, norms in jacobian_data.items():
+        if len(norms) == 0:
+            continue
+
+        # Convert to numpy and handle potential NaNs
+        norms_np = np.array(norms)
+        norms_np = norms_np[np.isfinite(norms_np)]
+
+        if len(norms_np) == 0:
+            continue
+
+        sns.histplot(
+            norms_np,
+            ax=ax,
+            label=f"{component} Sensitivity",
+            color=colors.get(component, "gray"),
+            kde=True,
+            log_scale=True,  # Critical: Gradients often span orders of magnitude
+            element="step",
+            fill=False,
+            stat="density",
+            linewidth=2,
+        )
+
+    ax.set_title(
+        "Jacobian Spectrum Analysis (Input Sensitivity)\nIsometry Check: Ideally narrow, non-zero distribution",
+        fontsize=14,
+    )
+    ax.set_xlabel("Gradient Norm || d_Output / d_Input || (Log Scale)")
+    ax.set_ylabel("Density")
+    ax.grid(True, linestyle="--", alpha=0.5, which="both")
+    ax.legend()
+
+    # Interpretation text
+    text_str = (
+        "Left (< 1e-4): Vanishing Gradients (Insensitive)\n"
+        "Right (> 1e2): Exploding/Shattered (Unstable)\n"
+        "Center: Isometric/Stable Region"
+    )
+    plt.text(
+        0.02,
+        0.95,
+        text_str,
+        transform=ax.transAxes,
+        fontsize=10,
+        verticalalignment="top",
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+    )
+
+    plt.tight_layout()
+    save_path = os.path.join(output_dir, "jacobian_spectrum.png")
+    plt.savefig(save_path, dpi=300)
+    plt.close(fig)
+    print(f"Saved Jacobian spectrum plot to: {save_path}")
+
+
+# --- 6. New Validation Plots (Isometry & Physics) ---
+
+
+def plot_isoperimetric_check(all_preds, output_dir):
+    """
+    Validates physical consistency: P >= sqrt(4 * pi * A).
+    """
+    print("\nGenerating Isoperimetric Consistency Check plot...")
+
+    # Flatten to treat every quantile of every sample as a data point
+    # Shape: [N, 3, Q] -> Flattened Area and Perimeter
+    # We only care about Area > epsilon to avoid log(0) issues or division issues
+
+    flat_A = all_preds[:, 0, :].flatten()
+    flat_P = all_preds[:, 1, :].flatten()
+
+    # Filter out tiny values to focus on the shape manifold
+    mask = flat_A > 1e-2
+    A_valid = flat_A[mask]
+    P_valid = flat_P[mask]
+
+    if len(A_valid) == 0:
+        print("Warning: No valid Area samples > 0.01 found for Isoperimetric plot.")
+        return
+
+    # Theoretical minimum perimeter (Circle)
+    P_min = np.sqrt(4 * np.pi * A_valid)
+
+    # Calculate Violations
+    # Allow small numerical epsilon
+    violation_mask = P_valid < (P_min - 1e-4)
+    violation_rate = np.mean(violation_mask) * 100
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Scatter Plot
+    # We plot sqrt(A) vs P so the relationship is linear: P = k * sqrt(A)
+    x_val = np.sqrt(A_valid)
+    y_val = P_valid
+
+    # Downsample for plotting speed if needed
+    if len(x_val) > 10000:
+        idx = np.random.choice(len(x_val), 10000, replace=False)
+        x_val = x_val[idx]
+        y_val = y_val[idx]
+        violation_mask_plot = violation_mask[idx]
+    else:
+        violation_mask_plot = violation_mask
+
+    # Plot valid points
+    ax.scatter(
+        x_val[~violation_mask_plot],
+        y_val[~violation_mask_plot],
+        alpha=0.3,
+        s=5,
+        c="dodgerblue",
+        label="Physically Valid",
+    )
+
+    # Plot violating points
+    ax.scatter(
+        x_val[violation_mask_plot],
+        y_val[violation_mask_plot],
+        alpha=0.5,
+        s=10,
+        c="crimson",
+        label="Violation",
+    )
+
+    # Plot Theoretical Line
+    max_sqrt_A = x_val.max()
+    line_x = np.linspace(0, max_sqrt_A, 100)
+    line_y = np.sqrt(4 * np.pi) * line_x
+    ax.plot(
+        line_x,
+        line_y,
+        "k--",
+        linewidth=2,
+        label=r"Theoretical Limit ($P = \sqrt{4\pi A}$)",
+    )
+
+    ax.set_title(
+        f"Isoperimetric Consistency Check\nViolation Rate: {violation_rate:.2f}%"
+    )
+    ax.set_xlabel(r"$\sqrt{\text{Area}}$ (Linear Scale)")
+    ax.set_ylabel("Perimeter")
+    ax.legend()
+    ax.grid(True, linestyle="--", alpha=0.5)
+
+    plt.tight_layout()
+    save_path = os.path.join(output_dir, "validation_isoperimetric_check.png")
+    plt.savefig(save_path, dpi=300)
+    plt.close(fig)
+    print(f"Saved Isoperimetric plot to: {save_path}")
+
+
+def plot_dry_input_error(all_preds, all_inputs, output_dir, threshold=1e-5):
+    """
+    Checks the 'Zero Mode' stability.
+    Plots the distribution of predicted Area for inputs that are effectively zero.
+    """
+    print("\nGenerating Dry Input Error Analysis...")
+
+    # Identify Dry Samples: sum(input) < threshold
+    # all_inputs shape: [N, H, W] or [N, 1, H, W]
+    input_sums = np.sum(all_inputs, axis=(-2, -1)).flatten()
+    dry_indices = np.where(input_sums < threshold)[0]
+
+    if len(dry_indices) == 0:
+        print("No dry samples found in test set. Skipping Dry Error plot.")
+        return
+
+    # Extract Predicted Area for these dry samples
+    # We take the MAX Area predicted across quantiles for each dry sample
+    # If the max is 0, then the whole vector is 0 (good).
+    dry_preds_A = all_preds[dry_indices, 0, :]  # [N_dry, Q]
+    max_dry_A = np.max(dry_preds_A, axis=1)  # [N_dry]
+
+    mean_error = np.mean(max_dry_A)
+    max_error = np.max(max_dry_A)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    sns.histplot(max_dry_A, bins=50, kde=False, color="darkorange", ax=ax)
+
+    ax.set_title(
+        f"Dry Input Response Analysis (N={len(dry_indices)})\n"
+        f"Mean Ghost Area: {mean_error:.4f} km² | Max Ghost Area: {max_error:.4f} km²"
+    )
+    ax.set_xlabel("Predicted Max Area (km²) for Empty Input")
+    ax.set_ylabel("Count")
+    ax.set_yscale("log")  # Log scale to see the tiny errors vs perfect zeros
+    ax.grid(True, linestyle="--", alpha=0.5)
+
+    plt.tight_layout()
+    save_path = os.path.join(output_dir, "validation_dry_input_error.png")
+    plt.savefig(save_path, dpi=300)
+    plt.close(fig)
+    print(f"Saved Dry Error plot to: {save_path}")
+
+
+def plot_saliency_maps(saliency_data, output_dir):
+    """
+    Plots input images alongside their gradient maps (Saliency).
+    saliency_data: list of tuples (input_img, grad_img, title)
+    """
+    print("\nGenerating Saliency Map visualizations...")
+
+    save_dir = os.path.join(output_dir, "evaluation_plots", "saliency")
+    os.makedirs(save_dir, exist_ok=True)
+
+    for i, (inp, grad, title) in enumerate(saliency_data):
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+        # Plot Input
+        im0 = axes[0].imshow(inp, cmap="Blues", origin="lower")
+        axes[0].set_title(f"Input: {title}")
+        fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+        # Plot Gradient
+        # We use a divergent map centered at 0 to show push/pull
+        limit = np.max(np.abs(grad)) + 1e-9
+        im1 = axes[1].imshow(
+            grad, cmap="RdBu_r", origin="lower", vmin=-limit, vmax=limit
+        )
+        axes[1].set_title("Gradient w.r.t Input (Sensitivity)")
+        fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+        plt.tight_layout()
+        safe_title = title.replace(" ", "_").lower()
+        plt.savefig(os.path.join(save_dir, f"saliency_{i}_{safe_title}.png"), dpi=150)
+        plt.close(fig)
+
+    print(f"Saved {len(saliency_data)} saliency maps to {save_dir}")

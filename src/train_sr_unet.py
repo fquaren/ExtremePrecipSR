@@ -64,6 +64,29 @@ ZERO_WEIGHT_ALPHA = config.get("ZERO_WEIGHT_ALPHA", 10.0)
 ZERO_WEIGHT_BETA = config.get("ZERO_WEIGHT_BETA", 5.0)
 
 
+def soft_threshold(x, threshold, sharpness=50.0):
+    """
+    Differentiable thresholding.
+    Approximates x * (x > threshold) using a sigmoid gate.
+
+    Args:
+        x: Input tensor (physical units)
+        threshold: Cutoff value (e.g., 0.1 mm/h)
+        sharpness: Controls how steep the transition is.
+                   Higher = closer to hard threshold, but vanishing gradients.
+                   Lower = smoother, but 'leaks' sub-threshold noise.
+                   50.0 is a good balance for mm/h data (0.1 transition).
+    """
+    # 1. Shift so threshold is at 0
+    # 2. Scale by sharpness
+    gate = torch.sigmoid(sharpness * (x - threshold))
+
+    # 3. Apply gate.
+    #    If x << T, gate ~ 0 -> output ~ 0
+    #    If x >> T, gate ~ 1 -> output ~ x
+    return x * gate
+
+
 class SoftExponentialWeightedL1Loss(nn.Module):
     def __init__(self, alpha, beta, hard_zero_weight=10.0):
         super().__init__()
@@ -383,28 +406,43 @@ def main():
             avg_trust = 1.0
 
             if METRIC_LOSS_MODE == "train" and current_metric_weight > 0:
-                # Invert Log Transform
+                # --- Prediction Path ---
                 pred_X_pos = F.softplus(pred_X, beta=5.0)
-                pred_X_log_space = pred_X_pos * PHYSICAL_MAX_VAL
-                pred_X_phys = torch.expm1(pred_X_log_space)
+                pred_X_log_unnorm = pred_X_pos * PHYSICAL_MAX_VAL
+                pred_X_phys = torch.expm1(pred_X_log_unnorm)
 
-                # Sparsity
-                pred_X_phys = pred_X_phys * (pred_X_phys > DRIZZLE_THRESHOLD).float()
+                # Use Soft Thresholding so gradients flow to dry pixels
+                pred_X_phys_clean = soft_threshold(
+                    pred_X_phys, DRIZZLE_THRESHOLD, sharpness=50.0
+                )
 
-                # Physical Ground Truth
+                # Back to Log for Emulator
+                pred_X_log_clean = torch.log1p(pred_X_phys_clean)
+
+                # --- Ground Truth Path (Keep Hard Threshold) ---
+                # We don't need gradients for Ground Truth, so hard threshold
+                # is better strictly for accuracy of the 'Target' topology.
                 with torch.no_grad():
-                    Y_phys = torch.expm1(Y * PHYSICAL_MAX_VAL)
+                    Y_log_unnorm = Y * PHYSICAL_MAX_VAL
+                    Y_phys = torch.expm1(Y_log_unnorm)
+                    # Hard threshold is fine/preferred for Truth
                     Y_phys_clean = Y_phys * (Y_phys > DRIZZLE_THRESHOLD).float()
+                    Y_log_clean = torch.log1p(Y_phys_clean)
 
-                # Emulator Prediction
-                pred_gamma_phys = emulator_model(pred_X_phys)
+                # ---------------------------------------------------------
+                # C. Emulator Forward Passes
+                # ---------------------------------------------------------
+
+                # 1. Prediction Path
+                pred_gamma_phys = emulator_model(pred_X_log_clean)
                 pred_gamma_log = torch.log1p(pred_gamma_phys)
 
-                # Trust Gating
+                # 2. Trust Gating (Using Transformed Truth)
                 with torch.no_grad():
-                    gamma_truth_phys = emulator_model(Y_phys_clean)
+                    gamma_truth_phys = emulator_model(Y_log_clean)
                     gamma_truth_log_pred = torch.log1p(gamma_truth_phys)
 
+                    # Calculate Trust based on Emulator's error on Ground Truth
                     emu_error_matrix = F.mse_loss(
                         gamma_truth_log_pred, Y_gamma_log, reduction="none"
                     )
@@ -415,6 +453,7 @@ def main():
                     trust_weights = torch.exp(-float(TRUST_TAU) * emu_error_scalar)
                     avg_trust = trust_weights.mean().item()
 
+                # Calculate Loss
                 loss_vec = metric_criterion(pred_gamma_log, Y_gamma_log)
                 raw_metric_mean = loss_vec.mean()
                 metric_term = (loss_vec * trust_weights).mean()
@@ -470,21 +509,30 @@ def main():
                 intr = torch.tensor(0.0, device=device)
 
                 if METRIC_LOSS_MODE != "none":
+                    # --- Prediction Path ---
                     pred_X_pos = F.softplus(pred_X, beta=5.0)
-                    pred_X_phys = torch.expm1(pred_X_pos * PHYSICAL_MAX_VAL)
+                    pred_X_log_unnorm = pred_X_pos * PHYSICAL_MAX_VAL
+                    pred_X_phys = torch.expm1(pred_X_log_unnorm)
 
-                    # Sparsity
-                    pred_X_phys = (
+                    # Threshold
+                    pred_X_phys_clean = (
                         pred_X_phys * (pred_X_phys > DRIZZLE_THRESHOLD).float()
                     )
 
+                    # Back to Log
+                    pred_X_log_clean = torch.log1p(pred_X_phys_clean)
+
+                    # --- Ground Truth Path ---
                     with torch.no_grad():
-                        Y_phys = torch.expm1(Y * PHYSICAL_MAX_VAL)
+                        Y_log_unnorm = Y * PHYSICAL_MAX_VAL
+                        Y_phys = torch.expm1(Y_log_unnorm)
                         Y_phys_clean = Y_phys * (Y_phys > DRIZZLE_THRESHOLD).float()
+                        Y_log_clean = torch.log1p(Y_phys_clean)
 
                     if METRIC_LOSS_MODE == "train":
-                        pred_gamma_phys = emulator_model(pred_X_phys)
-                        gamma_truth_phys = emulator_model(Y_phys_clean)
+                        # Forward pass with re-logged inputs
+                        pred_gamma_phys = emulator_model(pred_X_log_clean)
+                        gamma_truth_phys = emulator_model(Y_log_clean)
 
                         pred_gamma_log = torch.log1p(pred_gamma_phys)
                         gamma_truth_log_pred = torch.log1p(gamma_truth_phys)

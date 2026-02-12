@@ -40,7 +40,9 @@ class SRDataset(Dataset):
         interp_path = os.path.join(
             preprocessed_data_dir, split, "interpolated_original_precip.npz"
         )
-        gamma_path = os.path.join(preprocessed_data_dir, split, "gamma_targets.npz")
+        gamma_path = os.path.join(
+            preprocessed_data_dir, split, "gamma_targets_persistence.npz"
+        )
 
         print(f"Loading {split} dataset components...")
 
@@ -58,33 +60,36 @@ class SRDataset(Dataset):
         else:
             self.gamma_targets = np.load(gamma_path, mmap_mode="r")["data"]
 
-        # --- OPTIMIZATION: Zero-Filtering (Modified) ---
-        if self.is_train:
-            print("Filtering patches...")
-            max_vals = np.max(self.original_patches, axis=(1, 2))
-            wet_indices = np.where(max_vals > 1e-6)[0]
-            dry_indices = np.where(max_vals <= 1e-6)[0]
+        # # --- OPTIMIZATION: Zero-Filtering (Modified) ---
+        # if self.is_train:
+        #     print("Filtering patches...")
+        #     max_vals = np.max(self.original_patches, axis=(1, 2))
+        #     wet_indices = np.where(max_vals > 1e-6)[0]
+        #     dry_indices = np.where(max_vals <= 1e-6)[0]
 
-            # Keep ALL wet patches
-            # Keep randomly selected dry patches (e.g., 20% ratio)
-            n_dry_to_keep = int(len(wet_indices) * 0.2)
+        #     # Keep ALL wet patches
+        #     # Keep randomly selected dry patches (e.g., 20% ratio)
+        #     n_dry_to_keep = int(len(wet_indices) * 0.2)
 
-            if len(dry_indices) > n_dry_to_keep:
-                keep_dry = np.random.choice(
-                    dry_indices, size=n_dry_to_keep, replace=False
-                )
-            else:
-                keep_dry = dry_indices
+        #     if len(dry_indices) > n_dry_to_keep:
+        #         keep_dry = np.random.choice(
+        #             dry_indices, size=n_dry_to_keep, replace=False
+        #         )
+        #     else:
+        #         keep_dry = dry_indices
 
-            self.valid_indices = np.concatenate([wet_indices, keep_dry])
-            np.random.shuffle(self.valid_indices)
-            print(
-                f"Dataset Balanced (Pre-subset): {len(wet_indices)} Wet, {len(keep_dry)} Dry."
-            )
+        #     self.valid_indices = np.concatenate([wet_indices, keep_dry])
+        #     np.random.shuffle(self.valid_indices)
+        #     print(
+        #         f"Dataset Balanced (Pre-subset): {len(wet_indices)} Wet, {len(keep_dry)} Dry."
+        #     )
+        #     self.valid_indices = np.arange(len(self.original_patches))
 
-        else:
-            # For validation/test, we MUST keep everything to evaluate performance honestly.
-            self.valid_indices = np.arange(len(self.original_patches))
+        # else:
+        #     # For validation/test, we MUST keep everything to evaluate performance honestly.
+        #     self.valid_indices = np.arange(len(self.original_patches))
+
+        self.valid_indices = np.arange(len(self.original_patches))
 
         # --- SUBSET LOGIC ---
         # We apply this AFTER the wet/dry balance logic to ensure we are subsetting
@@ -167,12 +172,17 @@ class PrecomputedMixupDataset(Dataset):
         self,
         preprocessed_data_dir,
         metadata_file,
+        scaler_val,  # <--- NEW: Required to unify units
         augment=True,
         include_original=True,
         include_mixup=True,
         subset_fraction=1.0,
     ):
-        # Metadata loading (assumes metadata aligns with 'physical_precip.npz')
+        self.scaler_val = scaler_val
+        self.data_sources = []
+        self.target_sources = []
+
+        # Metadata loading
         with open(metadata_file, "r") as f:
             lines = f.readlines()
         try:
@@ -181,9 +191,6 @@ class PrecomputedMixupDataset(Dataset):
         except ValueError:
             start_idx = 1
         self.metadata_raw = [line.strip().split() for line in lines[start_idx:]]
-
-        self.data_sources = []
-        self.target_sources = []
 
         # 1. Load Original Real Data
         if include_original:
@@ -203,9 +210,8 @@ class PrecomputedMixupDataset(Dataset):
                 )["data"]
             )
 
-        # 2. Load Pre-computed MixUp Data
-        self.include_mixup = include_mixup
-        if self.include_mixup:
+        # 2. Load MixUp Data
+        if include_mixup:
             print("Loading Pre-computed MixUp Data...")
             mix_p_path = os.path.join(
                 preprocessed_data_dir, "mixup_augmented_precip.npz"
@@ -218,33 +224,22 @@ class PrecomputedMixupDataset(Dataset):
                 self.data_sources.append(np.load(mix_p_path, mmap_mode="r")["data"])
                 self.target_sources.append(np.load(mix_t_path, mmap_mode="r")["data"])
             else:
-                print(
-                    f"Warning: MixUp files not found at {mix_p_path}. Training without them."
-                )
+                print("Warning: MixUp files not found. Skipping.")
 
-        # Create indexing map
+        # Indexing Map
         self.cumulative_sizes = np.cumsum([len(d) for d in self.data_sources])
         self.total_len = self.cumulative_sizes[-1]
-
-        # --- SUBSET LOGIC ---
-        # For Mixup dataset, since we don't have an explicit 'valid_indices' list
-        # mapping to files, we create a virtual index mapper.
         self.indices_map = np.arange(self.total_len)
 
+        # Subset Logic
         if 0.0 < subset_fraction < 1.0:
             subset_size = int(self.total_len * subset_fraction)
-            if subset_size < 1:
-                subset_size = 1
-            print(
-                f"Subsetting MixupDataset to {subset_fraction*100:.1f}% ({subset_size}/{self.total_len})."
-            )
             rng = np.random.default_rng(seed=42)
             self.indices_map = rng.choice(
-                self.indices_map, size=subset_size, replace=False
+                self.indices_map, size=max(1, subset_size), replace=False
             )
-        elif subset_fraction <= 0.0 or subset_fraction > 1.0:
-            raise ValueError(
-                f"subset_fraction must be in (0, 1]. Received {subset_fraction}"
+            print(
+                f"Subsetting to {subset_fraction*100:.1f}% ({len(self.indices_map)} samples)."
             )
 
         self.augment = augment
@@ -259,16 +254,13 @@ class PrecomputedMixupDataset(Dataset):
                 ]
             )
 
-        print(f"Total Dataset Size: {len(self.indices_map)} samples.")
-
     def __len__(self):
         return len(self.indices_map)
 
     def __getitem__(self, idx):
-        # Map the virtual subset index to the real dataset index
         real_idx = self.indices_map[idx]
 
-        # Resolve Index to Source
+        # Find which source this index belongs to
         source_idx = np.searchsorted(self.cumulative_sizes, real_idx, side="right")
         if source_idx == 0:
             local_idx = real_idx
@@ -278,16 +270,23 @@ class PrecomputedMixupDataset(Dataset):
         patch = self.data_sources[source_idx][local_idx]
         target_phys = self.target_sources[source_idx][local_idx]
 
-        # To Tensor
-        input_tensor = torch.from_numpy(patch).float().unsqueeze(0)
+        # --- UNIT UNIFICATION LOGIC ---
+        if source_idx == 0:
+            # Source 0 is PHYSICAL (mm/h).
+            # Model expects Log-Transformed input.
+            patch_log = np.log1p(patch)
+        else:
+            # Source 1 is MIXUP (Normalized [0, 1]).
+            # We must scale it UP to Log-Space [0, scaler_val]
+            patch_log = patch * self.scaler_val
+
+        input_tensor = torch.from_numpy(patch_log).float().unsqueeze(0)
         target_phys_tensor = torch.from_numpy(target_phys).float()
 
-        # Augmentation (Spatial Only - No MixUp here)
         if self.augment:
             input_tensor = self.transform(input_tensor)
 
-        # Log Transform for training
+        # Targets for loss must be Log-Transformed
         log_target_gamma = torch.log1p(target_phys_tensor)
 
-        # Return same signature as before
         return input_tensor, log_target_gamma, input_tensor, target_phys_tensor

@@ -133,10 +133,26 @@ class ComponentWiseCDFLoss(nn.Module):
         )  # Shape [B], [B], [B]
 
 
+class WassersteinLogLoss(nn.Module):
+    def __init__(self, quantile_levels):
+        super().__init__()
+        self.register_buffer("quantiles", torch.tensor(quantile_levels))
+
+    def forward(self, pred_log, target_log):
+        # |log(x) - log(y)| is the relative distance
+        abs_diff = torch.abs(pred_log - target_log)
+
+        # Integrate w.r.t dq (quantiles) WITHOUT weighting by q
+        # This computes the area between the two log-quantile curves
+        wasserstein_dist = torch.trapezoid(abs_diff, self.quantiles, dim=2)
+
+        return wasserstein_dist[:, 0], wasserstein_dist[:, 1], wasserstein_dist[:, 2]
+
+
 class TotalErrorMetric(nn.Module):
     def __init__(self, quantile_levels, config):
         super(TotalErrorMetric, self).__init__()
-        self.component_criterion = ComponentWiseCDFLoss(quantile_levels)
+        self.component_criterion = WassersteinLogLoss(quantile_levels)
         self.config = config
         self.pixel_area_km2 = config.get("PIXEL_SIZE_KM", 2.0) ** 2
 
@@ -147,11 +163,13 @@ class TotalErrorMetric(nn.Module):
             predicted_gamma_log, log_target_gamma
         )
 
-        main_loss_per_sample = (
-            (self.config.get("WEIGHT_A", 1.0) * loss_A)
-            + (self.config.get("WEIGHT_P", 1.0) * loss_P)
-            + (self.config.get("WEIGHT_CC", 1.0) * loss_CC)
-        )
+        # main_loss_per_sample = (
+        #     (self.config.get("WEIGHT_A", 1.0) * loss_A)
+        #     + (self.config.get("WEIGHT_P", 1.0) * loss_P)
+        #     + (self.config.get("WEIGHT_CC", 1.0) * loss_CC)
+        # )
+
+        main_loss_per_sample = 1.0 * loss_A + 1.0 * loss_P + 1.0 * loss_CC
 
         total_loss_per_sample = main_loss_per_sample
 

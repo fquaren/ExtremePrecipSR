@@ -24,6 +24,10 @@ export PYTHONUNBUFFERED=1
 echo "Starting PARALLEL training on RTX 6000..."
 source /home/fquareng/.bashrc
 
+echo "Running final data preprocessing step..."
+micromamba run -n dl python "${PROJECT_ROOT}/data/final_preprocessing.py"
+
+
 # 1. Launch UNet with metric_loss_mode = none (Background process)
 echo "Launching Experiment 1: Metric=None, Data=10%"
 echo "  -> Logging to: $LOG_FILE_NONE"

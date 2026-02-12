@@ -1,14 +1,13 @@
 import yaml
 import torch
-import torch.nn as nn
 import numpy as np
-from gamma_predictors import (
-    GammaPredictorSeparateHeadsSoft,
-    GammaPredictorSeparateHeadsHard,
-    GammaPredictorHierarchicalSoftGated,
-    GammaPredictorHierarchicalHardGated,
-)
 import os
+
+from gamma_predictors_v5 import (
+    BaselineCNN,
+    IsometricCNN,
+    ConstrainedIsometricCNN,
+)
 
 # --- Config ---
 parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -16,31 +15,21 @@ config_path = os.path.join(parent_path, "config.yaml")
 with open(config_path, "r") as file:
     config = yaml.safe_load(file)
 
-# --- Surrogate Loss Config ---
-CONSTRAINT_MODE = config.get("CONSTRAINT_MODE", "hard")
-
-# --- Emulator Model Config (Needed to load the checkpoint) ---
+# --- Constants ---
 QUANTILE_LEVELS = config["QUANTILE_LEVELS"]
 N_QUANTILES = len(QUANTILE_LEVELS)
 PATCH_SIZE = config["PATCH_SIZE"]
 PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 2.0)
-
-ARCHITECTURE = config.get("ARCHITECTURE", "Vanilla")
-if ARCHITECTURE == "Vanilla":
-    HARD_EMULATOR = GammaPredictorSeparateHeadsHard
-    SOFT_EMULATOR = GammaPredictorSeparateHeadsSoft
-elif ARCHITECTURE == "Attention":
-    HARD_EMULATOR = GammaPredictorHierarchicalHardGated
-    SOFT_EMULATOR = GammaPredictorHierarchicalSoftGated
+PREPROCESSED_DATA_DIR = config.get("PREPROCESSED_DATA_DIR", "./data")
 
 
 def load_emulator(checkpoint_path, config, device):
     """
-    Loads a trained Gamma Emulator model for use in the SR loop.
+    Loads a trained Gamma Emulator model (Baseline, Isometric, or Constrained).
 
     Args:
         checkpoint_path (str): Path to the .pth file.
-        config (dict): Configuration dictionary containing model hyperparameters.
+        config (dict): Configuration dictionary.
         device (torch.device): 'cuda' or 'cpu'.
 
     Returns:
@@ -48,67 +37,78 @@ def load_emulator(checkpoint_path, config, device):
     """
     print(f"--- Loading Gamma Emulator from: {checkpoint_path} ---")
 
-    # 1. Extract necessary config parameters
-    # Defaulting to values seen in your previous scripts if missing
-    arch = config.get("ARCHITECTURE", "Vanilla")
-    constraint_mode = config.get("CONSTRAINT_MODE", "hybrid")
+    # 1. Load Physical Scaler (Critical for Normalization)
+    # The new models normalize inputs internally using this value.
+    scaler_path = config.get(
+        "MAX_LOG_PRECIP_FILE", os.path.join(PREPROCESSED_DATA_DIR, "precip_max_val.npy")
+    )
+
+    if os.path.exists(scaler_path):
+        max_input_val = float(np.load(scaler_path))
+        print(f"Loaded max_input_val for emulator normalization: {max_input_val:.4f}")
+    else:
+        print("Warning: Scaler file not found. Defaulting to 5.5")
+        max_input_val = 5.5
+
+    # 2. Extract Config Parameters
+    arch = config.get("ARCHITECTURE", "Baseline")  # Default to Baseline if missing
     patch_size = config["PATCH_SIZE"]
     n_quantiles = len(config["QUANTILE_LEVELS"])
     pixel_size_km = config.get("PIXEL_SIZE_KM", 2.0)
-    # Max precip is required for Soft/Hybrid scaling, ensure it matches training!
-    max_dataset_precip = float(np.load(config["MAX_PRECIP_FILE"]))
-
     input_shape = (1, patch_size, patch_size)
 
-    # 2. Select Architecture Class
-    # This must match the logic used in train_gamma.py exactly
-    if arch == "Vanilla":
-        HardClass = GammaPredictorSeparateHeadsHard
-        SoftClass = GammaPredictorSeparateHeadsSoft
-    elif arch == "Attention":
-        HardClass = GammaPredictorHierarchicalHardGated
-        SoftClass = GammaPredictorHierarchicalSoftGated
-    else:
-        raise ValueError(f"Unknown Architecture type in config: {arch}")
+    # 3. Instantiate Model based on Architecture
+    print(f"Initializing Architecture: {arch}")
 
-    # 3. Instantiate Model
-    if constraint_mode in ["soft", "none"]:
-        print(f"Initializing {SoftClass.__name__} (Mode: {constraint_mode})")
-        model = SoftClass(
-            input_shape=input_shape,
-            n_quantiles=n_quantiles,
-            activation_fn=nn.Mish(),
-            max_precip_value=max_dataset_precip,
-        ).to(device)
+    if arch == "Baseline":
+        model = BaselineCNN(n_quantiles=n_quantiles, input_shape=input_shape)
 
-    elif constraint_mode in ["hybrid", "hard"]:
-        print(f"Initializing {HardClass.__name__} (Mode: {constraint_mode})")
-        model = HardClass(
-            input_shape=input_shape,
+    elif arch == "Isometric":
+        model = IsometricCNN(
             n_quantiles=n_quantiles,
-            activation_fn=nn.Mish(),
+            input_shape=input_shape,
+            max_input_val=max_input_val,
+        )
+
+    elif arch == "Constrained":
+        model = ConstrainedIsometricCNN(
+            n_quantiles=n_quantiles,
+            input_shape=input_shape,
             quantile_levels=config["QUANTILE_LEVELS"],
-            pixel_area_km2=pixel_size_km**2,
-            max_precip_value=max_dataset_precip,
-        ).to(device)
+            pixel_area_km2=pixel_size_km**2,  # Pass Area (km^2), not length
+            max_input_val=max_input_val,
+        )
+
     else:
-        raise ValueError(f"Unknown CONSTRAINT_MODE: {constraint_mode}")
+        raise ValueError(
+            f"Unknown Architecture: '{arch}'. "
+            "Supported: 'Baseline', 'Isometric', 'Constrained'."
+        )
+
+    model = model.to(device)
 
     # 4. Load Weights
     try:
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        # Handle cases where checkpoint is nested or just state_dict
-        state_dict = (
-            checkpoint["model_state_dict"]
-            if "model_state_dict" in checkpoint
-            else checkpoint
-        )
-        model.load_state_dict(state_dict)
-    except RuntimeError as e:
-        print(f"CRITICAL ERROR loading state dict: {e}")
-        print(
-            "Tip: Check if 'ARCHITECTURE' in config matches the checkpoint's architecture."
-        )
+
+        # Checkpoint might be the full dict (with optimizer, epoch) or just state_dict
+        if "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+        else:
+            state_dict = checkpoint
+
+        # Clean state_dict if it was saved with DataParallel ('module.' prefix)
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            name = k[7:] if k.startswith("module.") else k
+            new_state_dict[name] = v
+
+        model.load_state_dict(new_state_dict)
+
+    except Exception as e:
+        print(f"\nCRITICAL ERROR loading emulator weights: {e}")
+        print(f"Expected Architecture: {arch}")
+        print("Ensure the config['ARCHITECTURE'] matches the checkpoint file.")
         raise e
 
     # 5. Freeze and Eval

@@ -116,7 +116,7 @@ def main():
         metadata_file=VAL_METADATA_FILE,
         augment=False,
         include_original=True,  # Load physical_precip.npz
-        include_mixup=False,  # Don't load mixup_augmented_precip.npz
+        include_mixup=True,  # Don't load mixup_augmented_precip.npz
     )
 
     indices = torch.randperm(len(val_dataset_full))[

@@ -19,7 +19,7 @@ QUANTILE_LEVELS = np.array(config["QUANTILE_LEVELS"], dtype=np.float32)
 PIXEL_SIZE_KM = config.get("PIXEL_SIZE_KM", 2.0)
 # Default to 0.05 if not in config, matching your production script default
 PERSISTENCE_THRESHOLD = config.get("PERSISTENCE_THRESHOLD", 0.05)
-NUM_WORKERS = 4
+NUM_WORKERS = config.get("NUM_WORKERS", 4)
 
 # --- HYPERPARAMETERS FOR MIXUP ---
 MIXUP_ALPHA = 0.2
@@ -141,9 +141,10 @@ def _worker_mixup(
     pixel_size,
     mixup_alpha,
     noise_std,
-    persistence_thresh,  # Added argument
+    persistence_thresh,
+    scaler_val,  # <--- NEW ARGUMENT
 ):
-    # Open inputs (Read-Only)
+    # Open inputs (Read-Only Physical Data)
     real_data = np.load(real_path, mmap_mode="r")["data"]
     interp_data = np.load(interp_path, mmap_mode="r")["data"]
 
@@ -156,7 +157,7 @@ def _worker_mixup(
     )
 
     for idx in indices:
-        # Load patches
+        # Load patches (Physical Units)
         real_patch = real_data[idx]
         interp_patch = interp_data[idx]
 
@@ -164,18 +165,26 @@ def _worker_mixup(
         noise = np.random.normal(0, noise_std, interp_patch.shape)
         interp_noisy = np.clip(interp_patch + noise, 0.0, None)
 
-        # 2. MixUp
+        # 2. MixUp (Physical Space)
+        # We mix in physical space to preserve mass linearity
         lam = np.random.beta(mixup_alpha, mixup_alpha)
         mixed_patch = lam * real_patch + (1 - lam) * interp_noisy
 
-        # 3. Compute Physics-Consistent Topology
-        # Using the corrected function with persistence thresholding
+        # 3. Compute Physics-Consistent Topology (On Physical Data)
+        # This part is correct: TDA must run on real values
         gamma_matrix = compute_gamma_matrix_consistent(
             mixed_patch, quantiles, pixel_size, persistence_thresh
         )
 
-        # 4. Save
-        out_patches[idx] = mixed_patch.astype(np.float32)
+        # 4. Transform for ML Input (CRITICAL FIX)
+        # We must transform the physical mixed patch to the "Feature Space"
+        # exactly how the model expects it (Log + Scale).
+        mixed_patch_ml = np.log1p(mixed_patch)
+        mixed_patch_ml = mixed_patch_ml / scaler_val
+        mixed_patch_ml = np.clip(mixed_patch_ml, 0.0, 1.0)
+
+        # 5. Save
+        out_patches[idx] = mixed_patch_ml.astype(np.float32)
         out_targets[idx] = gamma_matrix.astype(np.float32)
 
     out_patches.flush()
@@ -185,6 +194,14 @@ def _worker_mixup(
 
 def main():
     split = ["train"]
+
+    scaler_path = os.path.join(PREPROCESSED_DATA_DIR, "precip_max_val.npy")
+    if not os.path.exists(scaler_path):
+        print("Error: Scaler not found. Run preprocessing first.")
+        return
+    scaler_val = float(np.load(scaler_path)[0])
+    print(f"Loaded Scaler for Normalization: {scaler_val}")
+
     for s in split:
         print(f"--- Generating Offline MixUp Dataset for {s.upper()} ---")
         print(f"Using Persistence Threshold: {PERSISTENCE_THRESHOLD}")
@@ -237,7 +254,8 @@ def main():
             pixel_size=PIXEL_SIZE_KM,
             mixup_alpha=MIXUP_ALPHA,
             noise_std=NOISE_STD,
-            persistence_thresh=PERSISTENCE_THRESHOLD,  # Pass the config value
+            persistence_thresh=PERSISTENCE_THRESHOLD,
+            scaler_val=scaler_val,
         )
 
         print(f"Starting processing with {NUM_WORKERS} workers...")

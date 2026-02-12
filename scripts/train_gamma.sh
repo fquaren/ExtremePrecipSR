@@ -51,7 +51,7 @@ for (( i=0; i<${N_EXPS}; i++ )); do
     echo "=========================================================="
 
     micromamba run -n dl-torch python /work/FAC/FGSE/IDYST/tbeucler/downscaling/fquareng/ExtremePrecipSR/src/train_gamma.py \
-        --constraint_mode "$curr_mode" --arch "$curr_arch"
+        --constraint_mode "$curr_mode" --arch "$curr_arch" --data_percentage 10
 
     echo "--- Finished Experiment $((i+1)) ---"
     echo ""

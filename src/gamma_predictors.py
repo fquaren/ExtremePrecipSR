@@ -192,7 +192,7 @@ class GammaPredictorHierarchicalHardGated_V2(nn.Module):
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
 
         # Input size to FC is sum of channels from all scales due to MSFA
-        self.fc_input_size = 16 + 32 + 64
+        self.fc_input_size = 32 + 64
 
         # --- 3. Shared Latent ---
         self.shared_fc = nn.Linear(self.fc_input_size, 256)
@@ -235,10 +235,9 @@ class GammaPredictorHierarchicalHardGated_V2(nn.Module):
 
         # Multi-Scale Feature Aggregation (MSFA)
         # Global average pool each scale and concatenate
-        g1 = self.global_pool(f1).view(batch_size, -1)
         g2 = self.global_pool(f2).view(batch_size, -1)
         g3 = self.global_pool(f3).view(batch_size, -1)
-        x_flat = torch.cat([g1, g2, g3], dim=1)
+        x_flat = torch.cat([g2, g3], dim=1)
 
         shared = self.activation(self.shared_fc(x_flat))
         shared = self.dropout(shared)
@@ -344,7 +343,7 @@ class GammaPredictorHierarchicalSoftGated_V2(nn.Module):
         self.pool3 = BlurPool2d(64)
 
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc_input_size = 16 + 32 + 64  # MSFA sum
+        self.fc_input_size = 32 + 64  # MSFA sum
 
         # Shared Latent
         self.shared_fc = nn.Linear(self.fc_input_size, 256)
@@ -381,10 +380,9 @@ class GammaPredictorHierarchicalSoftGated_V2(nn.Module):
         x3 = self.sa3(x3)
         f3 = self.pool3(x3)
 
-        g1 = self.global_pool(f1).view(batch_size, -1)
         g2 = self.global_pool(f2).view(batch_size, -1)
         g3 = self.global_pool(f3).view(batch_size, -1)
-        x_flat = torch.cat([g1, g2, g3], dim=1)
+        x_flat = torch.cat([g2, g3], dim=1)
 
         shared = self.activation(self.shared_fc(x_flat))
         shared = self.dropout(shared)

@@ -39,23 +39,117 @@ class SoftmaxConstraintLayer(nn.Module):
 
 
 class DoubleConv(nn.Module):
-    """(CONV -> BN -> Mish) * 2"""
+    """
+    (ReflectionPad -> CONV -> BN -> Mish) * 2
+    Preserves boundary continuity for physical fields.
+    """
 
     def __init__(self, in_channels, out_channels, mid_channels=None):
         super().__init__()
         if not mid_channels:
             mid_channels = out_channels
         self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            # Layer 1
+            nn.ReflectionPad2d(1),  # Mirrors data at boundaries
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=0, bias=False),
             nn.BatchNorm2d(mid_channels),
-            nn.Mish(),
-            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.Mish(inplace=True),
+            # Layer 2
+            nn.ReflectionPad2d(1),  # Mirrors data at boundaries
+            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=0, bias=False),
             nn.BatchNorm2d(out_channels),
-            nn.Mish(),
+            nn.Mish(inplace=True),
         )
 
     def forward(self, x):
         return self.double_conv(x)
+
+
+class UNetSR(nn.Module):
+    def __init__(self, in_channels, out_channels, n_features_base=64):
+        super(UNetSR, self).__init__()
+
+        # --- Encoder ---
+        self.inc = DoubleConv(in_channels, n_features_base)
+
+        # CHANGED: MaxPool preserves storm cores better than AvgPool
+        self.pool = nn.MaxPool2d(2)
+
+        self.down1 = DoubleConv(n_features_base, n_features_base * 2)
+        self.down2 = DoubleConv(n_features_base * 2, n_features_base * 4)
+        self.down3 = DoubleConv(n_features_base * 4, n_features_base * 8)
+        self.down4 = DoubleConv(n_features_base * 8, n_features_base * 16)
+
+        # --- Decoder ---
+        # Note: Bilinear/Bicubic Upsample is fine for smooth fields
+        self.up1 = nn.Upsample(scale_factor=2, mode="bicubic", align_corners=True)
+        self.conv1 = DoubleConv(
+            n_features_base * 16 + n_features_base * 8, n_features_base * 8
+        )
+
+        self.up2 = nn.Upsample(scale_factor=2, mode="bicubic", align_corners=True)
+        self.conv2 = DoubleConv(
+            n_features_base * 8 + n_features_base * 4, n_features_base * 4
+        )
+
+        self.up3 = nn.Upsample(scale_factor=2, mode="bicubic", align_corners=True)
+        self.conv3 = DoubleConv(
+            n_features_base * 4 + n_features_base * 2, n_features_base * 2
+        )
+
+        self.up4 = nn.Upsample(scale_factor=2, mode="bicubic", align_corners=True)
+        self.conv4 = DoubleConv(n_features_base * 2 + n_features_base, n_features_base)
+
+        # --- Head: Regression (Intensity) ---
+        self.head_reg = nn.Conv2d(n_features_base, out_channels, kernel_size=1)
+
+        # CHANGED: Softplus is safer for gradients near zero than ReLU
+        self.final_activation = nn.Softplus()
+
+        # --- Scientific Init ---
+        # Initialize the head to zero. The model starts by predicting 0 residual.
+        # Output = Baseline + 0.
+        nn.init.constant_(self.head_reg.weight, 0)
+        nn.init.constant_(self.head_reg.bias, 0)
+
+    def forward(self, x):
+        # Assumption: x[:, 0] is the interpolated rainfall (baseline)
+        baseline = x[:, 0:1, :, :]
+
+        x1 = self.inc(x)
+        x2 = self.down1(self.pool(x1))
+        x3 = self.down2(self.pool(x2))
+        x4 = self.down3(self.pool(x3))
+        x5 = self.down4(self.pool(x4))
+
+        x = self.up1(x5)
+        # Fix: Ensure shapes match if dimensions are odd (optional safety)
+        # For strict 128x128, strict cat is fine.
+        x = torch.cat([x4, x], dim=1)
+        x = self.conv1(x)
+
+        x = self.up2(x)
+        x = torch.cat([x3, x], dim=1)
+        x = self.conv2(x)
+
+        x = self.up3(x)
+        x = torch.cat([x2, x], dim=1)
+        x = self.conv3(x)
+
+        x = self.up4(x)
+        x = torch.cat([x1, x], dim=1)
+        x = self.conv4(x)
+
+        # --- Head: Regression ---
+        residual = self.head_reg(x)
+
+        # Add residual to baseline
+        out_reg = baseline + residual
+
+        # Enforce physical constraint (non-negative)
+        out_reg = self.final_activation(out_reg)
+
+        return out_reg
 
 
 class UNetSR_soft(nn.Module):
@@ -154,91 +248,3 @@ class UNetSR_soft(nn.Module):
         out_phys = self.smcl(logits, x_phys_constraint)
 
         return out_phys
-
-
-class UNetSR(nn.Module):
-    def __init__(self, in_channels, out_channels, n_features_base=64):
-        super(UNetSR, self).__init__()
-
-        # --- Encoder ---
-        self.inc = DoubleConv(in_channels, n_features_base)
-        self.down1 = nn.Sequential(
-            nn.AvgPool2d(2), DoubleConv(n_features_base, n_features_base * 2)
-        )
-        self.down2 = nn.Sequential(
-            nn.AvgPool2d(2), DoubleConv(n_features_base * 2, n_features_base * 4)
-        )
-        self.down3 = nn.Sequential(
-            nn.AvgPool2d(2), DoubleConv(n_features_base * 4, n_features_base * 8)
-        )
-        self.down4 = nn.Sequential(
-            nn.AvgPool2d(2), DoubleConv(n_features_base * 8, n_features_base * 16)
-        )
-
-        # --- Decoder ---
-        self.up1 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="bicubic", align_corners=True),
-            nn.Conv2d(n_features_base * 16, n_features_base * 8, kernel_size=1),
-        )
-        self.conv1 = DoubleConv(
-            n_features_base * 8 + n_features_base * 8, n_features_base * 8
-        )
-
-        self.up2 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="bicubic", align_corners=True),
-            nn.Conv2d(n_features_base * 8, n_features_base * 4, kernel_size=1),
-        )
-        self.conv2 = DoubleConv(
-            n_features_base * 4 + n_features_base * 4, n_features_base * 4
-        )
-
-        self.up3 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="bicubic", align_corners=True),
-            nn.Conv2d(n_features_base * 4, n_features_base * 2, kernel_size=1),
-        )
-        self.conv3 = DoubleConv(
-            n_features_base * 2 + n_features_base * 2, n_features_base * 2
-        )
-
-        self.up4 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="bicubic", align_corners=True),
-            nn.Conv2d(n_features_base * 2, n_features_base, kernel_size=1),
-        )
-        self.conv4 = DoubleConv(n_features_base + n_features_base, n_features_base)
-
-        # --- Head: Regression (Intensity) ---
-        self.head_reg = nn.Conv2d(n_features_base, out_channels, kernel_size=1)
-
-        self.final_activation = nn.ReLU()
-
-    def forward(self, x):
-        baseline = x[:, 0:1, :, :]
-
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
-        x5 = self.down4(x4)
-
-        x = self.up1(x5)
-        x = torch.cat([x4, x], dim=1)
-        x = self.conv1(x)
-
-        x = self.up2(x)
-        x = torch.cat([x3, x], dim=1)
-        x = self.conv2(x)
-
-        x = self.up3(x)
-        x = torch.cat([x2, x], dim=1)
-        x = self.conv3(x)
-
-        x = self.up4(x)
-        x = torch.cat([x1, x], dim=1)
-        x = self.conv4(x)
-
-        # --- Head: Regression ---
-        residual = self.head_reg(x)
-        out_reg = baseline + residual
-        out_reg = self.final_activation(out_reg)
-
-        return out_reg
